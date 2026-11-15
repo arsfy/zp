@@ -1,9 +1,10 @@
 //! Shared application core for ZP: paths, logging, settings, projects, checkpoints.
 //!
-//! Only the foundation (paths and logging) exists so far; the rest arrives in later
-//! milestones. See `PLAN.md`.
+//! So far: paths, logging and the persisted model catalog layers; the rest arrives in
+//! later milestones. See `PLAN.md`.
 
 pub mod logging;
+pub mod model_catalog;
 pub mod paths;
 
 /// Human-readable application name.

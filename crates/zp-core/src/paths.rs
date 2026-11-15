@@ -51,6 +51,16 @@ pub fn logs_dir(data_dir: &Path) -> PathBuf {
     data_dir.join("logs")
 }
 
+/// Directory for data that can be re-downloaded at any time.
+pub fn cache_dir(data_dir: &Path) -> PathBuf {
+    data_dir.join("cache")
+}
+
+/// Cached model catalog layers (models.dev and provider model lists).
+pub fn models_cache_dir(data_dir: &Path) -> PathBuf {
+    cache_dir(data_dir).join("models")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -80,5 +90,6 @@ mod tests {
         assert_eq!(sessions_dir(root), root.join("sessions"));
         assert_eq!(checkpoints_dir(root), root.join("checkpoints"));
         assert_eq!(logs_dir(root), root.join("logs"));
+        assert_eq!(models_cache_dir(root), root.join("cache").join("models"));
     }
 }

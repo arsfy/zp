@@ -12,5 +12,12 @@ workspace = true
 [dependencies]
 anyhow.workspace = true
 dirs.workspace = true
+futures.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+zp-ai.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true
