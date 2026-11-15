@@ -1,14 +1,16 @@
-//! App-wide stores held as GPUI globals: data paths, the persisted UI state and the model
-//! registry.
+//! App-wide stores held as GPUI globals: data paths, the persisted UI state, the user's
+//! settings and the model registry.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use gpui::{App, Global, Task};
-use std::sync::Arc;
-
 use zp_ai::{HttpProvider, Model, Models, Provider};
 use zp_core::app_state::AppState;
+use zp_core::credentials::Credentials;
+use zp_core::model_catalog::{ModelCatalogCache, SyncOptions, SyncReport};
+use zp_core::settings::Settings;
 
 /// Delay before writing state changes, so bursts (window drags) cause one write.
 const SAVE_DELAY: Duration = Duration::from_millis(500);
@@ -95,49 +97,195 @@ impl AppStore {
     }
 }
 
+/// The user's settings (`~/.zp/settings.json`), with saving and applying changes.
+pub struct AppSettings {
+    path: Option<PathBuf>,
+    settings: Settings,
+}
+
+impl Global for AppSettings {}
+
+impl AppSettings {
+    pub fn init(data_dir: Option<&Path>, cx: &mut App) {
+        let path = data_dir.map(zp_core::paths::settings_file);
+        let settings = path
+            .as_deref()
+            .map(Settings::load_or_default)
+            .unwrap_or_default();
+        cx.set_global(Self { path, settings });
+    }
+
+    /// The current settings.
+    pub fn get(cx: &App) -> &Settings {
+        &cx.global::<Self>().settings
+    }
+
+    /// Changes the settings, saves them and applies them to the running app.
+    pub fn update(cx: &mut App, change: impl FnOnce(&mut Settings)) -> anyhow::Result<()> {
+        let this = cx.global_mut::<Self>();
+        // Pick up edits made to the file meanwhile.
+        if let Some(path) = &this.path
+            && let Ok(current) = Settings::load(path)
+        {
+            this.settings = current;
+        }
+        change(&mut this.settings);
+        let result = match &this.path {
+            Some(path) => this.settings.save(path),
+            None => Ok(()),
+        };
+        crate::apply_settings(cx);
+        result
+    }
+}
+
+/// State of model catalog syncing, for the settings window.
+#[derive(Clone, Debug, Default)]
+pub struct CatalogSync {
+    /// A sync is running.
+    pub running: bool,
+    /// The last finished sync: when, and what happened.
+    pub last: Option<(i64, SyncReport)>,
+    /// Requested refreshes (providers, forced), for tests.
+    pub requests: Vec<(Vec<String>, bool)>,
+    /// Whether refreshes reach the network (off in tests).
+    pub offline: bool,
+}
+
 /// Providers, credentials and model catalogs shared by every window.
 pub struct AppModels {
     pub models: Models,
+    /// Stored API keys.
+    pub credentials: Arc<Credentials>,
     /// Name new sessions with a short model-generated title.
     pub generate_titles: bool,
+    pub sync: CatalogSync,
 }
 
 impl Global for AppModels {}
 
 impl AppModels {
-    /// Built-in providers with the cached catalog layers applied.
+    /// Built-in and custom providers with keychain credentials and the cached catalog
+    /// layers applied.
     ///
     /// `ZP_BASE_URL_<PROVIDER>` (e.g. `ZP_BASE_URL_DEEPSEEK`) points a provider at another
     /// endpoint such as a proxy or a local mock server.
     pub fn init(cx: &mut App) {
-        let mut models = Models::builtin();
-        if let Some(dir) = cx.try_global::<AppPaths>().and_then(|p| p.data_dir.clone()) {
-            zp_core::model_catalog::ModelCatalogCache::new(&dir).load(&models);
+        let data_dir = cx.try_global::<AppPaths>().and_then(|p| p.data_dir.clone());
+        let credentials = Arc::new(match &data_dir {
+            Some(dir) => Credentials::keychain(dir),
+            None => Credentials::in_memory(),
+        });
+        let mut models = Models::builtin().with_credentials(credentials.clone());
+        let settings = AppSettings::get(cx).clone();
+        zp_core::providers::register_custom_providers(&models, &settings.providers);
+        if let Some(dir) = &data_dir {
+            ModelCatalogCache::new(dir).load(&models);
         }
         apply_base_url_overrides(&mut models);
         cx.set_global(Self {
             models,
-            generate_titles: true,
+            credentials,
+            generate_titles: settings.generate_titles.unwrap_or(true),
+            sync: CatalogSync::default(),
         });
     }
 
-    /// Replaces the registry (tests use a scripted provider).
+    /// Replaces the registry (tests use a scripted provider); keys are kept in memory.
     #[cfg(any(test, feature = "visual-tests"))]
     pub fn set(models: Models, generate_titles: bool, cx: &mut App) {
+        let credentials = Arc::new(Credentials::in_memory());
         cx.set_global(Self {
-            models,
+            models: models.with_credentials(credentials.clone()),
+            credentials,
             generate_titles,
+            sync: CatalogSync {
+                offline: true,
+                ..CatalogSync::default()
+            },
         });
     }
 
-    /// The model new conversations use: the default of the first provider with
-    /// credentials.
+    /// The model new conversations use: the one in the settings if it is available,
+    /// else the default of the first provider with credentials.
     pub fn default_model(cx: &App) -> Option<Model> {
         let models = &cx.try_global::<Self>()?.models;
-        models
-            .available_providers()
-            .iter()
-            .find_map(|provider| models.default_model(provider.id()))
+        let configured = AppSettings::get(cx)
+            .default_model
+            .as_deref()
+            .and_then(|spec| models.find(spec))
+            .filter(|model| models.resolve_auth(&model.provider).is_some());
+        configured.or_else(|| {
+            models
+                .available_providers()
+                .iter()
+                .find_map(|provider| models.default_model(provider.id()))
+        })
+    }
+
+    /// The model catalog cache, if there is a data directory.
+    pub fn catalog_cache(cx: &App) -> Option<ModelCatalogCache> {
+        let dir = cx.try_global::<AppPaths>()?.data_dir.clone()?;
+        Some(ModelCatalogCache::new(&dir))
+    }
+
+    /// Refreshes the catalog in the background: everything (`providers` empty) or only
+    /// some providers' model lists. `force` ignores cache freshness.
+    pub fn sync(cx: &mut App, providers: Vec<String>, force: bool) {
+        let Some(cache) = Self::catalog_cache(cx) else {
+            return;
+        };
+        let state = &mut cx.global_mut::<Self>().sync;
+        state.requests.push((providers.clone(), force));
+        if state.offline {
+            return;
+        }
+        let models = cx.global::<Self>().models.clone();
+        let options = SyncOptions {
+            models_dev: providers.is_empty(),
+            providers,
+            max_age: if force {
+                Duration::ZERO
+            } else {
+                SyncOptions::default().max_age
+            },
+            ..SyncOptions::default()
+        };
+        cx.global_mut::<Self>().sync.running = true;
+        cx.refresh_windows();
+        let task = gpui_tokio::Tokio::spawn(cx, async move { cache.sync(&models, &options).await });
+        cx.spawn(async move |cx| {
+            let report = task.await;
+            cx.update(|cx| {
+                let sync = &mut cx.global_mut::<Self>().sync;
+                sync.running = false;
+                match report {
+                    Ok(report) => {
+                        tracing::info!(?report, "model catalog synced");
+                        sync.last = Some((zp_ai::now_ms(), report));
+                    }
+                    Err(error) => tracing::warn!(%error, "model catalog sync stopped"),
+                }
+                cx.refresh_windows();
+            });
+        })
+        .detach();
+    }
+
+    /// After a key change: drops the provider's cached model list and fetches a new one.
+    pub fn credential_changed(cx: &mut App, provider: &str) {
+        let models = cx.global::<Self>().models.clone();
+        if let Some(cache) = Self::catalog_cache(cx) {
+            if let Err(error) = cache.clear_upstream(&models, provider) {
+                tracing::warn!(%error, provider, "could not clear the model list");
+            }
+        } else {
+            models.set_upstream(provider, None);
+        }
+        if models.resolve_auth(provider).is_some() {
+            Self::sync(cx, vec![provider.to_owned()], true);
+        }
+        cx.refresh_windows();
     }
 }
 

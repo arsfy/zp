@@ -114,6 +114,15 @@ impl SyncReport {
     }
 }
 
+/// When each layer was last refreshed, from the cache.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CatalogStatus {
+    /// Last successful models.dev check (Unix milliseconds) and the models it holds.
+    pub models_dev: Option<(i64, usize)>,
+    /// Per provider: when its list was fetched and how many models it lists.
+    pub upstream: Vec<(String, i64, usize)>,
+}
+
 /// On-disk storage for the runtime catalog layers.
 #[derive(Clone, Debug)]
 pub struct ModelCatalogCache {
@@ -170,6 +179,35 @@ impl ModelCatalogCache {
             if let Some(list) = read_json::<UpstreamModels>(&self.upstream_path(id)) {
                 models.set_upstream(id, Some(list));
             }
+        }
+    }
+
+    /// When the cached layers were refreshed (reads the cache, no network).
+    pub fn status(&self, models: &Models) -> CatalogStatus {
+        let models_dev = read_json::<ModelsDevEntry<serde::de::IgnoredAny>>(
+            &self.models_dev_path(),
+        )
+        .map(|entry| {
+            let count = models.models_dev().map_or(0, |c| c.model_count());
+            (entry.checked_at, count)
+        });
+        let upstream = models
+            .providers()
+            .iter()
+            .filter_map(|provider| {
+                let list = models
+                    .upstream(provider.id())
+                    .map(|list| (list.fetched_at, list.models.len()))
+                    .or_else(|| {
+                        read_json::<UpstreamModels>(&self.upstream_path(provider.id()))
+                            .map(|list| (list.fetched_at, list.models.len()))
+                    })?;
+                Some((provider.id().to_owned(), list.0, list.1))
+            })
+            .collect();
+        CatalogStatus {
+            models_dev,
+            upstream,
         }
     }
 

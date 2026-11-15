@@ -188,6 +188,7 @@ pub fn run(out: PathBuf) {
     tabs_and_history(&mut cx, &data_dir_of(&data), &root, &out);
     changes(&mut cx, &faux, &out);
     approvals(&mut cx, &faux, &out);
+    settings_pages(&mut cx, &out);
     println!("screenshots written to {}", out.display());
 }
 
@@ -699,4 +700,77 @@ fn approvals(cx: &mut VisualTestAppContext, faux: &FauxProvider, out: &std::path
         .unwrap()
         .save(out.join("17-permission-modes.png"))
         .unwrap();
+}
+
+/// M9: every settings page, with a few real providers registered.
+fn settings_pages(cx: &mut VisualTestAppContext, out: &std::path::Path) {
+    use crate::settings::{Page, SettingsWindow};
+    cx.update(|cx| {
+        let app = cx.global::<AppModels>();
+        for provider in Models::builtin().providers() {
+            app.models.register(provider);
+        }
+        app.credentials.set("deepseek", "sk-demo-key").unwrap();
+        crate::store::AppSettings::update(cx, |settings| {
+            settings.default_model = Some("deepseek/deepseek-v4-pro".into());
+            settings.providers = vec![zp_core::settings::CustomProvider {
+                id: "ollama".into(),
+                name: "Ollama".into(),
+                base_url: "http://localhost:11434/v1".into(),
+                models: vec!["qwen3-coder:30b".into(), "gpt-oss:20b".into()],
+                ..Default::default()
+            }];
+            settings
+                .keybindings
+                .insert("zp::SendMessage".into(), "cmd-enter".into());
+        })
+        .unwrap();
+        zp_core::providers::register_custom_providers(
+            &cx.global::<AppModels>().models,
+            &crate::store::AppSettings::get(cx).providers,
+        );
+    });
+    for (index, page) in Page::ALL.into_iter().enumerate() {
+        let window = cx
+            .open_offscreen_window(size(px(980.), px(700.)), |window, cx| {
+                cx.new(|cx| SettingsWindow::new_on(page, window, cx))
+            })
+            .unwrap();
+        pump(cx, Duration::from_millis(150));
+        let name = format!(
+            "{}-settings-{}.png",
+            18 + index,
+            page.label().to_lowercase()
+        );
+        cx.capture_screenshot(window.into())
+            .unwrap()
+            .save(out.join(name))
+            .unwrap();
+        if page == Page::Providers {
+            let shot = |cx: &mut VisualTestAppContext, name: &str| {
+                pump(cx, Duration::from_millis(150));
+                cx.capture_screenshot(window.into())
+                    .unwrap()
+                    .save(out.join(name))
+                    .unwrap();
+            };
+            cx.update_window(window.into(), |_, window, cx| {
+                let view = window.root::<SettingsWindow>().flatten().unwrap();
+                view.update(cx, |view, cx| view.edit_key("faux", window, cx));
+                if let Some(field) = view.read(cx).key_input() {
+                    field.update(cx, |input, cx| {
+                        input.emplace("sk-proj-0123456789abcdef", cx)
+                    });
+                }
+            })
+            .unwrap();
+            shot(cx, "24-settings-api-key.png");
+            cx.update_window(window.into(), |_, window, cx| {
+                let view = window.root::<SettingsWindow>().flatten().unwrap();
+                view.update(cx, |view, cx| view.open_provider_form(None, window, cx));
+            })
+            .unwrap();
+            shot(cx, "25-settings-provider-form.png");
+        }
+    }
 }

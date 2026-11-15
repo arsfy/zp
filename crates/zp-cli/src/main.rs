@@ -7,8 +7,12 @@ use std::io::IsTerminal as _;
 
 use anyhow::{Context as _, Result, bail};
 use clap::{Args, Parser, Subcommand};
+use std::sync::Arc;
 use zp_ai::{MODELS_DEV_URL, Model, Models, ThinkingLevel};
+
+use zp_core::credentials::Credentials;
 use zp_core::model_catalog::{DEFAULT_MAX_AGE, ModelCatalogCache, SyncOptions, SyncOutcome};
+use zp_core::settings::Settings;
 
 /// ZP command-line interface.
 ///
@@ -43,8 +47,24 @@ enum Command {
     Providers,
     /// Refresh model catalogs from models.dev and the configured providers' model lists.
     Sync(SyncArgs),
+    /// Manage API keys stored in the system keychain.
+    Auth {
+        #[command(subcommand)]
+        action: AuthCommand,
+    },
     /// Print data locations.
     Paths,
+}
+
+#[derive(Subcommand)]
+enum AuthCommand {
+    /// Store the API key of a provider (read from stdin).
+    Set {
+        /// Provider id, e.g. `deepseek` (see `zp-cli providers`).
+        provider: String,
+    },
+    /// Delete the stored API key of a provider.
+    Remove { provider: String },
 }
 
 #[derive(Args)]
@@ -70,11 +90,21 @@ struct SyncArgs {
 async fn main() -> Result<()> {
     zp_core::logging::init();
     let cli = Cli::parse();
-    let models = Models::builtin();
-    let cache = zp_core::paths::data_dir()
-        .map(|dir| ModelCatalogCache::new(&dir))
-        .inspect_err(|error| eprintln!("warning: model cache unavailable: {error:#}"))
+    let data_dir = zp_core::paths::data_dir()
+        .inspect_err(|error| eprintln!("warning: no data directory: {error:#}"))
         .ok();
+    // The same keys, custom providers and settings as the app.
+    let credentials = Arc::new(match &data_dir {
+        Some(dir) => Credentials::keychain(dir),
+        None => Credentials::in_memory(),
+    });
+    let settings = data_dir
+        .as_deref()
+        .map(|dir| Settings::load_or_default(&zp_core::paths::settings_file(dir)))
+        .unwrap_or_default();
+    let models = Models::builtin().with_credentials(credentials.clone());
+    zp_core::providers::register_custom_providers(&models, &settings.providers);
+    let cache = data_dir.as_deref().map(ModelCatalogCache::new);
     if let Some(cache) = &cache {
         cache.load(&models);
     }
@@ -92,6 +122,7 @@ async fn main() -> Result<()> {
             list_providers(&models);
             Ok(())
         }
+        Command::Auth { action } => auth(&models, &credentials, cache.as_ref(), action),
         Command::Sync(args) => {
             let cache = cache.context("no data directory for the model cache")?;
             sync(&models, &cache, args).await
@@ -114,6 +145,40 @@ async fn main() -> Result<()> {
             Ok(())
         }
     }
+}
+
+fn auth(
+    models: &Models,
+    credentials: &Credentials,
+    cache: Option<&ModelCatalogCache>,
+    action: AuthCommand,
+) -> Result<()> {
+    let provider = match &action {
+        AuthCommand::Set { provider } | AuthCommand::Remove { provider } => provider.clone(),
+    };
+    if models.provider(&provider).is_none() {
+        bail!("unknown provider `{provider}` (see `zp-cli providers`)");
+    }
+    match action {
+        AuthCommand::Set { .. } => {
+            if std::io::stdin().is_terminal() {
+                eprint!("API key for {provider}: ");
+            }
+            let mut key = String::new();
+            std::io::stdin().read_line(&mut key)?;
+            credentials.set(&provider, key.trim())?;
+            eprintln!("Stored the key of {provider} in the keychain.");
+        }
+        AuthCommand::Remove { .. } => {
+            credentials.remove(&provider)?;
+            eprintln!("Removed the key of {provider}.");
+        }
+    }
+    // The model list depends on the key.
+    if let Some(cache) = cache {
+        cache.clear_upstream(models, &provider)?;
+    }
+    Ok(())
 }
 
 async fn sync(models: &Models, cache: &ModelCatalogCache, args: SyncArgs) -> Result<()> {
@@ -183,12 +248,22 @@ async fn sync(models: &Models, cache: &ModelCatalogCache, args: SyncArgs) -> Res
     Ok(())
 }
 
-/// Resolves `--model`, or the default model of the first provider with credentials.
+/// Resolves `--model`, else the default model of the settings, else the default model of
+/// the first provider with credentials.
 pub(crate) fn select_model(models: &Models, spec: Option<&str>) -> Result<Model> {
     if let Some(spec) = spec {
         return models
             .find(spec)
             .with_context(|| format!("unknown model `{spec}` (see `zp-cli models`)"));
+    }
+    let configured = zp_core::paths::data_dir()
+        .ok()
+        .map(|dir| Settings::load_or_default(&zp_core::paths::settings_file(&dir)))
+        .and_then(|settings| settings.default_model)
+        .and_then(|spec| models.find(&spec))
+        .filter(|model| models.resolve_auth(&model.provider).is_some());
+    if let Some(model) = configured {
+        return Ok(model);
     }
     for provider in models.available_providers() {
         if let Some(model) = models.default_model(provider.id()) {

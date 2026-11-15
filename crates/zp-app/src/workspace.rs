@@ -151,7 +151,7 @@ pub fn capture_geometry(window: &Window, cx: &App) -> WindowGeometry {
     }
 }
 
-fn window_options(
+pub(crate) fn window_options(
     title: String,
     geometry: Option<&WindowGeometry>,
     default: (f32, f32),
@@ -333,4 +333,13 @@ pub fn report_error(title: &str, error: &anyhow::Error, cx: &mut App) {
             let _answer = window.prompt(PromptLevel::Warning, &title, Some(&detail), &["OK"], cx);
         });
     });
+}
+
+/// Re-applies the permission settings to every open project.
+pub fn apply_permissions(cx: &mut App) {
+    for window in cx.windows() {
+        if let Some(project) = window.downcast::<ProjectWindow>() {
+            let _ = project.update(cx, |view, _, cx| view.apply_permissions(cx));
+        }
+    }
 }

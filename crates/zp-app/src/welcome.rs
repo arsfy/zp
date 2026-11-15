@@ -7,7 +7,7 @@ use gpui::{
     prelude::*, px,
 };
 
-use crate::actions::{KEY_NEW_WINDOW, KEY_OPEN_FOLDER, NewWindow, OpenFolder};
+use crate::actions::{NewWindow, OpenFolder, shortcut_keys};
 use crate::store::AppStore;
 use crate::theme::{ActiveTheme, Theme};
 use crate::ui::{CUSTOM_TITLE_BAR, button, section_header, title_bar};
@@ -165,14 +165,14 @@ impl WelcomeView {
                     .child(button(
                         "open-folder",
                         "Open Folder…",
-                        Some(KEY_OPEN_FOLDER),
+                        shortcut_keys("zp::OpenFolder", cx).as_deref(),
                         cx,
                         |_, window, cx| window.dispatch_action(Box::new(OpenFolder), cx),
                     ))
                     .child(button(
                         "new-window",
                         "New Window",
-                        Some(KEY_NEW_WINDOW),
+                        shortcut_keys("zp::NewWindow", cx).as_deref(),
                         cx,
                         |_, window, cx| window.dispatch_action(Box::new(NewWindow), cx),
                     )),

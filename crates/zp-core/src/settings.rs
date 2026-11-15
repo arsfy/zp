@@ -1,6 +1,7 @@
 //! Settings: global (`~/.zp/settings.json`) and per project (`<project>/.zp/settings.json`,
 //! only read for trusted projects).
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::Context as _;
@@ -27,11 +28,60 @@ pub struct PermissionSettings {
     pub additional_directories: Vec<String>,
 }
 
+/// Light or dark UI.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ThemeChoice {
+    /// Follow the system appearance.
+    #[default]
+    System,
+    Dark,
+    Light,
+}
+
+/// An OpenAI-compatible (or Anthropic-compatible) endpoint added by the user.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct CustomProvider {
+    /// Provider id (`[a-z0-9_-]`), also the keychain entry of its key.
+    pub id: String,
+    pub name: String,
+    /// API base URL, e.g. `http://localhost:11434/v1`.
+    pub base_url: String,
+    /// Wire protocol: `openai-completions` (default) or `anthropic-messages`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub api: Option<String>,
+    /// Extra request headers.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub headers: BTreeMap<String, String>,
+    /// Model ids; empty means the models the endpoint lists.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub models: Vec<String>,
+}
+
 /// The contents of a `settings.json`. Unknown keys are kept when saving.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct Settings {
+    /// Model of new conversations, as `provider/model`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default_model: Option<String>,
+    /// Reasoning level of new conversations.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default_thinking: Option<zp_ai::ThinkingLevel>,
+    /// Name conversations with a short model-generated title (default on).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub generate_titles: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub theme: Option<ThemeChoice>,
     pub permissions: PermissionSettings,
+    /// User-defined providers.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub providers: Vec<CustomProvider>,
+    /// Shortcut overrides: action name (`zp::NewChat`) → keystrokes (`cmd-k`); an empty
+    /// string removes the shortcut.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub keybindings: BTreeMap<String, String>,
     #[serde(flatten)]
     pub other: Map<String, Value>,
 }
@@ -173,5 +223,30 @@ mod tests {
         std::fs::write(&file, "{ nope").unwrap();
         assert!(Settings::load(&file).is_err());
         assert_eq!(Settings::load_or_default(&file), Settings::default());
+    }
+
+    #[test]
+    fn general_appearance_providers_and_keys() {
+        let text = r#"{
+            "defaultModel": "deepseek/deepseek-v4-pro",
+            "defaultThinking": "high",
+            "generateTitles": false,
+            "theme": "light",
+            "providers": [{"id": "local", "name": "Local", "baseUrl": "http://localhost:1234/v1", "models": ["m1"]}],
+            "keybindings": {"zp::NewChat": "cmd-k"}
+        }"#;
+        let settings: Settings = serde_json::from_str(text).unwrap();
+        assert_eq!(settings.default_thinking, Some(zp_ai::ThinkingLevel::High));
+        assert_eq!(settings.theme, Some(ThemeChoice::Light));
+        assert_eq!(settings.providers[0].models, ["m1"]);
+        assert_eq!(settings.keybindings["zp::NewChat"], "cmd-k");
+        let back: Settings =
+            serde_json::from_str(&serde_json::to_string(&settings).unwrap()).unwrap();
+        assert_eq!(back, settings);
+        // Defaults stay out of the file.
+        assert_eq!(
+            serde_json::to_string(&Settings::default()).unwrap(),
+            r#"{"permissions":{}}"#
+        );
     }
 }

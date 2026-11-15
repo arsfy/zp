@@ -26,6 +26,15 @@ zp-ai.workspace = true
 zp-session.workspace = true
 zp-tools.workspace = true
 
+[target.'cfg(target_os = "macos")'.dependencies]
+keyring = { version = "3", features = ["apple-native"] }
+
+[target.'cfg(windows)'.dependencies]
+keyring = { version = "3", features = ["windows-native"] }
+
+[target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
+keyring = { version = "3", features = ["sync-secret-service", "crypto-rust"] }
+
 [dev-dependencies]
 tempfile.workspace = true
 tokio.workspace = true

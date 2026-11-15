@@ -185,6 +185,10 @@ impl ConversationView {
             })?),
         };
         let mut options = CodingSessionOptions::new(models, &self.root, session);
+        if model.is_some() {
+            // A new conversation: start at the default reasoning level.
+            options.thinking_level = crate::store::AppSettings::get(cx).default_thinking;
+        }
         options.model = model;
         options.global_context_dir = cx.try_global::<AppPaths>().and_then(|p| p.data_dir.clone());
         options.blobs = AppPaths::blobs(cx);

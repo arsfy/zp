@@ -41,7 +41,7 @@ pub use model::{
     Api, CostTier, InputModality, MaxTokensField, Model, ModelCompat, ModelCost, ThinkingFormat,
     ThinkingLevel,
 };
-pub use models::Models;
+pub use models::{ModelSource, Models};
 pub use options::{DEFAULT_MAX_RETRIES, StreamOptions, ThinkingBudgets};
 pub use provider::{HttpProvider, Provider};
 pub use sync::{

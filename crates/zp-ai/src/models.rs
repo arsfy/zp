@@ -18,14 +18,36 @@ use crate::sync::{
 };
 use crate::types::{AssistantMessage, Context};
 
+/// Where a model in [`Models::models`] comes from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ModelSource {
+    /// The provider's built-in catalog (possibly with metadata from models.dev).
+    BuiltIn,
+    /// Added from models.dev.
+    ModelsDev,
+    /// Only in the provider's own model list.
+    Upstream,
+}
+
+impl ModelSource {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::BuiltIn => "built-in",
+            Self::ModelsDev => "models.dev",
+            Self::Upstream => "provider list",
+        }
+    }
+}
+
 /// Registered providers plus credential resolution.
 ///
 /// Model lists are each provider's catalog with the models.dev and upstream layers
-/// applied (see [`crate::sync`]). Layers live behind a shared lock, so clones of a
-/// `Models` observe each other's [`Self::set_models_dev`] / [`Self::set_upstream`] calls.
+/// applied (see [`crate::sync`]). Providers and layers live behind shared locks, so clones
+/// of a `Models` observe each other's changes (a provider added in the settings is usable
+/// by running conversations).
 #[derive(Clone)]
 pub struct Models {
-    providers: Vec<Arc<dyn Provider>>,
+    providers: Arc<RwLock<Vec<Arc<dyn Provider>>>>,
     credentials: Arc<dyn CredentialStore>,
     env: EnvLookup,
     layers: Arc<RwLock<Layers>>,
@@ -58,7 +80,7 @@ impl Models {
     /// An empty collection reading keys from the process environment.
     pub fn new() -> Self {
         Self {
-            providers: Vec::new(),
+            providers: Arc::default(),
             credentials: Arc::new(MemoryCredentialStore::new()),
             env: process_env(),
             layers: Arc::default(),
@@ -88,10 +110,58 @@ impl Models {
 
     /// Registers a provider, replacing one with the same id.
     pub fn set_provider(&mut self, provider: Arc<dyn Provider>) {
+        self.register(provider);
+    }
+
+    /// Registers a provider, replacing one with the same id (also for clones).
+    pub fn register(&self, provider: Arc<dyn Provider>) {
         self.write_layers().changed();
-        match self.providers.iter_mut().find(|p| p.id() == provider.id()) {
+        let mut providers = self
+            .providers
+            .write()
+            .unwrap_or_else(PoisonError::into_inner);
+        match providers.iter_mut().find(|p| p.id() == provider.id()) {
             Some(slot) => *slot = provider,
-            None => self.providers.push(provider),
+            None => providers.push(provider),
+        }
+    }
+
+    /// Removes provider `id` and its upstream layer. Returns whether it was registered.
+    pub fn remove_provider(&self, id: &str) -> bool {
+        let removed = {
+            let mut providers = self
+                .providers
+                .write()
+                .unwrap_or_else(PoisonError::into_inner);
+            let before = providers.len();
+            providers.retain(|p| p.id() != id);
+            providers.len() != before
+        };
+        let mut layers = self.write_layers();
+        layers.upstream.remove(id);
+        layers.changed();
+        removed
+    }
+
+    /// Where `model` comes from: the built-in catalog, models.dev or only the provider's
+    /// own list.
+    pub fn model_source(&self, model: &Model) -> ModelSource {
+        let Some(provider) = self.provider(&model.provider) else {
+            return ModelSource::BuiltIn;
+        };
+        if provider.models().iter().any(|m| m.id == model.id) {
+            return ModelSource::BuiltIn;
+        }
+        let layers = self.read_layers();
+        let in_dev = provider
+            .models_dev_id()
+            .zip(layers.models_dev.as_deref())
+            .and_then(|(id, catalog)| catalog.provider(id))
+            .is_some_and(|dev| dev.models.contains_key(&model.id));
+        if in_dev {
+            ModelSource::ModelsDev
+        } else {
+            ModelSource::Upstream
         }
     }
 
@@ -144,7 +214,7 @@ impl Models {
 
     /// models.dev ids of the registered providers.
     pub fn models_dev_ids(&self) -> BTreeSet<String> {
-        self.providers
+        self.providers()
             .iter()
             .filter_map(|p| p.models_dev_id().map(str::to_owned))
             .collect()
@@ -197,18 +267,26 @@ impl Models {
     }
 
     /// Registered providers in registration order.
-    pub fn providers(&self) -> &[Arc<dyn Provider>] {
-        &self.providers
+    pub fn providers(&self) -> Vec<Arc<dyn Provider>> {
+        self.providers
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
     }
 
     /// The provider with `id`.
-    pub fn provider(&self, id: &str) -> Option<&Arc<dyn Provider>> {
-        self.providers.iter().find(|provider| provider.id() == id)
+    pub fn provider(&self, id: &str) -> Option<Arc<dyn Provider>> {
+        self.providers
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .find(|provider| provider.id() == id)
+            .cloned()
     }
 
     /// All models, optionally limited to one provider.
     pub fn models(&self, provider: Option<&str>) -> Vec<Model> {
-        self.providers
+        self.providers()
             .iter()
             .filter(|p| provider.is_none_or(|id| p.id() == id))
             .flat_map(|p| self.provider_models(p).to_vec())
@@ -217,7 +295,7 @@ impl Models {
 
     /// The model `id` of `provider`.
     pub fn model(&self, provider: &str, id: &str) -> Option<Model> {
-        self.provider_models(self.provider(provider)?)
+        self.provider_models(&self.provider(provider)?)
             .iter()
             .find(|m| m.id == id)
             .cloned()
@@ -231,7 +309,7 @@ impl Models {
         {
             return Some(model);
         }
-        self.providers.iter().find_map(|p| {
+        self.providers().iter().find_map(|p| {
             self.provider_models(p)
                 .iter()
                 .find(|m| m.id == spec)
@@ -243,7 +321,7 @@ impl Models {
     pub fn default_model(&self, provider: &str) -> Option<Model> {
         let provider = self.provider(provider)?;
         let id = provider.default_model_id()?;
-        self.provider_models(provider)
+        self.provider_models(&provider)
             .iter()
             .find(|m| m.id == id)
             .cloned()
@@ -274,10 +352,9 @@ impl Models {
 
     /// Providers whose credentials resolve.
     pub fn available_providers(&self) -> Vec<Arc<dyn Provider>> {
-        self.providers
-            .iter()
+        self.providers()
+            .into_iter()
             .filter(|p| self.resolve_auth(p.id()).is_some())
-            .cloned()
             .collect()
     }
 
@@ -334,6 +411,22 @@ mod tests {
             .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
             .collect();
         Arc::new(move |name| map.get(name).cloned())
+    }
+
+    #[test]
+    fn clones_share_providers() {
+        let models = Models::new().with_env(env(&[]));
+        let clone = models.clone();
+        models.register(Arc::new(FauxProvider::default()));
+        assert_eq!(clone.providers().len(), 1);
+        let model = clone.models(None)[0].clone();
+        assert_eq!(clone.model_source(&model), ModelSource::BuiltIn);
+        let mut listed = model.clone();
+        listed.id = "listed-only".into();
+        assert_eq!(clone.model_source(&listed), ModelSource::Upstream);
+        assert!(clone.remove_provider(&model.provider));
+        assert!(models.providers().is_empty());
+        assert!(!models.remove_provider("nope"));
     }
 
     #[test]

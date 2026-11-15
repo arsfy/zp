@@ -11,6 +11,7 @@ mod conversation;
 mod diff_view;
 mod markdown;
 mod project;
+mod settings;
 mod store;
 mod theme;
 mod ui;
@@ -25,6 +26,8 @@ mod tests_changes;
 mod tests_conversation;
 #[cfg(test)]
 mod tests_permissions;
+#[cfg(test)]
+mod tests_settings;
 #[cfg(feature = "visual-tests")]
 mod visual;
 
@@ -32,7 +35,7 @@ use std::path::PathBuf;
 
 use gpui::App;
 
-use crate::store::{AppModels, AppPaths, AppStore};
+use crate::store::{AppModels, AppPaths, AppSettings, AppStore};
 use crate::theme::Theme;
 use crate::workspace::Workspaces;
 
@@ -55,6 +58,8 @@ fn main() {
             .inspect_err(|error| tracing::warn!(%error, "no data directory; state is not saved"))
             .ok();
         init(data_dir, cx);
+        // Refresh stale model catalog layers in the background.
+        AppModels::sync(cx, Vec::new(), false);
         cx.on_app_quit(|cx| {
             workspace::prepare_quit(cx);
             async {}
@@ -81,10 +86,24 @@ fn main() {
 
 /// Installs the globals every window relies on.
 pub fn init(data_dir: Option<PathBuf>, cx: &mut App) {
+    AppSettings::init(data_dir.as_deref(), cx);
     Theme::init(cx);
     AppPaths::init(data_dir.clone(), cx);
     AppStore::init(data_dir.as_deref().map(zp_core::paths::state_file), cx);
     AppModels::init(cx);
     Workspaces::init(cx);
     actions::init(cx);
+}
+
+/// Applies changed settings to the running app: theme, shortcuts, titles and the
+/// permissions of open projects.
+pub fn apply_settings(cx: &mut App) {
+    Theme::apply_settings(cx);
+    actions::bind_keys(cx);
+    let titles = AppSettings::get(cx).generate_titles.unwrap_or(true);
+    if cx.has_global::<AppModels>() {
+        cx.global_mut::<AppModels>().generate_titles = titles;
+    }
+    workspace::apply_permissions(cx);
+    cx.refresh_windows();
 }

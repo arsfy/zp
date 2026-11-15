@@ -832,11 +832,21 @@ impl ConversationView {
                                         .child(if self.running {
                                             "Esc to stop".to_owned()
                                         } else {
-                                            format!(
-                                                "{} to send · Shift+{} for newline",
-                                                crate::ui::shortcut_label(KEY_SEND),
-                                                crate::ui::shortcut_label(KEY_SEND)
-                                            )
+                                            match crate::actions::shortcut_keys(
+                                                "zp::SendMessage",
+                                                cx,
+                                            ) {
+                                                Some(keys) if keys == KEY_SEND => format!(
+                                                    "{} to send · Shift+{} for newline",
+                                                    crate::ui::shortcut_label(&keys),
+                                                    crate::ui::shortcut_label(&keys)
+                                                ),
+                                                Some(keys) => format!(
+                                                    "{} to send",
+                                                    crate::ui::shortcut_label(&keys)
+                                                ),
+                                                None => String::new(),
+                                            }
                                         }),
                                 )
                                 .child(action),

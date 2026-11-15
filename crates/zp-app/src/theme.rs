@@ -1,8 +1,10 @@
 //! Theme tokens for the ZP UI.
 //!
-//! The active theme is stored as a GPUI global and follows the system appearance.
+//! The active theme is stored as a GPUI global; it follows the system appearance unless
+//! the settings pick light or dark.
 
 use gpui::{App, Global, Pixels, Rgba, SharedString, WindowAppearance, px, rgb};
+use zp_core::settings::ThemeChoice;
 
 /// Color tokens used throughout the UI.
 #[derive(Clone, Debug)]
@@ -58,20 +60,43 @@ pub struct Theme {
 impl Global for Theme {}
 
 impl Theme {
-    /// Installs the theme matching the current system appearance.
+    /// Installs the theme of the settings (or the system appearance).
     pub fn init(cx: &mut App) {
-        cx.set_global(Self::for_appearance(cx.window_appearance()));
+        let theme = Self::for_settings(cx.window_appearance(), cx);
+        cx.set_global(theme);
     }
 
-    /// Switches the global theme if the system appearance changed. Returns `true` when
-    /// the theme was replaced and windows need to re-render.
+    fn choice(cx: &App) -> ThemeChoice {
+        cx.try_global::<crate::store::AppSettings>()
+            .and_then(|_| crate::store::AppSettings::get(cx).theme)
+            .unwrap_or_default()
+    }
+
+    fn for_settings(appearance: WindowAppearance, cx: &App) -> Self {
+        match Self::choice(cx) {
+            ThemeChoice::System => Self::for_appearance(appearance),
+            ThemeChoice::Dark => Self::dark(),
+            ThemeChoice::Light => Self::light(),
+        }
+    }
+
+    /// Switches the global theme if the system appearance changed (and the settings
+    /// follow it). Returns `true` when the theme was replaced and windows need to
+    /// re-render.
     pub fn sync_with_appearance(appearance: WindowAppearance, cx: &mut App) -> bool {
-        let next = Self::for_appearance(appearance);
+        let next = Self::for_settings(appearance, cx);
         if cx.global::<Self>().is_dark == next.is_dark {
             return false;
         }
         cx.set_global(next);
         true
+    }
+
+    /// Applies a changed theme setting to every window.
+    pub fn apply_settings(cx: &mut App) {
+        if Self::sync_with_appearance(cx.window_appearance(), cx) {
+            cx.refresh_windows();
+        }
     }
 
     /// Returns the theme for a system appearance.

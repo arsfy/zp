@@ -180,9 +180,19 @@ pub(crate) async fn run(models: &Models, args: RunArgs) -> Result<()> {
         None
     };
 
+    // New sessions start at the default reasoning level of the settings.
+    let default_thinking = session
+        .context()
+        .thinking_level
+        .is_none()
+        .then(|| {
+            zp_core::settings::Settings::load_or_default(&zp_core::paths::settings_file(&data_dir))
+                .default_thinking
+        })
+        .flatten();
     let mut options = CodingSessionOptions::new(models.clone(), &cwd, session);
     options.model = model;
-    options.thinking_level = args.thinking;
+    options.thinking_level = args.thinking.or(default_thinking);
     options.tools = tools;
     if !args.no_session {
         options.blobs = Some(zp_core::checkpoint::BlobStore::in_data_dir(&data_dir));
