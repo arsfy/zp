@@ -6,10 +6,7 @@ use gpui::{App, Global, Pixels, Rgba, WindowAppearance, px, rgb};
 
 /// Color tokens used throughout the UI.
 #[derive(Clone, Debug)]
-#[allow(
-    dead_code,
-    reason = "tokens are adopted progressively by the UI from M4 on"
-)]
+#[allow(dead_code, reason = "state colors are used from M5 on")]
 pub struct ThemeColors {
     /// Window background.
     pub background: Rgba,
@@ -37,10 +34,6 @@ pub struct ThemeColors {
 
 /// Spacing and sizing tokens.
 #[derive(Clone, Debug)]
-#[allow(
-    dead_code,
-    reason = "tokens are adopted progressively by the UI from M4 on"
-)]
 pub struct ThemeMetrics {
     /// Base UI font size.
     pub font_size: Pixels,

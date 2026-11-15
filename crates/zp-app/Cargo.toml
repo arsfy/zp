@@ -19,4 +19,10 @@ gpui.workspace = true
 gpui_platform.workspace = true
 gpui_tokio.workspace = true
 tracing.workspace = true
+zp-ai.workspace = true
 zp-core.workspace = true
+zp-session.workspace = true
+
+[dev-dependencies]
+gpui = { workspace = true, features = ["test-support"] }
+tempfile.workspace = true
