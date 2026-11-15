@@ -14,7 +14,7 @@ use gpui::{
 };
 use zp_core::app_state::{WindowGeometry, WindowMode};
 
-use crate::project_window::ProjectWindow;
+use crate::project::ProjectWindow;
 use crate::store::AppStore;
 use crate::ui;
 use crate::welcome::WelcomeView;

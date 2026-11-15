@@ -6,7 +6,6 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::{Context as _, Result, bail};
 use clap::Args;
-use serde_json::Value;
 use tokio::io::AsyncBufReadExt as _;
 use zp_agent::{AgentEvent, AgentMessage, AgentToolResult, PromptInput};
 use zp_ai::{AssistantMessageEvent, Models, StopReason, StreamOptions, ThinkingLevel, UserContent};
@@ -92,15 +91,15 @@ impl Style {
     }
 }
 
+/// The project directory in the same canonical form the GUI uses, so both find the same
+/// sessions.
 fn project_dir(cwd: Option<&Path>) -> Result<PathBuf> {
     let dir = match cwd {
-        Some(dir) => std::path::absolute(dir)?,
+        Some(dir) => dir.to_path_buf(),
         None => std::env::current_dir()?,
     };
-    if !dir.is_dir() {
-        bail!("{} is not a directory", dir.display());
-    }
-    Ok(dir)
+    zp_core::project::normalize_project_path(&dir)
+        .with_context(|| format!("{} is not a usable project directory", dir.display()))
 }
 
 fn session_manager() -> Result<(PathBuf, SessionManager)> {
@@ -518,7 +517,10 @@ impl Printer {
             AgentEvent::ToolExecutionStart {
                 tool_name, args, ..
             } => {
-                let call = format!("→ {tool_name} {}", summarize_args(tool_name, args));
+                let call = format!(
+                    "→ {tool_name} {}",
+                    zp_tools::describe_call(tool_name, args, 120)
+                );
                 let _ = writeln!(stderr, "{}", self.style.paint("36", call.trim_end()));
             }
             AgentEvent::ToolExecutionEnd {
@@ -535,32 +537,6 @@ impl Printer {
             }
             _ => {}
         }
-    }
-}
-
-fn one_line(text: &str, max_chars: usize) -> String {
-    let line = text.lines().next().unwrap_or_default();
-    let mut short: String = line.chars().take(max_chars).collect();
-    if short.len() < line.len() || text.lines().nth(1).is_some() {
-        short.push('…');
-    }
-    short
-}
-
-fn summarize_args(tool: &str, args: &Value) -> String {
-    let field = |name: &str| args.get(name).and_then(Value::as_str).unwrap_or_default();
-    match tool {
-        "bash" => format!("$ {}", one_line(field("command"), 120)),
-        "read" | "write" | "edit" | "ls" => field("path").to_owned(),
-        "grep" | "find" => {
-            let path = field("path");
-            if path.is_empty() {
-                field("pattern").to_owned()
-            } else {
-                format!("{} in {path}", field("pattern"))
-            }
-        }
-        _ => one_line(&args.to_string(), 120),
     }
 }
 

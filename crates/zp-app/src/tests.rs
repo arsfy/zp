@@ -11,7 +11,7 @@ use crate::store::AppStore;
 use crate::workspace::{self, Workspaces};
 
 /// Initializes the app with a temp data directory, optionally seeded with `state`.
-fn setup(cx: &mut TestAppContext, state: Option<AppState>) -> TempDir {
+pub(crate) fn setup(cx: &mut TestAppContext, state: Option<AppState>) -> TempDir {
     let data = tempfile::tempdir().unwrap();
     if let Some(state) = state {
         state
@@ -23,13 +23,13 @@ fn setup(cx: &mut TestAppContext, state: Option<AppState>) -> TempDir {
     data
 }
 
-fn project_dir() -> (TempDir, PathBuf) {
+pub(crate) fn project_dir() -> (TempDir, PathBuf) {
     let dir = tempfile::tempdir().unwrap();
     let canonical = zp_core::project::normalize_project_path(dir.path()).unwrap();
     (dir, canonical)
 }
 
-fn saved_state(cx: &mut TestAppContext, data: &TempDir) -> AppState {
+pub(crate) fn saved_state(cx: &mut TestAppContext, data: &TempDir) -> AppState {
     cx.update(AppStore::flush);
     AppState::load(&zp_core::paths::state_file(data.path()))
 }

@@ -3,6 +3,7 @@
 //! Key bindings use `secondary`, which is cmd on macOS and ctrl on Linux / Windows.
 
 use gpui::{App, KeyBinding, Menu, MenuItem, PromptLevel, actions};
+use gpui_elements::editable_text::actions::{DEFAULT_INPUT_CONTEXT, Enter, default_bindings};
 
 use crate::workspace;
 
@@ -16,9 +17,29 @@ actions!(
         CloseTab,
         CloseWindow,
         ToggleSidebar,
-        ToggleRightPanel
+        ToggleRightPanel,
+        NewChat,
+        SendMessage,
+        StopRun,
+        ClosePicker,
+        PickFirstModel,
+        NextTab,
+        PreviousTab,
+        ToggleSessionTree,
+        SelectNextSession,
+        SelectPreviousSession,
+        OpenSelectedSession,
+        ClearSessionSearch,
+        ConfirmRename,
+        CancelRename,
+        DismissMenu
     ]
 );
+
+/// Activates the tab at an index (`usize::MAX` for the last tab).
+#[derive(Clone, Debug, PartialEq, gpui::Action)]
+#[action(namespace = zp, no_json)]
+pub struct ActivateTab(pub usize);
 
 /// Key context of project windows.
 pub const PROJECT_CONTEXT: &str = "ProjectWindow";
@@ -30,6 +51,18 @@ pub const KEY_CLOSE_TAB: &str = "secondary-w";
 pub const KEY_CLOSE_WINDOW: &str = "secondary-shift-w";
 pub const KEY_TOGGLE_SIDEBAR: &str = "secondary-b";
 pub const KEY_TOGGLE_RIGHT_PANEL: &str = "secondary-alt-b";
+pub const KEY_NEW_CHAT: &str = "secondary-t";
+pub const KEY_SEND: &str = "enter";
+
+/// The composer's text field.
+const COMPOSER_INPUT: &str = "Composer > EditableText";
+/// The model picker's filter field.
+const MODEL_FILTER_INPUT: &str = "ModelPicker > EditableText";
+/// The sidebar's session search field.
+const SESSION_SEARCH_INPUT: &str = "SessionSearch > EditableText";
+/// The rename field.
+const RENAME_INPUT: &str = "RenameInput > EditableText";
+pub const KEY_SESSION_TREE: &str = "secondary-shift-t";
 
 /// Registers global action handlers, key bindings and the application menu.
 pub fn init(cx: &mut App) {
@@ -43,7 +76,46 @@ pub fn init(cx: &mut App) {
     // do when no tabs are left.
     cx.on_action(|_: &CloseTab, cx| workspace::close_active_window(cx));
 
+    // `secondary-1` … `secondary-8` pick a tab, `secondary-9` the last one; the platform
+    // shortcuts for the next / previous tab work too.
+    for index in 0..9 {
+        let target = if index == 8 { usize::MAX } else { index };
+        cx.bind_keys([KeyBinding::new(
+            &format!("secondary-{}", index + 1),
+            ActivateTab(target),
+            Some(PROJECT_CONTEXT),
+        )]);
+    }
+    if cfg!(target_os = "macos") {
+        cx.bind_keys([
+            KeyBinding::new("cmd-shift-]", NextTab, Some(PROJECT_CONTEXT)),
+            KeyBinding::new("cmd-shift-[", PreviousTab, Some(PROJECT_CONTEXT)),
+        ]);
+    } else {
+        cx.bind_keys([
+            KeyBinding::new("ctrl-pagedown", NextTab, Some(PROJECT_CONTEXT)),
+            KeyBinding::new("ctrl-pageup", PreviousTab, Some(PROJECT_CONTEXT)),
+        ]);
+    }
+    // Text fields first, so the more specific composer bindings below override them.
+    cx.bind_keys(default_bindings().as_keybindings(Some(DEFAULT_INPUT_CONTEXT)));
     cx.bind_keys([
+        KeyBinding::new(KEY_SEND, SendMessage, Some(COMPOSER_INPUT)),
+        KeyBinding::new("shift-enter", Enter, Some(COMPOSER_INPUT)),
+        KeyBinding::new("escape", StopRun, Some(COMPOSER_INPUT)),
+        KeyBinding::new("enter", PickFirstModel, Some(MODEL_FILTER_INPUT)),
+        KeyBinding::new("escape", ClosePicker, Some(MODEL_FILTER_INPUT)),
+        KeyBinding::new(KEY_NEW_CHAT, NewChat, Some(PROJECT_CONTEXT)),
+        KeyBinding::new("ctrl-tab", NextTab, Some(PROJECT_CONTEXT)),
+        KeyBinding::new("ctrl-shift-tab", PreviousTab, Some(PROJECT_CONTEXT)),
+        KeyBinding::new(KEY_SESSION_TREE, ToggleSessionTree, Some(PROJECT_CONTEXT)),
+        KeyBinding::new("down", SelectNextSession, Some(SESSION_SEARCH_INPUT)),
+        KeyBinding::new("up", SelectPreviousSession, Some(SESSION_SEARCH_INPUT)),
+        KeyBinding::new("enter", OpenSelectedSession, Some(SESSION_SEARCH_INPUT)),
+        KeyBinding::new("escape", ClearSessionSearch, Some(SESSION_SEARCH_INPUT)),
+        KeyBinding::new("enter", ConfirmRename, Some(RENAME_INPUT)),
+        KeyBinding::new("escape", CancelRename, Some(RENAME_INPUT)),
+        KeyBinding::new("escape", DismissMenu, Some("ContextMenu")),
         KeyBinding::new(KEY_QUIT, Quit, None),
         KeyBinding::new(KEY_OPEN_FOLDER, OpenFolder, None),
         KeyBinding::new(KEY_NEW_WINDOW, NewWindow, None),
@@ -71,6 +143,7 @@ pub fn init(cx: &mut App) {
         Menu {
             name: "File".into(),
             items: vec![
+                MenuItem::action("New Chat", NewChat),
                 MenuItem::action("New Window", NewWindow),
                 MenuItem::action("Open Folder…", OpenFolder),
                 MenuItem::separator(),
@@ -82,6 +155,10 @@ pub fn init(cx: &mut App) {
         Menu {
             name: "View".into(),
             items: vec![
+                MenuItem::action("Next Tab", NextTab),
+                MenuItem::action("Previous Tab", PreviousTab),
+                MenuItem::action("Session Tree", ToggleSessionTree),
+                MenuItem::separator(),
                 MenuItem::action("Toggle Sidebar", ToggleSidebar),
                 MenuItem::action("Toggle Changes Panel", ToggleRightPanel),
             ],

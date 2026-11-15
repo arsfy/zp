@@ -117,7 +117,8 @@ pub struct UsageTotals {
 }
 
 impl UsageTotals {
-    fn add(&mut self, usage: &Usage) {
+    /// Adds one response's usage.
+    pub fn add(&mut self, usage: &Usage) {
         self.input += usage.input;
         self.output += usage.output;
         self.cache_read += usage.cache_read;
@@ -282,6 +283,75 @@ impl CodingSession {
         let messages = {
             let mut session = self.session();
             session.branch(id)?;
+            session.context().messages
+        };
+        self.agent.set_messages(messages);
+        Ok(())
+    }
+
+    /// Moves to just before entry `id` (e.g. to edit and resend a message): the next prompt
+    /// starts a sibling branch of `id`.
+    pub fn branch_before(&self, id: &str) -> anyhow::Result<()> {
+        if self.agent.is_streaming() {
+            bail!("cannot branch while the agent is running");
+        }
+        let messages = {
+            let mut session = self.session();
+            let parent = session
+                .entry(id)
+                .with_context(|| format!("entry {id} not found"))?
+                .parent_id
+                .clone();
+            match parent {
+                Some(parent) => session.branch(&parent)?,
+                None => session.reset_leaf(),
+            }
+            session.context().messages
+        };
+        self.agent.set_messages(messages);
+        Ok(())
+    }
+
+    /// Switches to the most recent branch through entry `id`.
+    pub fn switch_branch(&self, id: &str) -> anyhow::Result<()> {
+        let leaf = self
+            .session()
+            .latest_leaf_under(id)
+            .map(str::to_owned)
+            .with_context(|| format!("entry {id} not found"))?;
+        self.branch(&leaf)
+    }
+
+    /// The session entry behind each message of the agent transcript.
+    pub fn context_entry_ids(&self) -> Vec<String> {
+        self.session().context().entry_ids
+    }
+
+    /// Rewinds past a failed or aborted last response so that
+    /// [`Agent::continue_run`] asks again. The failed response stays in the session file
+    /// on an abandoned branch.
+    pub fn prepare_retry(&self) -> anyhow::Result<()> {
+        if self.agent.is_streaming() {
+            bail!("cannot retry while the agent is running");
+        }
+        let messages = {
+            let mut session = self.session();
+            let path = session.branch_path(None);
+            let failed = path
+                .iter()
+                .rev()
+                .find_map(|entry| Some((entry, entry.message()?)))
+                .filter(|(_, message)| {
+                    message.as_assistant().is_some_and(|m| {
+                        matches!(m.stop_reason, StopReason::Error | StopReason::Aborted)
+                    })
+                })
+                .map(|(entry, _)| entry.parent_id.clone());
+            match failed {
+                Some(Some(parent)) => session.branch(&parent)?,
+                Some(None) => session.reset_leaf(),
+                None => bail!("the last response did not fail"),
+            }
             session.context().messages
         };
         self.agent.set_messages(messages);

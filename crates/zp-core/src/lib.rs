@@ -11,6 +11,7 @@ pub mod model_catalog;
 pub mod paths;
 pub mod project;
 pub mod system_prompt;
+pub mod title;
 
 pub use coding_session::{
     CodingHooks, CodingSession, CodingSessionOptions, UsageTotals, session_model,

@@ -144,6 +144,39 @@ async fn read_edit_test_then_resume() {
 }
 
 #[tokio::test]
+async fn retry_after_a_failed_response() {
+    let project = tempfile::tempdir().unwrap();
+    let faux = FauxProvider::default();
+    faux.push(FauxResponse::Error("overloaded".into()));
+    faux.push(FauxResponse::text("second try"));
+    let session = zp_session::Session::in_memory(project.path());
+    let mut options = CodingSessionOptions::new(models(&faux), project.path(), session);
+    options.model = Some(faux.model());
+    let coding = CodingSession::new(options).unwrap();
+
+    assert!(coding.prepare_retry().is_err(), "nothing failed yet");
+    coding.prompt("hi").await.unwrap();
+    assert_eq!(coding.agent().messages().len(), 2);
+    coding.prepare_retry().unwrap();
+    assert_eq!(coding.agent().messages().len(), 1);
+    let added = coding.agent().continue_run().await.unwrap();
+    assert_eq!(added[0].as_assistant().unwrap().text(), "second try");
+    // The request did not include the failed response.
+    assert_eq!(faux.requests()[1].messages.len(), 1);
+    let session = coding.session();
+    assert_eq!(session.context().messages.len(), 2);
+    assert_eq!(
+        session
+            .entries()
+            .iter()
+            .filter(|e| e.message().is_some())
+            .count(),
+        3,
+        "the failed attempt is kept on its own branch"
+    );
+}
+
+#[tokio::test]
 async fn branching_rewinds_the_agent_transcript() {
     let project = tempfile::tempdir().unwrap();
     let faux = FauxProvider::default();
@@ -169,4 +202,46 @@ async fn branching_rewinds_the_agent_transcript() {
 
     coding.set_name(Some("Experiment".into())).unwrap();
     assert_eq!(coding.session().name(), Some("Experiment"));
+}
+
+#[tokio::test]
+async fn titles_and_branch_navigation() {
+    let faux = FauxProvider::default();
+    faux.push(FauxResponse::text("\"Fix the flaky test.\""));
+    let models = models(&faux);
+    let title = zp_core::title::generate_title(&models, &faux.model(), "the test is flaky")
+        .await
+        .unwrap();
+    assert_eq!(title, "Fix the flaky test");
+    assert_eq!(faux.requests()[0].messages.len(), 1);
+    // Faux models are free, so the current model is used.
+    assert_eq!(
+        zp_core::title::title_model(&models, &faux.model()).id,
+        "faux-1"
+    );
+
+    let project = tempfile::tempdir().unwrap();
+    faux.push(FauxResponse::text("a1"));
+    faux.push(FauxResponse::text("a2"));
+    faux.push(FauxResponse::text("a2 again"));
+    let session = zp_session::Session::in_memory(project.path());
+    let mut options = CodingSessionOptions::new(models, project.path(), session);
+    options.model = Some(faux.model());
+    let coding = CodingSession::new(options).unwrap();
+    coding.prompt("u1").await.unwrap();
+    coding.prompt("u2").await.unwrap();
+    let ids = coding.context_entry_ids();
+    assert_eq!(ids.len(), 4);
+
+    // Edit & resend the second user message: a sibling branch.
+    coding.branch_before(&ids[2]).unwrap();
+    assert_eq!(coding.agent().messages().len(), 2);
+    coding.prompt("u2 edited").await.unwrap();
+    assert_eq!(coding.session().children(&ids[1]).len(), 2);
+
+    // Switching back to the original branch lands on its latest message.
+    coding.switch_branch(&ids[2]).unwrap();
+    let messages = coding.agent().messages();
+    assert_eq!(messages.len(), 4);
+    assert_eq!(messages[3].as_assistant().unwrap().text(), "a2");
 }

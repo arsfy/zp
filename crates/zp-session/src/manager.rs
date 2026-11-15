@@ -30,29 +30,46 @@ pub struct SessionInfo {
     pub message_count: usize,
     /// Text of the first user message (shortened).
     pub first_message: String,
+    /// User and assistant text of the whole session (capped), for searching.
+    pub search_text: String,
 }
 
 impl SessionInfo {
     /// Summarizes an opened session.
     pub fn of(session: &Session, path: PathBuf) -> Self {
+        const SEARCH_TEXT_LIMIT: usize = 64 * 1024;
         let mut message_count = 0;
         let mut first_message = None;
+        let mut search_text = String::new();
+        let mut add_text = |text: &str| {
+            if search_text.len() < SEARCH_TEXT_LIMIT {
+                search_text.push_str(text);
+                search_text.push('\n');
+            }
+        };
         for entry in session.entries() {
             match entry.message() {
                 Some(AgentMessage::Llm(Message::User(user))) => {
                     message_count += 1;
+                    let text: String = user
+                        .content
+                        .iter()
+                        .filter_map(UserContent::as_text)
+                        .collect();
                     if first_message.is_none() {
-                        let text: String = user
-                            .content
-                            .iter()
-                            .filter_map(UserContent::as_text)
-                            .collect();
                         first_message = Some(shorten(text.trim(), 200));
                     }
+                    add_text(&text);
                 }
-                Some(AgentMessage::Llm(Message::Assistant(_))) => message_count += 1,
+                Some(AgentMessage::Llm(Message::Assistant(assistant))) => {
+                    message_count += 1;
+                    add_text(&assistant.text());
+                }
                 _ => {}
             }
+        }
+        if let Some(name) = session.name() {
+            add_text(name);
         }
         Self {
             path,
@@ -67,7 +84,18 @@ impl SessionInfo {
                 .map_or(session.header().timestamp, |entry| entry.timestamp),
             message_count,
             first_message: first_message.unwrap_or_default(),
+            search_text,
         }
+    }
+
+    /// Whether every whitespace-separated word of `query` occurs (case-insensitively) in
+    /// the title or text.
+    pub fn matches(&self, query: &str) -> bool {
+        let haystack = format!("{}\n{}", self.title(), self.search_text).to_lowercase();
+        query
+            .to_lowercase()
+            .split_whitespace()
+            .all(|word| haystack.contains(word))
     }
 
     /// The name, else the first message, else `(empty)`.

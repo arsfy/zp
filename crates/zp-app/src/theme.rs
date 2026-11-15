@@ -2,11 +2,10 @@
 //!
 //! The active theme is stored as a GPUI global and follows the system appearance.
 
-use gpui::{App, Global, Pixels, Rgba, WindowAppearance, px, rgb};
+use gpui::{App, Global, Pixels, Rgba, SharedString, WindowAppearance, px, rgb};
 
 /// Color tokens used throughout the UI.
 #[derive(Clone, Debug)]
-#[allow(dead_code, reason = "state colors are used from M5 on")]
 pub struct ThemeColors {
     /// Window background.
     pub background: Rgba,
@@ -30,6 +29,8 @@ pub struct ThemeColors {
     pub warning: Rgba,
     /// Error state (e.g. removed lines).
     pub error: Rgba,
+    /// Background of code blocks and inline code.
+    pub code_background: Rgba,
 }
 
 /// Spacing and sizing tokens.
@@ -39,6 +40,8 @@ pub struct ThemeMetrics {
     pub font_size: Pixels,
     /// Corner radius for controls.
     pub radius: Pixels,
+    /// Monospace font for code and command output.
+    pub mono_font: SharedString,
 }
 
 /// The active UI theme.
@@ -95,6 +98,7 @@ impl Theme {
                 success: rgb(0x4fbf7f),
                 warning: rgb(0xe0b350),
                 error: rgb(0xe5605b),
+                code_background: rgb(0x23252c),
             },
             metrics: ThemeMetrics::default(),
         }
@@ -116,6 +120,7 @@ impl Theme {
                 success: rgb(0x22863a),
                 warning: rgb(0xb7791f),
                 error: rgb(0xcb2431),
+                code_background: rgb(0xf0f1f4),
             },
             metrics: ThemeMetrics::default(),
         }
@@ -127,6 +132,14 @@ impl Default for ThemeMetrics {
         Self {
             font_size: px(13.),
             radius: px(6.),
+            mono_font: if cfg!(target_os = "macos") {
+                "Menlo"
+            } else if cfg!(target_os = "windows") {
+                "Consolas"
+            } else {
+                "DejaVu Sans Mono"
+            }
+            .into(),
         }
     }
 }

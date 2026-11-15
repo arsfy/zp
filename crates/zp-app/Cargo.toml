@@ -15,13 +15,26 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow.workspace = true
+chrono.workspace = true
+futures.workspace = true
 gpui.workspace = true
+gpui_elements.workspace = true
 gpui_platform.workspace = true
 gpui_tokio.workspace = true
+pulldown-cmark.workspace = true
+serde_json.workspace = true
 tracing.workspace = true
+trash.workspace = true
+zp-agent.workspace = true
 zp-ai.workspace = true
 zp-core.workspace = true
 zp-session.workspace = true
+zp-tools.workspace = true
+tempfile = { workspace = true, optional = true }
+
+[features]
+# `zp --visual-tests DIR`: render scripted scenarios off-screen and save screenshots.
+visual-tests = ["gpui/test-support", "gpui_platform/test-support", "dep:tempfile"]
 
 [dev-dependencies]
 gpui = { workspace = true, features = ["test-support"] }

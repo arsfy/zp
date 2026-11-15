@@ -29,6 +29,8 @@ pub struct ModelRef {
 pub struct SessionContext {
     /// Transcript, with compacted history replaced by its summary.
     pub messages: Vec<AgentMessage>,
+    /// The entry each message came from (the compaction entry for its summary).
+    pub entry_ids: Vec<String>,
     /// Last model used or selected on the branch.
     pub model: Option<ModelRef>,
     /// Last reasoning level selected on the branch.
@@ -407,6 +409,27 @@ impl Session {
         path
     }
 
+    /// The most recent entry in the subtree of `id` (`id` itself if it has no
+    /// descendants): where "switching to that branch" should land.
+    pub fn latest_leaf_under(&self, id: &str) -> Option<&str> {
+        let target = self.entry(id)?;
+        for entry in self.entries.iter().rev() {
+            let mut current = Some(entry);
+            let mut steps = 0;
+            while let Some(node) = current {
+                if node.id == target.id {
+                    return Some(&entry.id);
+                }
+                steps += 1;
+                if steps > self.entries.len() {
+                    break;
+                }
+                current = node.parent_id.as_deref().and_then(|p| self.entry(p));
+            }
+        }
+        Some(&target.id)
+    }
+
     /// The agent context of the current branch.
     pub fn context(&self) -> SessionContext {
         self.context_at(None)
@@ -442,8 +465,16 @@ impl Session {
         let compaction = path
             .iter()
             .rposition(|entry| matches!(entry.data, EntryData::Compaction { .. }));
+        let push = |entry: &SessionEntry, context: &mut SessionContext| {
+            if let Some(message) = entry.message() {
+                context.messages.push(message.clone());
+                context.entry_ids.push(entry.id.clone());
+            }
+        };
         let Some(at) = compaction else {
-            context.messages = path.iter().filter_map(|e| e.message().cloned()).collect();
+            for entry in &path {
+                push(entry, &mut context);
+            }
             return context;
         };
         let EntryData::Compaction {
@@ -464,16 +495,14 @@ impl Session {
             }
             .into(),
         );
+        context.entry_ids.push(path[at].id.clone());
         let kept_from = path[..at]
             .iter()
             .position(|entry| &entry.id == first_kept_entry_id)
             .unwrap_or(at);
-        context.messages.extend(
-            path[kept_from..at]
-                .iter()
-                .chain(&path[at + 1..])
-                .filter_map(|entry| entry.message().cloned()),
-        );
+        for entry in path[kept_from..at].iter().chain(&path[at + 1..]) {
+            push(entry, &mut context);
+        }
         context
     }
 

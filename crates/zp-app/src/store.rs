@@ -5,7 +5,9 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use gpui::{App, Global, Task};
-use zp_ai::{Model, Models};
+use std::sync::Arc;
+
+use zp_ai::{HttpProvider, Model, Models, Provider};
 use zp_core::app_state::AppState;
 
 /// Delay before writing state changes, so bursts (window drags) cause one write.
@@ -87,18 +89,36 @@ impl AppStore {
 /// Providers, credentials and model catalogs shared by every window.
 pub struct AppModels {
     pub models: Models,
+    /// Name new sessions with a short model-generated title.
+    pub generate_titles: bool,
 }
 
 impl Global for AppModels {}
 
 impl AppModels {
     /// Built-in providers with the cached catalog layers applied.
+    ///
+    /// `ZP_BASE_URL_<PROVIDER>` (e.g. `ZP_BASE_URL_DEEPSEEK`) points a provider at another
+    /// endpoint such as a proxy or a local mock server.
     pub fn init(cx: &mut App) {
-        let models = Models::builtin();
+        let mut models = Models::builtin();
         if let Some(dir) = cx.try_global::<AppPaths>().and_then(|p| p.data_dir.clone()) {
             zp_core::model_catalog::ModelCatalogCache::new(&dir).load(&models);
         }
-        cx.set_global(Self { models });
+        apply_base_url_overrides(&mut models);
+        cx.set_global(Self {
+            models,
+            generate_titles: true,
+        });
+    }
+
+    /// Replaces the registry (tests use a scripted provider).
+    #[cfg(any(test, feature = "visual-tests"))]
+    pub fn set(models: Models, generate_titles: bool, cx: &mut App) {
+        cx.set_global(Self {
+            models,
+            generate_titles,
+        });
     }
 
     /// The model new conversations use: the default of the first provider with
@@ -109,5 +129,60 @@ impl AppModels {
             .available_providers()
             .iter()
             .find_map(|provider| models.default_model(provider.id()))
+    }
+}
+
+/// Applies `ZP_BASE_URL_<PROVIDER>` environment overrides.
+fn apply_base_url_overrides(models: &mut Models) {
+    let overrides: Vec<(Arc<dyn Provider>, String)> = models
+        .providers()
+        .iter()
+        .filter_map(|provider| {
+            let var = format!(
+                "ZP_BASE_URL_{}",
+                provider.id().to_uppercase().replace('-', "_")
+            );
+            let url = std::env::var(var)
+                .ok()
+                .filter(|url| !url.trim().is_empty())?;
+            Some((provider.clone(), url))
+        })
+        .collect();
+    for (provider, url) in overrides {
+        tracing::info!(provider = provider.id(), %url, "overriding base URL");
+        let catalog: Vec<Model> = models
+            .models(Some(provider.id()))
+            .into_iter()
+            .map(|mut model| {
+                model.base_url.clone_from(&url);
+                model
+            })
+            .collect();
+        let mut replacement = HttpProvider::new(
+            provider.id(),
+            provider.name(),
+            provider.api_key_env_vars().to_vec(),
+            catalog,
+        );
+        if let Some(id) = provider.default_model_id() {
+            replacement = replacement.with_default_model(id);
+        }
+        if let Some((api, _)) = provider.api_endpoint() {
+            replacement = replacement.with_api_endpoint(api, url.clone());
+        }
+        models.set_provider(Arc::new(replacement));
+    }
+}
+
+/// How deleted sessions are removed: the system trash by default; tests delete directly.
+#[derive(Clone, Copy)]
+pub struct FileTrash(pub fn(&std::path::Path) -> anyhow::Result<()>);
+
+impl Global for FileTrash {}
+
+impl FileTrash {
+    /// Moves files to the platform trash.
+    pub fn system() -> Self {
+        Self(|path| trash::delete(path).map_err(|error| anyhow::anyhow!("{error}")))
     }
 }

@@ -88,6 +88,26 @@ pub struct ProjectUiState {
     pub window: Option<WindowGeometry>,
     /// Panel layout.
     pub layout: PanelLayout,
+    /// Open conversation tabs, in order.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub tabs: Vec<TabState>,
+    /// Index of the active tab.
+    pub active_tab: usize,
+}
+
+/// A conversation tab to restore.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct TabState {
+    /// Session file; `None` for a chat that had no messages yet.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session: Option<PathBuf>,
+    /// The branch shown (session leaf entry), if not the latest one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub leaf: Option<String>,
+    /// Pinned tabs stay at the front.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub pinned: bool,
 }
 
 /// Everything in `state.json`.

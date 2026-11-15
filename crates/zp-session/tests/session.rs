@@ -280,3 +280,48 @@ fn manager_lists_finds_and_forks() {
     assert_eq!(encode_cwd(Path::new("/work/my-app")), "--work-my-app--");
     assert_eq!(encode_cwd(Path::new("C:\\Users\\me")), "--C--Users-me--");
 }
+
+#[test]
+fn context_entry_ids_and_latest_leaves() {
+    let mut session = Session::in_memory(Path::new("/p"));
+    let u1 = session.append_message(AgentMessage::user("u1")).unwrap();
+    session.append_model_change("p", "m").unwrap();
+    let a1 = session.append_message(assistant("a1", "m")).unwrap();
+    let u2 = session.append_message(AgentMessage::user("u2")).unwrap();
+    let a2 = session.append_message(assistant("a2", "m")).unwrap();
+    let context = session.context();
+    assert_eq!(
+        context.entry_ids,
+        [u1.clone(), a1.clone(), u2.clone(), a2.clone()]
+    );
+
+    session.branch(&a1).unwrap();
+    let u3 = session.append_message(AgentMessage::user("u3")).unwrap();
+    assert_eq!(session.latest_leaf_under(&u1), Some(u3.as_str()));
+    assert_eq!(session.latest_leaf_under(&u2), Some(a2.as_str()));
+    assert_eq!(session.latest_leaf_under(&a2), Some(a2.as_str()));
+    assert_eq!(session.latest_leaf_under("nope"), None);
+
+    // With a compaction, the summary maps to the compaction entry.
+    session.branch(&a2).unwrap();
+    let compaction = session.append_compaction("s".into(), &u2, 1, None).unwrap();
+    assert_eq!(session.context().entry_ids, [compaction, u2, a2]);
+}
+
+#[test]
+fn session_info_search() {
+    let root = tempfile::tempdir().unwrap();
+    let manager = SessionManager::new(root.path());
+    let mut session = manager.create(Path::new("/p"));
+    session
+        .append_message(AgentMessage::user("Fix the parser"))
+        .unwrap();
+    session
+        .append_message(assistant("Used recursive descent", "m"))
+        .unwrap();
+    let info = &manager.list(Path::new("/p")).unwrap()[0];
+    assert!(info.matches("parser"));
+    assert!(info.matches("RECURSIVE fix"));
+    assert!(!info.matches("lexer"));
+    assert!(info.matches(""));
+}

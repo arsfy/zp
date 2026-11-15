@@ -6,6 +6,7 @@
 //! a notice telling the model how to get the rest.
 
 mod bash;
+mod describe;
 mod edit;
 mod edit_apply;
 mod file_change;
@@ -24,6 +25,7 @@ use std::sync::Arc;
 use zp_agent::AgentTool;
 
 pub use bash::BashTool;
+pub use describe::{describe_call, shorten};
 pub use edit::EditTool;
 pub use edit_apply::{EditSpec, apply_edits};
 pub use file_change::FileChange;
