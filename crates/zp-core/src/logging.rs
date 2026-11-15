@@ -7,7 +7,7 @@ const DEFAULT_FILTER: &str = "info,zp=debug";
 
 /// Initializes `tracing` output to stderr.
 ///
-/// The filter is read from `RUST_LOG`, falling back to [`DEFAULT_FILTER`]. Calling this
+/// The filter is read from `RUST_LOG`, falling back to `info,zp=debug`. Calling this
 /// more than once is harmless; later calls are ignored.
 pub fn init() {
     let filter =

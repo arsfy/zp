@@ -59,6 +59,17 @@ pub trait AgentTool: Send + Sync {
     /// JSON Schema of the arguments (`{"type": "object", ...}`).
     fn parameters(&self) -> Value;
 
+    /// One-line summary for the system prompt's tool list; tools without one are not
+    /// listed there (the model still sees their declaration).
+    fn prompt_snippet(&self) -> Option<&str> {
+        None
+    }
+
+    /// Usage rules added to the system prompt when the tool is enabled.
+    fn prompt_guidelines(&self) -> &[&str] {
+        &[]
+    }
+
     /// Forces an execution mode for batches containing this tool. `Sequential` makes the
     /// whole batch sequential.
     fn execution_mode(&self) -> Option<ToolExecutionMode> {

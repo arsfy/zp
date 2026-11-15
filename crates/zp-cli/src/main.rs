@@ -9,17 +9,26 @@ use clap::{Args, Parser, Subcommand};
 use zp_ai::{MODELS_DEV_URL, Model, Models, ThinkingLevel};
 use zp_core::model_catalog::{DEFAULT_MAX_AGE, ModelCatalogCache, SyncOptions, SyncOutcome};
 
+/// ZP command-line interface.
+///
+/// Without a subcommand, runs the coding agent in the current (or `--cwd`) directory: with
+/// a prompt it answers once and exits; without one on a terminal it starts an interactive
+/// session. Sessions are saved under `~/.zp/sessions` (see `zp-cli sessions`).
 #[derive(Parser)]
-#[command(name = "zp-cli", version, about = "ZP command-line interface")]
+#[command(name = "zp-cli", version, args_conflicts_with_subcommands = true)]
 struct Cli {
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
+    #[command(flatten)]
+    run: run::RunArgs,
 }
 
 #[derive(Subcommand)]
 enum Command {
-    /// Send a prompt and stream the response.
+    /// Run the coding agent (the default command).
     Run(run::RunArgs),
+    /// List saved sessions of a project.
+    Sessions(run::SessionsArgs),
     /// List models.
     Models {
         /// Only this provider.
@@ -68,8 +77,9 @@ async fn main() -> Result<()> {
     if let Some(cache) = &cache {
         cache.load(&models);
     }
-    match cli.command {
+    match cli.command.unwrap_or(Command::Run(cli.run)) {
         Command::Run(args) => run::run(&models, args).await,
+        Command::Sessions(args) => run::list_sessions(args),
         Command::Models {
             provider,
             available,
@@ -264,7 +274,7 @@ fn list_providers(models: &Models) {
     print_table(&rows);
 }
 
-fn print_table<const N: usize>(rows: &[[String; N]]) {
+pub(crate) fn print_table<const N: usize>(rows: &[[String; N]]) {
     let mut widths = [0usize; N];
     for row in rows {
         for (width, cell) in widths.iter_mut().zip(row) {

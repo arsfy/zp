@@ -17,7 +17,11 @@ serde.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+zp-agent.workspace = true
 zp-ai.workspace = true
+zp-session.workspace = true
+zp-tools.workspace = true
 
 [dev-dependencies]
+tempfile.workspace = true
 tokio.workspace = true

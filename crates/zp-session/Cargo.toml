@@ -10,3 +10,13 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+zp-agent.workspace = true
+zp-ai.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

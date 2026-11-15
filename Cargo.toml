@@ -15,6 +15,8 @@ publish = false
 zp-agent = { path = "crates/zp-agent" }
 zp-ai = { path = "crates/zp-ai" }
 zp-core = { path = "crates/zp-core" }
+zp-session = { path = "crates/zp-session" }
+zp-tools = { path = "crates/zp-tools" }
 
 # GPUI Community Edition, pinned to a specific revision because the API moves fast.
 # The library crate is published as `gpui-ce` but its lib name is `gpui`.
@@ -24,6 +26,13 @@ gpui_tokio = { package = "gpui_ce_tokio", git = "https://github.com/gpui-ce/gpui
 
 # Common
 anyhow = "1"
+base64 = "0.22"
+globset = "0.4"
+ignore = "0.4"
+nix = { version = "0.30", default-features = false, features = ["signal", "process"] }
+regex = "1"
+uuid = { version = "1", features = ["v4", "v7"] }
+tempfile = "3"
 clap = { version = "4", features = ["derive"] }
 futures = "0.3"
 reqwest = { version = "0.13", features = ["stream"] }
