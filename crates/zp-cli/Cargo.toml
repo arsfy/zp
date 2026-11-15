@@ -19,5 +19,6 @@ clap.workspace = true
 futures.workspace = true
 serde_json.workspace = true
 tokio = { workspace = true, features = ["signal"] }
+zp-agent.workspace = true
 zp-ai.workspace = true
 zp-core.workspace = true

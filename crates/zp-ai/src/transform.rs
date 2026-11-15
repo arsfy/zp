@@ -39,6 +39,7 @@ pub(crate) fn prepare_messages(
                         tool_name: call.name.clone(),
                         content: vec![UserContent::text("No result provided")],
                         is_error: true,
+                        details: None,
                         timestamp: now_ms(),
                     }));
                 }
@@ -219,6 +220,7 @@ mod tests {
             tool_name: "read".into(),
             content: vec![UserContent::text("ok")],
             is_error: false,
+            details: None,
             timestamp: 0,
         })
     }

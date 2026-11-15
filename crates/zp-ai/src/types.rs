@@ -278,6 +278,9 @@ pub struct ToolResultMessage {
     pub content: Vec<UserContent>,
     /// Whether the tool failed.
     pub is_error: bool,
+    /// Tool-specific data for logs and UI (e.g. a file diff). Never sent to the model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub details: Option<Value>,
     /// Creation time in milliseconds.
     pub timestamp: i64,
 }
@@ -290,6 +293,7 @@ impl ToolResultMessage {
             tool_name: call.name.clone(),
             content: vec![UserContent::text(text)],
             is_error,
+            details: None,
             timestamp: now_ms(),
         }
     }

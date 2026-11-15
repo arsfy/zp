@@ -12,6 +12,7 @@ publish = false
 
 [workspace.dependencies]
 # Internal crates (others are added as they gain dependents)
+zp-agent = { path = "crates/zp-agent" }
 zp-ai = { path = "crates/zp-ai" }
 zp-core = { path = "crates/zp-core" }
 

@@ -1,15 +1,14 @@
-//! `zp-cli run`: stream one prompt (optionally with a demo tool loop).
+//! `zp-cli run`: stream one prompt through the agent loop (optionally with a demo tool).
 
 use std::io::{IsTerminal as _, Read as _, Write as _};
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Result, bail};
 use clap::Args;
-use futures::StreamExt as _;
-use serde_json::json;
-use zp_ai::{
-    AssistantContent, AssistantMessage, AssistantMessageEvent, Context, Message, Models,
-    StopReason, StreamOptions, ThinkingLevel, Tool, ToolResultMessage,
-};
+use futures::future::BoxFuture;
+use serde_json::{Value, json};
+use zp_agent::{Agent, AgentEvent, AgentOptions, AgentTool, AgentToolResult, ToolContext};
+use zp_ai::{AssistantMessageEvent, Models, StopReason, StreamOptions, ThinkingLevel, UserContent};
 
 #[derive(Args)]
 pub(crate) struct RunArgs {
@@ -35,8 +34,7 @@ pub(crate) struct RunArgs {
     prompt: Vec<String>,
 }
 
-const MAX_TOOL_ROUNDS: usize = 5;
-
+#[derive(Clone, Copy)]
 struct Style {
     enabled: bool,
 }
@@ -73,149 +71,173 @@ pub(crate) async fn run(models: &Models, args: RunArgs) -> Result<()> {
     let style = Style {
         enabled: std::io::stderr().is_terminal(),
     };
-    let thinking = model.clamp_thinking_level(args.thinking);
     eprintln!(
         "{}",
         style.paint(
             "2",
-            &format!("{} · thinking {}", model.qualified_id(), thinking)
+            &format!(
+                "{} · thinking {}",
+                model.qualified_id(),
+                model.clamp_thinking_level(args.thinking)
+            )
         )
     );
 
-    let mut context = Context {
-        system_prompt: args.system,
-        messages: vec![Message::user(prompt)],
-        tools: if args.demo_tool {
-            vec![time_tool()]
-        } else {
-            Vec::new()
-        },
+    let mut options = AgentOptions::with_models(models.clone(), model);
+    options.thinking_level = args.thinking;
+    options.system_prompt = args.system;
+    if args.demo_tool {
+        options.tools.push(Arc::new(TimeTool));
+    }
+    options.request_options = StreamOptions {
+        max_tokens: args.max_tokens,
+        ..StreamOptions::default()
+    };
+    let agent = Agent::new(options);
+    let printer = Arc::new(Mutex::new(Printer {
+        style,
+        ends_with_newline: true,
+        totals: Totals::default(),
+    }));
+    let _subscription = {
+        let printer = printer.clone();
+        agent.subscribe(move |event| {
+            if let Ok(mut printer) = printer.lock() {
+                printer.handle(event);
+            }
+        })
     };
 
-    let mut totals = (0u64, 0u64, 0u64, 0.0f64);
-    for _ in 0..MAX_TOOL_ROUNDS {
-        let options = StreamOptions {
-            thinking: args.thinking,
-            max_tokens: args.max_tokens,
-            ..StreamOptions::default()
-        };
-        let cancel = options.cancel.clone();
-        let stream = models.stream(&model, &context, options);
-        let message = tokio::select! {
-            message = print_stream(stream, &style) => message,
-            _ = tokio::signal::ctrl_c() => {
-                cancel.cancel();
-                eprintln!("\n{}", style.paint("33", "aborted"));
-                std::process::exit(130);
-            }
-        };
-        totals.0 += message.usage.input;
-        totals.1 += message.usage.cache_read + message.usage.cache_write;
-        totals.2 += message.usage.output;
-        totals.3 += message.usage.cost.total;
+    let added = tokio::select! {
+        added = agent.prompt(prompt) => added?,
+        _ = tokio::signal::ctrl_c() => {
+            agent.abort();
+            agent.wait_for_idle().await;
+            eprintln!("\n{}", style.paint("33", "aborted"));
+            std::process::exit(130);
+        }
+    };
 
-        if matches!(message.stop_reason, StopReason::Error | StopReason::Aborted) {
-            let error = message
-                .error_message
-                .unwrap_or_else(|| "unknown error".into());
-            eprintln!("{}", style.paint("31", &format!("error: {error}")));
-            std::process::exit(1);
-        }
-        let calls: Vec<_> = message.tool_calls().cloned().collect();
-        let stop_reason = message.stop_reason;
-        context.messages.push(message.into());
-        if calls.is_empty() || stop_reason != StopReason::ToolUse {
-            break;
-        }
-        for call in calls {
-            let (output, is_error) = if call.name == "get_current_time" {
-                (current_time_utc(), false)
-            } else {
-                (format!("unknown tool `{}`", call.name), true)
-            };
-            eprintln!("{}", style.paint("36", &format!("← {output}")));
-            context
-                .messages
-                .push(ToolResultMessage::text(&call, output, is_error).into());
-        }
-    }
-
+    let totals = printer.lock().map(|p| p.totals).unwrap_or_default();
     eprintln!(
         "{}",
         style.paint(
             "2",
             &format!(
                 "tokens: in {} (+{} cached) · out {} · cost ${:.6}",
-                totals.0, totals.1, totals.2, totals.3
+                totals.input, totals.cached, totals.output, totals.cost
             )
         )
     );
+    if let Some(last) = added.iter().rev().find_map(|m| m.as_assistant())
+        && matches!(last.stop_reason, StopReason::Error | StopReason::Aborted)
+    {
+        let error = last.error_message.as_deref().unwrap_or("unknown error");
+        eprintln!("{}", style.paint("31", &format!("error: {error}")));
+        std::process::exit(1);
+    }
     Ok(())
 }
 
-/// Prints a response as it streams and returns the final message.
-async fn print_stream(
-    mut stream: zp_ai::AssistantMessageStream,
-    style: &Style,
-) -> AssistantMessage {
-    let mut stdout = std::io::stdout();
-    let mut stderr = std::io::stderr();
-    let mut ends_with_newline = true;
-    while let Some(event) = stream.next().await {
+#[derive(Clone, Copy, Default)]
+struct Totals {
+    input: u64,
+    cached: u64,
+    output: u64,
+    cost: f64,
+}
+
+/// Prints agent events as they arrive: text to stdout, everything else to stderr.
+struct Printer {
+    style: Style,
+    ends_with_newline: bool,
+    totals: Totals,
+}
+
+impl Printer {
+    fn handle(&mut self, event: &AgentEvent) {
+        let mut stdout = std::io::stdout();
+        let mut stderr = std::io::stderr();
         match event {
-            AssistantMessageEvent::ThinkingStart { .. } => {
-                let _ = write!(stderr, "{}", style.paint("2;3", "thinking: "));
-            }
-            AssistantMessageEvent::ThinkingDelta { delta, .. } => {
-                let _ = write!(stderr, "{}", style.paint("2;3", &delta));
-                let _ = stderr.flush();
-            }
-            AssistantMessageEvent::ThinkingEnd { .. } => {
-                let _ = writeln!(stderr);
-            }
-            AssistantMessageEvent::TextDelta { delta, .. } => {
-                ends_with_newline = delta.ends_with('\n');
-                let _ = write!(stdout, "{delta}");
-                let _ = stdout.flush();
-            }
-            AssistantMessageEvent::ToolCallEnd { tool_call, .. } => {
-                if !ends_with_newline {
-                    let _ = writeln!(stdout);
-                    ends_with_newline = true;
+            AgentEvent::MessageUpdate { event } => match event {
+                AssistantMessageEvent::ThinkingStart { .. } => {
+                    let _ = write!(stderr, "{}", self.style.paint("2;3", "thinking: "));
                 }
+                AssistantMessageEvent::ThinkingDelta { delta, .. } => {
+                    let _ = write!(stderr, "{}", self.style.paint("2;3", delta));
+                    let _ = stderr.flush();
+                }
+                AssistantMessageEvent::ThinkingEnd { .. } => {
+                    let _ = writeln!(stderr);
+                }
+                AssistantMessageEvent::TextDelta { delta, .. } => {
+                    self.ends_with_newline = delta.ends_with('\n');
+                    let _ = write!(stdout, "{delta}");
+                    let _ = stdout.flush();
+                }
+                _ => {}
+            },
+            AgentEvent::MessageEnd { message } if message.is_assistant() => {
+                if !self.ends_with_newline {
+                    let _ = writeln!(stdout);
+                    self.ends_with_newline = true;
+                }
+            }
+            AgentEvent::ToolExecutionStart {
+                tool_name, args, ..
+            } => {
+                let call = format!("→ {tool_name}({args})");
+                let _ = writeln!(stderr, "{}", self.style.paint("36", &call));
+            }
+            AgentEvent::ToolExecutionEnd {
+                result, is_error, ..
+            } => {
+                let output: String = result
+                    .content
+                    .iter()
+                    .filter_map(UserContent::as_text)
+                    .collect();
+                let color = if *is_error { "31" } else { "36" };
                 let _ = writeln!(
                     stderr,
                     "{}",
-                    style.paint(
-                        "36",
-                        &format!("→ {}({})", tool_call.name, tool_call.arguments)
-                    )
+                    self.style.paint(color, &format!("← {output}"))
                 );
             }
-            AssistantMessageEvent::Done { message } | AssistantMessageEvent::Error { message } => {
-                let printed_text = message
-                    .content
-                    .iter()
-                    .any(|block| matches!(block, AssistantContent::Text(_)));
-                if printed_text && !ends_with_newline {
-                    let _ = writeln!(stdout);
-                }
-                return message;
+            AgentEvent::TurnEnd { message, .. } => {
+                let usage = &message.usage;
+                self.totals.input += usage.input;
+                self.totals.cached += usage.cache_read + usage.cache_write;
+                self.totals.output += usage.output;
+                self.totals.cost += usage.cost.total;
             }
             _ => {}
         }
     }
-    let mut message = AssistantMessage::empty("", "", "");
-    message.stop_reason = StopReason::Error;
-    message.error_message = Some("stream ended unexpectedly".into());
-    message
 }
 
-fn time_tool() -> Tool {
-    Tool {
-        name: "get_current_time".into(),
-        description: "Get the current date and time in UTC.".into(),
-        parameters: json!({"type": "object", "properties": {}, "required": []}),
+/// `get_current_time`: the current date and time in UTC.
+struct TimeTool;
+
+impl AgentTool for TimeTool {
+    fn name(&self) -> &str {
+        "get_current_time"
+    }
+
+    fn description(&self) -> &str {
+        "Get the current date and time in UTC."
+    }
+
+    fn parameters(&self) -> Value {
+        json!({"type": "object", "properties": {}, "required": []})
+    }
+
+    fn execute<'a>(
+        &'a self,
+        _args: Value,
+        _ctx: ToolContext,
+    ) -> BoxFuture<'a, anyhow::Result<AgentToolResult>> {
+        Box::pin(async { Ok(AgentToolResult::text(current_time_utc())) })
     }
 }
 

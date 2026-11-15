@@ -7658,6 +7658,16 @@ checksum = "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b"
 [[package]]
 name = "zp-agent"
 version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "futures",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "zp-ai",
+]
 
 [[package]]
 name = "zp-ai"
@@ -7693,6 +7703,7 @@ dependencies = [
  "futures",
  "serde_json",
  "tokio",
+ "zp-agent",
  "zp-ai",
  "zp-core",
 ]
