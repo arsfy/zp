@@ -1148,7 +1148,16 @@ version = "5.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "44c45a9d03d6676652bcb5e724c7e988de1acad23a711b5217ab9cbecbec2225"
 dependencies = [
- "dirs-sys",
+ "dirs-sys 0.4.1",
+]
+
+[[package]]
+name = "dirs"
+version = "6.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c3e8aa94d75141228480295a7d0e7feb620b1a5ad9f12bc40be62411e38cce4e"
+dependencies = [
+ "dirs-sys 0.5.0",
 ]
 
 [[package]]
@@ -1159,8 +1168,20 @@ checksum = "520f05a5cbd335fae5a99ff7a6ab8627577660ee5cfd6a94a6a929b52ff0321c"
 dependencies = [
  "libc",
  "option-ext",
- "redox_users",
+ "redox_users 0.4.6",
  "windows-sys 0.48.0",
+]
+
+[[package]]
+name = "dirs-sys"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e01a3366d27ee9890022452ee61b2b63a67e6f13f58900b651ff5665f0bb1fab"
+dependencies = [
+ "libc",
+ "option-ext",
+ "redox_users 0.5.3",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1828,7 +1849,7 @@ dependencies = [
 [[package]]
 name = "gpui-ce"
 version = "0.4.0"
-source = "git+https://github.com/gpui-ce/gpui-ce#f388375d03e63d75811fa1cca3a563203b920d98"
+source = "git+https://github.com/gpui-ce/gpui-ce?rev=f388375d03e63d75811fa1cca3a563203b920d98#f388375d03e63d75811fa1cca3a563203b920d98"
 dependencies = [
  "accesskit",
  "anyhow",
@@ -1903,7 +1924,7 @@ dependencies = [
 [[package]]
 name = "gpui_ce_apple"
 version = "0.4.0"
-source = "git+https://github.com/gpui-ce/gpui-ce#f388375d03e63d75811fa1cca3a563203b920d98"
+source = "git+https://github.com/gpui-ce/gpui-ce?rev=f388375d03e63d75811fa1cca3a563203b920d98#f388375d03e63d75811fa1cca3a563203b920d98"
 dependencies = [
  "anyhow",
  "block",
@@ -1929,7 +1950,7 @@ dependencies = [
 [[package]]
 name = "gpui_ce_collections"
 version = "0.4.0"
-source = "git+https://github.com/gpui-ce/gpui-ce#f388375d03e63d75811fa1cca3a563203b920d98"
+source = "git+https://github.com/gpui-ce/gpui-ce?rev=f388375d03e63d75811fa1cca3a563203b920d98#f388375d03e63d75811fa1cca3a563203b920d98"
 dependencies = [
  "gpui_ce_util",
  "indexmap",
@@ -1939,7 +1960,7 @@ dependencies = [
 [[package]]
 name = "gpui_ce_derive_refineable"
 version = "0.4.0"
-source = "git+https://github.com/gpui-ce/gpui-ce#f388375d03e63d75811fa1cca3a563203b920d98"
+source = "git+https://github.com/gpui-ce/gpui-ce?rev=f388375d03e63d75811fa1cca3a563203b920d98#f388375d03e63d75811fa1cca3a563203b920d98"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1949,7 +1970,7 @@ dependencies = [
 [[package]]
 name = "gpui_ce_linux"
 version = "0.4.0"
-source = "git+https://github.com/gpui-ce/gpui-ce#f388375d03e63d75811fa1cca3a563203b920d98"
+source = "git+https://github.com/gpui-ce/gpui-ce?rev=f388375d03e63d75811fa1cca3a563203b920d98#f388375d03e63d75811fa1cca3a563203b920d98"
 dependencies = [
  "accesskit",
  "accesskit_unix",
@@ -1980,7 +2001,7 @@ dependencies = [
 [[package]]
 name = "gpui_ce_macos"
 version = "0.4.0"
-source = "git+https://github.com/gpui-ce/gpui-ce#f388375d03e63d75811fa1cca3a563203b920d98"
+source = "git+https://github.com/gpui-ce/gpui-ce?rev=f388375d03e63d75811fa1cca3a563203b920d98#f388375d03e63d75811fa1cca3a563203b920d98"
 dependencies = [
  "accesskit",
  "accesskit_macos",
@@ -2032,7 +2053,7 @@ dependencies = [
 [[package]]
 name = "gpui_ce_macros"
 version = "0.4.0"
-source = "git+https://github.com/gpui-ce/gpui-ce#f388375d03e63d75811fa1cca3a563203b920d98"
+source = "git+https://github.com/gpui-ce/gpui-ce?rev=f388375d03e63d75811fa1cca3a563203b920d98#f388375d03e63d75811fa1cca3a563203b920d98"
 dependencies = [
  "heck",
  "proc-macro2",
@@ -2043,7 +2064,7 @@ dependencies = [
 [[package]]
 name = "gpui_ce_media"
 version = "0.4.0"
-source = "git+https://github.com/gpui-ce/gpui-ce#f388375d03e63d75811fa1cca3a563203b920d98"
+source = "git+https://github.com/gpui-ce/gpui-ce?rev=f388375d03e63d75811fa1cca3a563203b920d98#f388375d03e63d75811fa1cca3a563203b920d98"
 dependencies = [
  "anyhow",
  "bindgen",
@@ -2057,7 +2078,7 @@ dependencies = [
 [[package]]
 name = "gpui_ce_parley"
 version = "0.4.0"
-source = "git+https://github.com/gpui-ce/gpui-ce#f388375d03e63d75811fa1cca3a563203b920d98"
+source = "git+https://github.com/gpui-ce/gpui-ce?rev=f388375d03e63d75811fa1cca3a563203b920d98#f388375d03e63d75811fa1cca3a563203b920d98"
 dependencies = [
  "anyhow",
  "fontique",
@@ -2071,7 +2092,7 @@ dependencies = [
 [[package]]
 name = "gpui_ce_platform"
 version = "0.4.0"
-source = "git+https://github.com/gpui-ce/gpui-ce#f388375d03e63d75811fa1cca3a563203b920d98"
+source = "git+https://github.com/gpui-ce/gpui-ce?rev=f388375d03e63d75811fa1cca3a563203b920d98#f388375d03e63d75811fa1cca3a563203b920d98"
 dependencies = [
  "console_error_panic_hook",
  "gpui-ce",
@@ -2085,7 +2106,7 @@ dependencies = [
 [[package]]
 name = "gpui_ce_refineable"
 version = "0.4.0"
-source = "git+https://github.com/gpui-ce/gpui-ce#f388375d03e63d75811fa1cca3a563203b920d98"
+source = "git+https://github.com/gpui-ce/gpui-ce?rev=f388375d03e63d75811fa1cca3a563203b920d98#f388375d03e63d75811fa1cca3a563203b920d98"
 dependencies = [
  "gpui_ce_derive_refineable",
 ]
@@ -2093,7 +2114,7 @@ dependencies = [
 [[package]]
 name = "gpui_ce_render"
 version = "0.4.0"
-source = "git+https://github.com/gpui-ce/gpui-ce#f388375d03e63d75811fa1cca3a563203b920d98"
+source = "git+https://github.com/gpui-ce/gpui-ce?rev=f388375d03e63d75811fa1cca3a563203b920d98#f388375d03e63d75811fa1cca3a563203b920d98"
 dependencies = [
  "anyhow",
  "gpui-ce",
@@ -2110,7 +2131,7 @@ dependencies = [
 [[package]]
 name = "gpui_ce_scheduler"
 version = "0.4.0"
-source = "git+https://github.com/gpui-ce/gpui-ce#f388375d03e63d75811fa1cca3a563203b920d98"
+source = "git+https://github.com/gpui-ce/gpui-ce?rev=f388375d03e63d75811fa1cca3a563203b920d98#f388375d03e63d75811fa1cca3a563203b920d98"
 dependencies = [
  "async-task",
  "backtrace",
@@ -2125,7 +2146,7 @@ dependencies = [
 [[package]]
 name = "gpui_ce_shared_string"
 version = "0.4.0"
-source = "git+https://github.com/gpui-ce/gpui-ce#f388375d03e63d75811fa1cca3a563203b920d98"
+source = "git+https://github.com/gpui-ce/gpui-ce?rev=f388375d03e63d75811fa1cca3a563203b920d98#f388375d03e63d75811fa1cca3a563203b920d98"
 dependencies = [
  "schemars",
  "serde",
@@ -2135,7 +2156,7 @@ dependencies = [
 [[package]]
 name = "gpui_ce_sum_tree"
 version = "0.4.0"
-source = "git+https://github.com/gpui-ce/gpui-ce#f388375d03e63d75811fa1cca3a563203b920d98"
+source = "git+https://github.com/gpui-ce/gpui-ce?rev=f388375d03e63d75811fa1cca3a563203b920d98#f388375d03e63d75811fa1cca3a563203b920d98"
 dependencies = [
  "heapless",
  "log",
@@ -2144,9 +2165,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "gpui_ce_tokio"
+version = "0.4.0"
+source = "git+https://github.com/gpui-ce/gpui-ce?rev=f388375d03e63d75811fa1cca3a563203b920d98#f388375d03e63d75811fa1cca3a563203b920d98"
+dependencies = [
+ "anyhow",
+ "gpui-ce",
+ "gpui_ce_util",
+ "tokio",
+]
+
+[[package]]
 name = "gpui_ce_util"
 version = "0.4.0"
-source = "git+https://github.com/gpui-ce/gpui-ce#f388375d03e63d75811fa1cca3a563203b920d98"
+source = "git+https://github.com/gpui-ce/gpui-ce?rev=f388375d03e63d75811fa1cca3a563203b920d98#f388375d03e63d75811fa1cca3a563203b920d98"
 dependencies = [
  "anyhow",
  "log",
@@ -2156,7 +2188,7 @@ dependencies = [
 [[package]]
 name = "gpui_ce_web"
 version = "0.4.0"
-source = "git+https://github.com/gpui-ce/gpui-ce#f388375d03e63d75811fa1cca3a563203b920d98"
+source = "git+https://github.com/gpui-ce/gpui-ce?rev=f388375d03e63d75811fa1cca3a563203b920d98#f388375d03e63d75811fa1cca3a563203b920d98"
 dependencies = [
  "anyhow",
  "console_error_panic_hook",
@@ -2181,7 +2213,7 @@ dependencies = [
 [[package]]
 name = "gpui_ce_wgpu"
 version = "0.4.0"
-source = "git+https://github.com/gpui-ce/gpui-ce#f388375d03e63d75811fa1cca3a563203b920d98"
+source = "git+https://github.com/gpui-ce/gpui-ce?rev=f388375d03e63d75811fa1cca3a563203b920d98#f388375d03e63d75811fa1cca3a563203b920d98"
 dependencies = [
  "anyhow",
  "core-foundation",
@@ -2213,7 +2245,7 @@ dependencies = [
 [[package]]
 name = "gpui_ce_windows"
 version = "0.4.0"
-source = "git+https://github.com/gpui-ce/gpui-ce#f388375d03e63d75811fa1cca3a563203b920d98"
+source = "git+https://github.com/gpui-ce/gpui-ce?rev=f388375d03e63d75811fa1cca3a563203b920d98#f388375d03e63d75811fa1cca3a563203b920d98"
 dependencies = [
  "accesskit",
  "accesskit_windows",
@@ -2989,6 +3021,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "matchers"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d1525a2a28c7f4fa0fc98bb91ae755d1e2d1505079e05539e35bc876b5d65ae9"
+dependencies = [
+ "regex-automata",
+]
+
+[[package]]
 name = "maybe-rayon"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3269,6 +3310,15 @@ dependencies = [
  "serde",
  "tauri-winrt-notification",
  "zbus 6.3.0",
+]
+
+[[package]]
+name = "nu-ansi-term"
+version = "0.50.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
+dependencies = [
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4374,6 +4424,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "redox_users"
+version = "0.5.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "60dc65c0ff1a7ae1294b0c67b9f14baf70b644404010370171787bfac1038fc0"
+dependencies = [
+ "libredox",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "ref-cast"
 version = "1.0.27"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4702,6 +4762,15 @@ dependencies = [
  "cfg-if",
  "cpufeatures",
  "digest",
+]
+
+[[package]]
+name = "sharded-slab"
+version = "0.1.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f40ca3c46823713e0d4209592e8d6e826aa57e928f09752619fc696c499637f6"
+dependencies = [
+ "lazy_static",
 ]
 
 [[package]]
@@ -5179,6 +5248,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "thread_local"
+version = "1.1.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1ad99c4c6d32803332c548b1af0540b357b3f5fc0be8f6c6bfe8b2e6ae784070"
+dependencies = [
+ "cfg-if",
+]
+
+[[package]]
 name = "tiff"
 version = "0.11.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5351,6 +5429,36 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "db97caf9d906fbde555dd62fa95ddba9eecfd14cb388e4f491a66d74cd5fb79a"
 dependencies = [
  "once_cell",
+ "valuable",
+]
+
+[[package]]
+name = "tracing-log"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ee855f1f400bd0e5c02d150ae5de3840039a3f54b025156404e34c23c03f47c3"
+dependencies = [
+ "log",
+ "once_cell",
+ "tracing-core",
+]
+
+[[package]]
+name = "tracing-subscriber"
+version = "0.3.23"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cb7f578e5945fb242538965c2d0b04418d38ec25c79d160cd279bf0731c8d319"
+dependencies = [
+ "matchers",
+ "nu-ansi-term",
+ "once_cell",
+ "regex-automata",
+ "sharded-slab",
+ "smallvec",
+ "thread_local",
+ "tracing",
+ "tracing-core",
+ "tracing-log",
 ]
 
 [[package]]
@@ -5501,6 +5609,12 @@ dependencies = [
  "num-traits",
  "wasm-bindgen",
 ]
+
+[[package]]
+name = "valuable"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ba73ea9cf16a25df0c8caa16c51acb937d5712a8429db78a3ee29d5dcacd3a65"
 
 [[package]]
 name = "value-bag"
@@ -6586,7 +6700,7 @@ dependencies = [
  "core-foundation",
  "core-graphics",
  "core-text",
- "dirs",
+ "dirs 5.0.1",
  "dwrote",
  "float-ord",
  "freetype-sys",
@@ -6742,12 +6856,50 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b"
 
 [[package]]
-name = "zp"
+name = "zp-agent"
+version = "0.1.0"
+
+[[package]]
+name = "zp-ai"
+version = "0.1.0"
+
+[[package]]
+name = "zp-app"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "gpui-ce",
  "gpui_ce_platform",
+ "gpui_ce_tokio",
+ "tracing",
+ "zp-core",
 ]
+
+[[package]]
+name = "zp-cli"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "zp-core",
+]
+
+[[package]]
+name = "zp-core"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "dirs 6.0.0",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "zp-session"
+version = "0.1.0"
+
+[[package]]
+name = "zp-tools"
+version = "0.1.0"
 
 [[package]]
 name = "zruntime"

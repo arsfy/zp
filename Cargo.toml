@@ -1,9 +1,34 @@
-[package]
-name = "zp"
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+default-members = ["crates/zp-app"]
+
+[workspace.package]
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.95"
+license = "MIT"
+publish = false
 
-[dependencies]
-gpui = { package = "gpui-ce", git = "https://github.com/gpui-ce/gpui-ce" }
-gpui_platform = { package = "gpui_ce_platform", git = "https://github.com/gpui-ce/gpui-ce", features = ["font-kit"] }
+[workspace.dependencies]
+# Internal crates (others are added as they gain dependents)
+zp-core = { path = "crates/zp-core" }
+
+# GPUI Community Edition, pinned to a specific revision because the API moves fast.
+# The library crate is published as `gpui-ce` but its lib name is `gpui`.
+gpui = { package = "gpui-ce", git = "https://github.com/gpui-ce/gpui-ce", rev = "f388375d03e63d75811fa1cca3a563203b920d98" }
+gpui_platform = { package = "gpui_ce_platform", git = "https://github.com/gpui-ce/gpui-ce", rev = "f388375d03e63d75811fa1cca3a563203b920d98", features = ["font-kit"] }
+gpui_tokio = { package = "gpui_ce_tokio", git = "https://github.com/gpui-ce/gpui-ce", rev = "f388375d03e63d75811fa1cca3a563203b920d98" }
+
+# Common
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+dirs = "6"
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+
+[workspace.lints.clippy]
+dbg_macro = "warn"
+todo = "warn"
