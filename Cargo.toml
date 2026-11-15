@@ -1,0 +1,9 @@
+[package]
+name = "zp"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+
+[dependencies]
+gpui = { package = "gpui-ce", git = "https://github.com/gpui-ce/gpui-ce" }
+gpui_platform = { package = "gpui_ce_platform", git = "https://github.com/gpui-ce/gpui-ce", features = ["font-kit"] }
