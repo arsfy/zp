@@ -4,8 +4,11 @@
 //! previous run are restored (or the welcome window is shown).
 
 mod actions;
+mod approvals;
+mod changes_panel;
 mod context_menu;
 mod conversation;
+mod diff_view;
 mod markdown;
 mod project;
 mod store;
@@ -17,7 +20,11 @@ mod workspace;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
+mod tests_changes;
+#[cfg(test)]
 mod tests_conversation;
+#[cfg(test)]
+mod tests_permissions;
 #[cfg(feature = "visual-tests")]
 mod visual;
 

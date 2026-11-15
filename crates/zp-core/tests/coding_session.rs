@@ -6,9 +6,11 @@ use std::sync::{Arc, Mutex};
 use serde_json::json;
 use zp_agent::{AgentEvent, AgentMessage};
 use zp_ai::{FauxBlock, FauxProvider, FauxResponse, Message, Models, ThinkingLevel, UserContent};
+use zp_core::changes::{GroupKind, Scope};
+use zp_core::checkpoint::{BlobStore, RecordedChange};
+use zp_core::restore::RestorePlan;
 use zp_core::{CodingSession, CodingSessionOptions, session_model};
 use zp_session::{EntryData, SessionManager};
-use zp_tools::FileChange;
 
 fn models(faux: &FauxProvider) -> Models {
     let mut models = Models::new();
@@ -51,9 +53,11 @@ async fn read_edit_test_then_resume() {
     faux.push(FauxResponse::text("Fixed: add.sh now prints 5."));
 
     let manager = SessionManager::new(data.path().join("sessions"));
+    let blobs = BlobStore::in_data_dir(data.path());
     let mut options = CodingSessionOptions::new(models(&faux), &cwd, manager.create(&cwd));
     options.model = Some(faux.model());
     options.thinking_level = Some(ThinkingLevel::Low);
+    options.blobs = Some(blobs.clone());
     let coding = CodingSession::new(options).unwrap();
     let session_file = coding.session().file().unwrap().to_path_buf();
 
@@ -77,8 +81,16 @@ async fn read_edit_test_then_resume() {
     assert_eq!(text(&results[0].content), "echo $((2+2))\n");
     assert!(results[1].is_error);
     assert!(text(&results[1].content).contains("FAIL"));
-    let change = FileChange::from_details(results[2].details.as_ref().unwrap()).unwrap();
-    assert_eq!(change.after, "echo $((2+3))\n");
+    // The edit's versions went to the snapshot store; the session keeps hashes.
+    let details = results[2].details.as_ref().unwrap();
+    assert!(details.get("after").is_none());
+    let change = RecordedChange::from_details(details).unwrap();
+    assert_eq!((change.added, change.removed), (1, 1));
+    assert_eq!(
+        &*change.after.load(&blobs).unwrap().unwrap(),
+        "echo $((2+3))\n"
+    );
+    assert!(data.path().join("checkpoints/objects").is_dir());
     assert!(!results[3].is_error);
     assert!(text(&results[3].content).ends_with("PASS"));
     assert_eq!(
@@ -110,7 +122,41 @@ async fn read_edit_test_then_resume() {
     assert_eq!(kinds[..2], ["model_change", "thinking_level_change"]);
     assert_eq!(reopened.context().messages.len(), 10);
     assert_eq!(coding.usage().output, 25);
+
+    // The change log has the turn; reverting it restores the file and tells the model.
+    let log = coding.change_log();
+    assert_eq!(log.groups.len(), 1);
+    let files = log.files(Scope::Session);
+    assert_eq!(files.len(), 1);
+    assert_eq!(files[0].path, cwd.join("add.sh"));
+    let plan = RestorePlan::prepare(&log.revert_targets(Scope::Group(0), None), &blobs).unwrap();
+    assert_eq!(plan.conflicts().count(), 0);
+    let restored = plan.apply(false, &blobs).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(cwd.join("add.sh")).unwrap(),
+        "echo $((2+2))\n"
+    );
+    coding.record_restore("Reverted turn 1", &restored).unwrap();
+    let log = coding.change_log();
+    assert!(
+        matches!(&log.groups[1].kind, GroupKind::Restore { description } if description == "Reverted turn 1")
+    );
+    assert!(log.files(Scope::Session)[0].is_unchanged());
+    assert_eq!(coding.agent().messages().len(), 11);
+    // Put the fix back for the rest of the test.
+    let plan = RestorePlan::prepare(&log.revert_targets(Scope::Group(1), None), &blobs).unwrap();
+    let redone = plan.apply(false, &blobs).unwrap();
+    coding
+        .record_restore("Reverted the restore", &redone)
+        .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(cwd.join("add.sh")).unwrap(),
+        "echo $((2+3))\n"
+    );
     drop(coding);
+    // Two restore records were added.
+    let reopened = manager.open(&session_file).unwrap();
+    assert_eq!(reopened.context().messages.len(), 12);
 
     // Resume: the model and transcript come back and the conversation continues.
     faux.push(FauxResponse::text("You're welcome."));
@@ -118,17 +164,17 @@ async fn read_edit_test_then_resume() {
     assert_eq!(session_model(&models, &reopened).unwrap().id, "faux-1");
     let resumed = CodingSession::new(CodingSessionOptions::new(models, &cwd, reopened)).unwrap();
     assert_eq!(resumed.agent().thinking_level(), ThinkingLevel::Low);
-    assert_eq!(resumed.agent().messages().len(), 10);
+    assert_eq!(resumed.agent().messages().len(), 12);
     resumed.prompt("thanks").await.unwrap();
 
     let last_request = faux.requests().last().unwrap().clone();
-    assert_eq!(last_request.messages.len(), 11);
+    assert_eq!(last_request.messages.len(), 13);
     let Message::User(user) = last_request.messages.last().unwrap() else {
         panic!("expected the new prompt last")
     };
     assert_eq!(text(&user.content), "thanks");
     let entries = manager.open(&session_file).unwrap();
-    assert_eq!(entries.context().messages.len(), 12);
+    assert_eq!(entries.context().messages.len(), 14);
     // No duplicate model/thinking records on resume.
     let changes = entries
         .entries()

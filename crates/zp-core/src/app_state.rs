@@ -93,6 +93,12 @@ pub struct ProjectUiState {
     pub tabs: Vec<TabState>,
     /// Index of the active tab.
     pub active_tab: usize,
+    /// Whether the user trusts the project; `None` until asked.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trusted: Option<bool>,
+    /// The permission mode chosen for this project (overrides the settings).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub permission_mode: Option<crate::permissions::PermissionMode>,
 }
 
 /// A conversation tab to restore.

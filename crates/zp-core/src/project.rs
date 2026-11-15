@@ -1,4 +1,5 @@
-//! Project directories: identity, display name and git branch.
+//! Project directories: identity, display name, git branch and what trusting them
+//! means.
 
 use std::path::{Component, Path, PathBuf};
 
@@ -99,6 +100,30 @@ fn find_git_dir(dir: &Path) -> Option<PathBuf> {
     None
 }
 
+/// The directory whose contents come with the project: the enclosing git repository's
+/// root, else the project itself. Instruction files above it belong to the user.
+pub fn trust_boundary(root: &Path) -> PathBuf {
+    root.ancestors()
+        .find(|dir| dir.join(".git").exists())
+        .unwrap_or(root)
+        .to_path_buf()
+}
+
+/// Files of a project that change what the agent does (instructions and settings), which
+/// ZP only loads once the user trusts the project. Empty: nothing to trust.
+pub fn trust_files(root: &Path) -> Vec<PathBuf> {
+    let boundary = trust_boundary(root);
+    let mut files: Vec<PathBuf> = crate::system_prompt::project_context_files(root)
+        .into_iter()
+        .filter(|file| file.starts_with(&boundary))
+        .collect();
+    let settings = crate::settings::project_settings_file(root);
+    if settings.is_file() {
+        files.push(settings);
+    }
+    files
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -153,5 +178,29 @@ mod tests {
                 format!("~{}x", std::path::MAIN_SEPARATOR)
             );
         }
+    }
+
+    #[test]
+    fn trust_files_stop_at_the_repository() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = normalize_project_path(dir.path()).unwrap();
+        let repo = home.join("repo");
+        let project = repo.join("app");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(home.join("AGENTS.md"), "mine").unwrap();
+        assert!(
+            trust_files(&project).is_empty(),
+            "{:?}",
+            trust_files(&project)
+        );
+        std::fs::create_dir(repo.join(".git")).unwrap();
+        std::fs::write(repo.join("CLAUDE.md"), "theirs").unwrap();
+        std::fs::create_dir_all(project.join(".zp")).unwrap();
+        std::fs::write(project.join(".zp/settings.json"), "{}").unwrap();
+        assert_eq!(trust_boundary(&project), repo);
+        assert_eq!(
+            trust_files(&project),
+            [repo.join("CLAUDE.md"), project.join(".zp/settings.json")]
+        );
     }
 }

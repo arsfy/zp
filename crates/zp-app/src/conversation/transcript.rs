@@ -120,6 +120,14 @@ impl Transcript {
     }
 
     /// The tool call `id`.
+    /// The row of the assistant message that made tool call `id`.
+    pub fn row_of_tool(&self, id: &str) -> Option<usize> {
+        self.rows.iter().position(|row| match row {
+            Row::Assistant { message, .. } => message.tool_calls().any(|call| call.id == id),
+            _ => false,
+        })
+    }
+
     pub fn tool(&self, id: &str) -> Option<&ToolState> {
         self.tools.get(id)
     }
@@ -234,7 +242,8 @@ impl Transcript {
                     self.push(
                         Row::Notice {
                             kind: custom.custom_type.clone(),
-                            text: text_of(&custom.content),
+                            text: zp_core::changes::restore_summary(custom)
+                                .unwrap_or_else(|| text_of(&custom.content)),
                             ordinal,
                         },
                         changes,

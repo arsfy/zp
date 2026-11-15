@@ -4,6 +4,8 @@
 //! [`Transcript`] in batches, at most ~30 times per second, so streaming does not redraw
 //! for every token.
 
+mod files;
+mod permissions;
 mod render;
 pub mod transcript;
 pub mod tree;
@@ -28,6 +30,7 @@ use zp_session::Session;
 
 use self::transcript::{Changes, Transcript};
 use crate::actions::{ClosePicker, PickFirstModel, SendMessage, StopRun};
+use crate::diff_view::DiffItem;
 use crate::markdown::{Block, parse};
 use crate::store::{AppModels, AppPaths};
 
@@ -50,6 +53,12 @@ pub enum ConversationEvent {
     Activity,
     /// A fork of this conversation should open in a new tab.
     Forked(SessionHandoff),
+    /// Files were changed (by a tool or a restore), or another branch is shown.
+    FilesChanged,
+    /// The user asked for the full diff of a change.
+    OpenDiff(DiffItem),
+    /// The user picked a permission mode (for the whole project).
+    PermissionModeChanged(zp_core::permissions::PermissionMode),
 }
 
 /// Which popover is open.
@@ -57,6 +66,7 @@ pub enum ConversationEvent {
 pub enum Picker {
     Model,
     Thinking,
+    Permissions,
 }
 
 /// Status shown in the window's status bar.
@@ -95,6 +105,10 @@ pub struct ConversationView {
     /// Tool cards the user toggled, by call id (overrides the default).
     tool_expanded: HashMap<String, bool>,
     markdown_cache: RefCell<HashMap<u64, Rc<Vec<Block>>>>,
+    /// Diffs of tool calls, by call id.
+    tool_diffs: RefCell<HashMap<String, Rc<Result<files::ToolDiff, String>>>>,
+    /// Tool calls waiting for the user.
+    approvals: Vec<permissions::Approval>,
     /// Whether the session tree overlay is shown.
     tree_open: bool,
     /// A model title was already requested for this session.
@@ -102,6 +116,7 @@ pub struct ConversationView {
     focus_handle: FocusHandle,
     _agent_events: Option<zp_agent::Subscription>,
     _pump: Option<Task<()>>,
+    _approvals: Option<Task<()>>,
     run_task: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
 }
@@ -136,11 +151,14 @@ impl ConversationView {
             expanded_thinking: HashSet::new(),
             tool_expanded: HashMap::new(),
             markdown_cache: RefCell::default(),
+            tool_diffs: RefCell::default(),
+            approvals: Vec::new(),
             tree_open: false,
             title_requested: false,
             focus_handle: cx.focus_handle(),
             _agent_events: None,
             _pump: None,
+            _approvals: None,
             run_task: None,
             _subscriptions: subscriptions,
         };
@@ -169,7 +187,26 @@ impl ConversationView {
         let mut options = CodingSessionOptions::new(models, &self.root, session);
         options.model = model;
         options.global_context_dir = cx.try_global::<AppPaths>().and_then(|p| p.data_dir.clone());
+        options.blobs = AppPaths::blobs(cx);
+        options.trusted = crate::approvals::is_trusted(&self.root, cx);
+        let (approval_sender, mut approval_receiver) = futures::channel::mpsc::unbounded();
+        options.permissions = Some(Arc::new(zp_core::permissions::PermissionGate::new(
+            crate::approvals::project_policy(&self.root, cx),
+            Arc::new(crate::approvals::ChannelApprover::new(approval_sender)),
+            options.models.clone(),
+        )));
         let coding = Arc::new(CodingSession::new(options)?);
+        let approvals = cx.spawn(async move |this, cx| {
+            while let Some(pending) = approval_receiver.next().await {
+                if this
+                    .update(cx, |this, cx| this.add_approval(pending, cx))
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+        self._approvals = Some(approvals);
 
         let (sender, mut receiver) = futures::channel::mpsc::unbounded::<AgentEvent>();
         let subscription = coding.agent().subscribe(move |event| {
@@ -215,6 +252,12 @@ impl ConversationView {
         }
         if changes.usage {
             cx.emit(ConversationEvent::StatusChanged);
+        }
+        let files_changed = events.iter().any(|event| {
+            matches!(event, AgentEvent::ToolExecutionEnd { result, .. } if result.details.is_some())
+        });
+        if files_changed {
+            cx.emit(ConversationEvent::FilesChanged);
         }
         if changes.finished && self.running {
             self.finish_run(cx);
@@ -301,6 +344,16 @@ impl ConversationView {
         self.apply_events(events, cx);
     }
 
+    /// Scrolls the transcript so that `row` is at the top (screenshots).
+    #[cfg(feature = "visual-tests")]
+    pub fn scroll_to_row(&mut self, row: usize) {
+        self.list_state.set_follow_mode(gpui::FollowMode::Normal);
+        self.list_state.scroll_to(gpui::ListOffset {
+            item_ix: row,
+            offset_in_item: px(0.),
+        });
+    }
+
     /// Stops the running agent, if any.
     pub fn abort(&mut self, cx: &mut Context<Self>) {
         if let Some(coding) = &self.coding {
@@ -378,14 +431,23 @@ impl ConversationView {
     }
 
     /// Continues from `row`: later messages move to an abandoned branch.
-    pub(crate) fn branch_from(&mut self, row: usize, cx: &mut Context<Self>) {
-        let (Some(coding), Some(entry)) = (self.coding.clone(), self.entry_for_row(row)) else {
+    pub(crate) fn branch_from(&mut self, row: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(entry) = self.entry_for_row(row) else {
             return;
         };
-        let result = coding.branch(&entry);
-        self.reload_transcript();
-        cx.emit(ConversationEvent::Activity);
-        self.report(result, cx);
+        let target = Some(entry.clone());
+        self.change_branch(
+            target,
+            Box::new(move |this, _, cx| {
+                let Some(coding) = this.coding.clone() else {
+                    return;
+                };
+                let result = coding.branch(&entry);
+                this.after_branch_change(result, cx);
+            }),
+            window,
+            cx,
+        );
     }
 
     /// Rewinds to before user message `row` and puts its text back in the composer.
@@ -402,12 +464,28 @@ impl ConversationView {
         let (Some(coding), Some(entry)) = (self.coding.clone(), self.entry_for_row(row)) else {
             return;
         };
-        let result = coding.branch_before(&entry);
+        let parent = coding
+            .session()
+            .entry(&entry)
+            .and_then(|entry| entry.parent_id.clone());
+        self.change_branch(
+            parent,
+            Box::new(move |this, window, cx| {
+                let result = coding.branch_before(&entry);
+                this.composer
+                    .update(cx, |composer, cx| composer.emplace(&text, cx));
+                this.focus_composer(window, cx);
+                this.after_branch_change(result, cx);
+            }),
+            window,
+            cx,
+        );
+    }
+
+    fn after_branch_change(&mut self, result: anyhow::Result<()>, cx: &mut Context<Self>) {
         self.reload_transcript();
-        self.composer
-            .update(cx, |composer, cx| composer.emplace(&text, cx));
-        self.focus_composer(window, cx);
         cx.emit(ConversationEvent::Activity);
+        cx.emit(ConversationEvent::FilesChanged);
         self.report(result, cx);
     }
 
@@ -435,16 +513,22 @@ impl ConversationView {
     }
 
     /// Switches to the newest branch through entry `id` (from the tree).
-    pub(crate) fn switch_branch(&mut self, id: &str, cx: &mut Context<Self>) {
+    pub(crate) fn switch_branch(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
         let Some(coding) = self.coding.clone() else {
             return;
         };
-        if self.running {
+        let Some(leaf) = coding.session().latest_leaf_under(id).map(str::to_owned) else {
             return;
-        }
-        let result = coding.switch_branch(id);
-        self.reload_transcript();
-        self.report(result, cx);
+        };
+        self.change_branch(
+            Some(leaf.clone()),
+            Box::new(move |this, _, cx| {
+                let result = coding.branch(&leaf);
+                this.after_branch_change(result, cx);
+            }),
+            window,
+            cx,
+        );
     }
 
     pub fn is_running(&self) -> bool {
@@ -593,6 +677,7 @@ impl ConversationView {
     /// Marks the run as over once its last event has been shown.
     fn finish_run(&mut self, cx: &mut Context<Self>) {
         self.running = false;
+        self.clear_approvals();
         let failed = self.has_failed();
         cx.emit(ConversationEvent::StatusChanged);
         cx.emit(ConversationEvent::RunFinished);

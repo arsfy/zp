@@ -23,7 +23,11 @@ use crate::tests::{project_dir, saved_state, setup};
 use crate::workspace;
 
 /// App with `providers` as the only models (the first one is the default).
-fn setup_models(cx: &mut TestAppContext, providers: &[&FauxProvider], titles: bool) -> TempDir {
+pub(crate) fn setup_models(
+    cx: &mut TestAppContext,
+    providers: &[&FauxProvider],
+    titles: bool,
+) -> TempDir {
     cx.executor().allow_parking();
     let data = setup(cx, None);
     let providers: Vec<FauxProvider> = providers.iter().map(|p| (*p).clone()).collect();
@@ -36,11 +40,25 @@ fn setup_models(cx: &mut TestAppContext, providers: &[&FauxProvider], titles: bo
         AppModels::set(models, titles, cx);
         cx.set_global(FileTrash(|path| Ok(std::fs::remove_file(path)?)));
     });
+    // Tools run without approvals unless a test asks for them.
+    set_permission_mode(&data, zp_core::permissions::PermissionMode::FullAuto);
     data
 }
 
+/// Sets the default permission mode in the global settings.
+pub(crate) fn set_permission_mode(data: &TempDir, mode: zp_core::permissions::PermissionMode) {
+    let mut settings = zp_core::settings::Settings::default();
+    settings.permissions.mode = Some(mode);
+    settings
+        .save(&zp_core::paths::settings_file(data.path()))
+        .unwrap();
+}
+
 /// Lets Tokio-side work progress until `done` holds (or fails after a few seconds).
-fn wait_until(cx: &mut TestAppContext, mut done: impl FnMut(&mut TestAppContext) -> bool) {
+pub(crate) fn wait_until(
+    cx: &mut TestAppContext,
+    mut done: impl FnMut(&mut TestAppContext) -> bool,
+) {
     for _ in 0..600 {
         cx.run_until_parked();
         if done(cx) {
@@ -52,7 +70,7 @@ fn wait_until(cx: &mut TestAppContext, mut done: impl FnMut(&mut TestAppContext)
     panic!("timed out");
 }
 
-fn open(cx: &mut TestAppContext, project: &Path) -> WindowHandle<ProjectWindow> {
+pub(crate) fn open(cx: &mut TestAppContext, project: &Path) -> WindowHandle<ProjectWindow> {
     let window = cx
         .update(|cx| workspace::open_project(project, None, cx))
         .unwrap();
@@ -60,7 +78,7 @@ fn open(cx: &mut TestAppContext, project: &Path) -> WindowHandle<ProjectWindow> 
     window
 }
 
-fn active(
+pub(crate) fn active(
     window: WindowHandle<ProjectWindow>,
     cx: &mut TestAppContext,
 ) -> Entity<ConversationView> {
@@ -69,19 +87,19 @@ fn active(
         .unwrap()
 }
 
-fn tab_count(window: WindowHandle<ProjectWindow>, cx: &mut TestAppContext) -> usize {
+pub(crate) fn tab_count(window: WindowHandle<ProjectWindow>, cx: &mut TestAppContext) -> usize {
     window.update(cx, |view, _, _| view.tabs().len()).unwrap()
 }
 
 /// Types `text` into the active tab and sends it.
-fn send(window: WindowHandle<ProjectWindow>, text: &str, cx: &mut TestAppContext) {
+pub(crate) fn send(window: WindowHandle<ProjectWindow>, text: &str, cx: &mut TestAppContext) {
     let conversation = active(window, cx);
     conversation.update(cx, |view, cx| view.set_draft(text, cx));
     cx.dispatch_action(window.into(), SendMessage);
     cx.run_until_parked();
 }
 
-fn idle(conversation: &Entity<ConversationView>, rows: usize, cx: &mut TestAppContext) {
+pub(crate) fn idle(conversation: &Entity<ConversationView>, rows: usize, cx: &mut TestAppContext) {
     wait_until(cx, |cx| {
         conversation.read_with(cx, |view, _| {
             !view.is_running() && view.transcript().len() == rows
@@ -587,11 +605,19 @@ fn message_actions_and_session_tree(cx: &mut TestAppContext) {
         ]
     );
     let old = rows.iter().find(|r| r.label == "u2").unwrap().id.clone();
-    conversation.update(cx, |view, cx| view.switch_branch(&old, cx));
+    window
+        .update(cx, |_, window, cx| {
+            conversation.update(cx, |view, cx| view.switch_branch(&old, window, cx))
+        })
+        .unwrap();
     assert_eq!(texts(cx), ["u1", "a1", "u2", "a2"]);
 
     // Branch from a1, then fork a1 into a new tab.
-    conversation.update(cx, |view, cx| view.branch_from(1, cx));
+    window
+        .update(cx, |_, window, cx| {
+            conversation.update(cx, |view, cx| view.branch_from(1, window, cx))
+        })
+        .unwrap();
     assert_eq!(texts(cx), ["u1", "a1"]);
     conversation.update(cx, |view, cx| view.fork_from(1, cx));
     cx.run_until_parked();

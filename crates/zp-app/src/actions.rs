@@ -32,7 +32,12 @@ actions!(
         ClearSessionSearch,
         ConfirmRename,
         CancelRename,
-        DismissMenu
+        DismissMenu,
+        CloseDiff,
+        NextDiffFile,
+        PreviousDiffFile,
+        ToggleDiffLayout,
+        DenyToolCall
     ]
 );
 
@@ -116,6 +121,11 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("enter", ConfirmRename, Some(RENAME_INPUT)),
         KeyBinding::new("escape", CancelRename, Some(RENAME_INPUT)),
         KeyBinding::new("escape", DismissMenu, Some("ContextMenu")),
+        KeyBinding::new("escape", CloseDiff, Some("DiffView")),
+        KeyBinding::new("enter", DenyToolCall, Some("ApprovalReason > EditableText")),
+        KeyBinding::new("]", NextDiffFile, Some("DiffView")),
+        KeyBinding::new("[", PreviousDiffFile, Some("DiffView")),
+        KeyBinding::new("secondary-alt-d", ToggleDiffLayout, Some("DiffView")),
         KeyBinding::new(KEY_QUIT, Quit, None),
         KeyBinding::new(KEY_OPEN_FOLDER, OpenFolder, None),
         KeyBinding::new(KEY_NEW_WINDOW, NewWindow, None),
@@ -161,6 +171,7 @@ pub fn init(cx: &mut App) {
                 MenuItem::separator(),
                 MenuItem::action("Toggle Sidebar", ToggleSidebar),
                 MenuItem::action("Toggle Changes Panel", ToggleRightPanel),
+                MenuItem::action("Toggle Diff Layout", ToggleDiffLayout),
             ],
             disabled: false,
         },

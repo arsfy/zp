@@ -57,6 +57,12 @@ fn pump(cx: &mut VisualTestAppContext, real: Duration) {
 pub fn run(out: PathBuf) {
     std::fs::create_dir_all(&out).unwrap();
     let data = tempfile::tempdir().unwrap();
+    // The scripted runs need no approvals (the approvals scene asks for them).
+    let mut settings = zp_core::settings::Settings::default();
+    settings.permissions.mode = Some(zp_core::permissions::PermissionMode::FullAuto);
+    settings
+        .save(&zp_core::paths::settings_file(data.path()))
+        .unwrap();
     let project = tempfile::tempdir().unwrap();
     std::fs::write(
         project.path().join("lib.rs"),
@@ -180,6 +186,8 @@ pub fn run(out: PathBuf) {
             .unwrap();
     }
     tabs_and_history(&mut cx, &data_dir_of(&data), &root, &out);
+    changes(&mut cx, &faux, &out);
+    approvals(&mut cx, &faux, &out);
     println!("screenshots written to {}", out.display());
 }
 
@@ -466,4 +474,229 @@ fn error_events() -> Vec<AgentEvent> {
             messages: Vec::new(),
         },
     ]
+}
+
+const PARSER: &str = "use crate::lexer::{Lexer, Token};
+
+pub struct Parser<'a> {
+    lexer: Lexer<'a>,
+    peeked: Option<Token>,
+}
+
+impl<'a> Parser<'a> {
+    pub fn new(source: &'a str) -> Self {
+        Self { lexer: Lexer::new(source), peeked: None }
+    }
+
+    /// expr := term (('+' | '-') term)*
+    pub fn expr(&mut self) -> Result<i64, String> {
+        let mut value = self.term()?;
+        while let Some(op) = self.eat_any(&[Token::Plus, Token::Minus]) {
+            let rhs = self.term()?;
+            value = if op == Token::Plus { value + rhs } else { value - rhs };
+        }
+        Ok(value)
+    }
+
+    fn term(&mut self) -> Result<i64, String> {
+        match self.next() {
+            Some(Token::Number(n)) => Ok(n),
+            Some(Token::LParen) => {
+                let value = self.expr()?;
+                self.expect(Token::RParen)?;
+                Ok(value)
+            }
+            other => Err(format!(\"unexpected {other:?}\")),
+        }
+    }
+}
+";
+
+/// M7: inline diffs, the changes panel and the diff view, after an agent edited files
+/// over two turns.
+fn changes(cx: &mut VisualTestAppContext, faux: &FauxProvider, out: &std::path::Path) {
+    let project = tempfile::tempdir().unwrap();
+    let root = zp_core::project::normalize_project_path(project.path()).unwrap();
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(root.join("src/parser.rs"), PARSER).unwrap();
+    std::fs::write(
+        root.join("README.md"),
+        "# calc\n\nA tiny calculator.\n\n## Usage\n\n    calc '1 + 2'\n",
+    )
+    .unwrap();
+
+    faux.push(FauxResponse::blocks(vec![
+        FauxBlock::Text("Negative numbers fail in `term`; I'll accept a leading minus.".into()),
+        FauxBlock::ToolCall {
+            name: "edit".into(),
+            arguments: json!({"path": "src/parser.rs", "edits": [{
+                "oldText": "            Some(Token::Number(n)) => Ok(n),\n",
+                "newText": "            Some(Token::Number(n)) => Ok(n),\n            // Unary minus: `-3`, `-(1 + 2)`.\n            Some(Token::Minus) => Ok(-self.term()?),\n"
+            }]}),
+        },
+    ]));
+    faux.push(FauxResponse::tool_call(
+        "write",
+        json!({"path": "tests/negative.rs", "content": "use calc::Parser;\n\n#[test]\nfn negative_numbers() {\n    assert_eq!(Parser::new(\"-3 + 5\").expr(), Ok(2));\n    assert_eq!(Parser::new(\"-(1 + 2)\").expr(), Ok(-3));\n}\n"}),
+    ));
+    faux.push(FauxResponse::text(
+        "Done: `term` now handles a leading `-`, with tests.",
+    ));
+    faux.push(FauxResponse::tool_call(
+        "edit",
+        json!({"path": "README.md", "edits": [{
+            "oldText": "    calc '1 + 2'\n",
+            "newText": "    calc '1 + 2'\n    calc '-3 + 5'   # negative numbers work too\n"
+        }]}),
+    ));
+    faux.push(FauxResponse::text(
+        "The README mentions negative numbers now.",
+    ));
+
+    let window = cx
+        .open_offscreen_window(size(px(1440.), px(860.)), |window, cx| {
+            cx.new(|cx| ProjectWindow::new(root.clone(), window, cx))
+        })
+        .unwrap();
+    let any = window.into();
+    pump(cx, Duration::from_millis(200));
+    cx.dispatch_action(any, crate::actions::ToggleRightPanel);
+    for prompt in [
+        "Negative numbers like -3 don't parse",
+        "Mention it in the README",
+    ] {
+        cx.simulate_input(any, prompt);
+        pump(cx, Duration::from_millis(50));
+        cx.dispatch_action(any, SendMessage);
+        pump(cx, Duration::from_millis(4000));
+    }
+    // Show the first turn's edit.
+    cx.update_window(any, |_, window, cx| {
+        let view = window.root::<ProjectWindow>().flatten().unwrap();
+        let conversation = view.read(cx).active_conversation().unwrap().clone();
+        conversation.update(cx, |c, _| c.scroll_to_row(1));
+    })
+    .unwrap();
+    pump(cx, Duration::from_millis(200));
+    cx.capture_screenshot(any)
+        .unwrap()
+        .save(out.join("11-inline-diff-and-changes.png"))
+        .unwrap();
+
+    cx.update_window(any, |_, window, cx| {
+        let view = window.root::<ProjectWindow>().flatten().unwrap();
+        let panel = view.read(cx).changes_panel().clone();
+        panel.update(cx, |panel, cx| {
+            panel.set_mode(crate::changes_panel::ChangesMode::Turns, cx)
+        });
+    })
+    .unwrap();
+    pump(cx, Duration::from_millis(100));
+    // Hover the newest turn to show its actions.
+    cx.simulate_mouse_move(any, point(px(1300.), px(98.)), None, Modifiers::none());
+    pump(cx, Duration::from_millis(100));
+    cx.capture_screenshot(any)
+        .unwrap()
+        .save(out.join("12-changes-by-turn.png"))
+        .unwrap();
+
+    cx.update_window(any, |_, window, cx| {
+        let view = window.root::<ProjectWindow>().flatten().unwrap();
+        let panel = view.read(cx).changes_panel().clone();
+        panel.update(cx, |panel, cx| {
+            panel.open_file(
+                zp_core::changes::Scope::Session,
+                &root.join("src/parser.rs"),
+                cx,
+            )
+        });
+    })
+    .unwrap();
+    pump(cx, Duration::from_millis(100));
+    cx.capture_screenshot(any)
+        .unwrap()
+        .save(out.join("13-diff-unified.png"))
+        .unwrap();
+    cx.dispatch_action(any, crate::actions::ToggleDiffLayout);
+    pump(cx, Duration::from_millis(100));
+    cx.capture_screenshot(any)
+        .unwrap()
+        .save(out.join("14-diff-split.png"))
+        .unwrap();
+}
+
+/// M8: approval cards for a destructive command and a file change, and the permission
+/// mode picker.
+fn approvals(cx: &mut VisualTestAppContext, faux: &FauxProvider, out: &std::path::Path) {
+    let project = tempfile::tempdir().unwrap();
+    let root = zp_core::project::normalize_project_path(project.path()).unwrap();
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(
+        root.join("src/config.rs"),
+        "pub const RETRIES: u32 = 3;\npub const TIMEOUT_SECS: u64 = 30;\n",
+    )
+    .unwrap();
+    cx.update(|cx| {
+        let root = root.clone();
+        crate::store::AppStore::update(cx, move |state| {
+            state.project_mut(&root).permission_mode =
+                Some(zp_core::permissions::PermissionMode::AutoReview);
+        });
+    });
+    faux.push(FauxResponse::blocks(vec![
+        FauxBlock::Text("The build directory is stale; I'll remove it and rebuild.".into()),
+        FauxBlock::ToolCall {
+            name: "bash".into(),
+            arguments: json!({"command": "rm -rf build && cargo build --release"}),
+        },
+    ]));
+    faux.push(FauxResponse::tool_call(
+        "edit",
+        json!({"path": "/etc/zp-demo.conf", "edits": [{"oldText": "a", "newText": "b"}]}),
+    ));
+
+    let window = cx
+        .open_offscreen_window(size(px(1280.), px(820.)), |window, cx| {
+            cx.new(|cx| ProjectWindow::new(root.clone(), window, cx))
+        })
+        .unwrap();
+    let any = window.into();
+    pump(cx, Duration::from_millis(200));
+    cx.simulate_input(any, "The release build is broken, rebuild from scratch");
+    pump(cx, Duration::from_millis(50));
+    cx.dispatch_action(any, SendMessage);
+    pump(cx, Duration::from_millis(2500));
+    cx.capture_screenshot(any)
+        .unwrap()
+        .save(out.join("15-approval-command.png"))
+        .unwrap();
+
+    // Deny with a reason; the next call writes outside the project.
+    cx.update_window(any, |_, window, cx| {
+        let view = window.root::<ProjectWindow>().flatten().unwrap();
+        let conversation = view.read(cx).active_conversation().unwrap().clone();
+        conversation.update(cx, |c, cx| {
+            c.deny_first_approval("keep build/, run cargo clean instead", cx)
+        });
+    })
+    .unwrap();
+    pump(cx, Duration::from_millis(2500));
+    cx.capture_screenshot(any)
+        .unwrap()
+        .save(out.join("16-approval-outside.png"))
+        .unwrap();
+
+    cx.update_window(any, |_, window, cx| {
+        let view = window.root::<ProjectWindow>().flatten().unwrap();
+        let conversation = view.read(cx).active_conversation().unwrap().clone();
+        conversation.update(cx, |c, cx| {
+            c.toggle_picker(crate::conversation::Picker::Permissions, window, cx)
+        });
+    })
+    .unwrap();
+    pump(cx, Duration::from_millis(100));
+    cx.capture_screenshot(any)
+        .unwrap()
+        .save(out.join("17-permission-modes.png"))
+        .unwrap();
 }

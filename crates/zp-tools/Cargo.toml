@@ -19,6 +19,7 @@ ignore.workspace = true
 regex.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+similar.workspace = true
 tokio = { workspace = true, features = ["process", "fs"] }
 tokio-util.workspace = true
 tracing.workspace = true

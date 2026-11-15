@@ -108,6 +108,13 @@ impl ProjectWindow {
                 };
                 match event {
                     ConversationEvent::StatusChanged => {}
+                    ConversationEvent::PermissionModeChanged(mode) => {
+                        let (root, mode) = (this.root.clone(), *mode);
+                        AppStore::update(cx, move |state| {
+                            state.project_mut(&root).permission_mode = Some(mode);
+                        });
+                        this.apply_permissions(cx);
+                    }
                     ConversationEvent::RunFinished => {
                         if index != this.active {
                             this.tabs[index].unread = true;
@@ -127,6 +134,10 @@ impl ProjectWindow {
                             this.add_tab(session, false, window, cx);
                             this.load_sessions(cx);
                         }
+                    }
+                    ConversationEvent::FilesChanged => {}
+                    ConversationEvent::OpenDiff(item) => {
+                        this.open_diff(vec![item.clone()], 0, window, cx)
                     }
                 }
                 cx.notify();
@@ -174,6 +185,10 @@ impl ProjectWindow {
         tab.unread = false;
         self.active = index;
         let conversation = tab.conversation.clone();
+        self.diff = None;
+        self.changes.update(cx, |panel, cx| {
+            panel.set_conversation(Some(conversation.clone()), cx)
+        });
         self.sidebar.selected = conversation.read(cx).session_file();
         let focus = conversation.read(cx).composer_focus(cx);
         focus.focus(window, cx);
@@ -499,7 +514,10 @@ impl ProjectWindow {
         let tab = &self.tabs[index];
         let view = tab.conversation.read(cx);
         let dot = |color| div().size(px(7.)).rounded_full().bg(color).flex_shrink_0();
-        if view.is_running() {
+        if view.needs_attention() {
+            // Waiting for an approval: the most urgent state.
+            Some(dot(colors.warning).into_any_element())
+        } else if view.is_running() {
             Some(
                 dot(colors.accent)
                     .with_animation(

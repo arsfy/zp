@@ -20,10 +20,12 @@ use crate::actions::{
     OpenSelectedSession, PROJECT_CONTEXT, PreviousTab, SelectNextSession, SelectPreviousSession,
     ToggleRightPanel, ToggleSessionTree, ToggleSidebar,
 };
+use crate::changes_panel::{ChangesMode, ChangesPanel, ChangesPanelEvent};
 use crate::context_menu::ContextMenu;
+use crate::diff_view::{DiffItem, DiffLayout, DiffView, DiffViewEvent};
 use crate::store::{AppPaths, AppStore};
 use crate::theme::{ActiveTheme, Theme};
-use crate::ui::{CUSTOM_TITLE_BAR, section_header, title_bar};
+use crate::ui::{CUSTOM_TITLE_BAR, title_bar};
 use crate::workspace::{self, Workspaces};
 
 pub use tabs::Tab;
@@ -69,6 +71,11 @@ struct Rename {
     position: Point<Pixels>,
 }
 
+struct OpenDiff {
+    view: Entity<DiffView>,
+    _events: Subscription,
+}
+
 struct OpenMenu {
     menu: Entity<ContextMenu>,
     position: Point<Pixels>,
@@ -86,6 +93,12 @@ pub struct ProjectWindow {
     sidebar: sidebar::Sidebar,
     menu: Option<OpenMenu>,
     rename: Option<Rename>,
+    changes: Entity<ChangesPanel>,
+    /// A diff shown instead of the active conversation.
+    diff: Option<OpenDiff>,
+    diff_layout: DiffLayout,
+    /// Whether the trust question is on screen.
+    trust_prompt_open: bool,
     focus_handle: FocusHandle,
     _subscriptions: Vec<Subscription>,
 }
@@ -104,7 +117,81 @@ impl ProjectWindow {
     pub fn new(root: PathBuf, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let mut this = Self::empty(root, window, cx);
         this.restore_tabs(window, cx);
+        this.check_trust(window, cx);
         this
+    }
+
+    // ----- permissions and trust -----------------------------------------------------
+
+    /// Applies the project's current permission policy and trust to every tab.
+    pub(crate) fn apply_permissions(&mut self, cx: &mut Context<Self>) {
+        let policy = crate::approvals::project_policy(&self.root, cx);
+        let trusted = crate::approvals::is_trusted(&self.root, cx);
+        for tab in &self.tabs {
+            tab.conversation.update(cx, |view, cx| {
+                view.set_permission_policy(policy.clone(), cx);
+                view.set_trusted(trusted);
+            });
+        }
+        cx.notify();
+    }
+
+    /// Asks whether to trust the project the first time it has instructions or settings.
+    fn check_trust(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if AppStore::state(cx).project(&self.root).trusted.is_none()
+            && !zp_core::project::trust_files(&self.root).is_empty()
+        {
+            self.prompt_trust(window, cx);
+        }
+    }
+
+    /// Whether the project's instructions and settings are ignored.
+    fn is_restricted(&self, cx: &App) -> bool {
+        AppStore::state(cx).project(&self.root).trusted != Some(true)
+            && !zp_core::project::trust_files(&self.root).is_empty()
+    }
+
+    /// Asks the user whether to trust the project and applies the answer.
+    pub(crate) fn prompt_trust(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.trust_prompt_open {
+            return;
+        }
+        let files: Vec<String> = zp_core::project::trust_files(&self.root)
+            .iter()
+            .map(|file| {
+                file.strip_prefix(&self.root)
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|_| zp_core::project::tilde_path(file))
+            })
+            .collect();
+        let detail = format!(
+            "This folder has instructions or settings for AI agents:\n{}\n\nA trusted project's \
+             files can tell the agent what to do and change its permissions. If you don't \
+             trust the folder's authors, ZP ignores them.",
+            files.join("\n")
+        );
+        let answer = window.prompt(
+            gpui::PromptLevel::Warning,
+            "Do you trust this project?",
+            Some(&detail),
+            &["Trust Project", "Don't Trust"],
+            cx,
+        );
+        self.trust_prompt_open = true;
+        cx.spawn_in(window, async move |this, cx| {
+            let trusted = answer.await.ok().map(|answer| answer == 0);
+            let _ = this.update(cx, |this, cx| {
+                this.trust_prompt_open = false;
+                if let Some(trusted) = trusted {
+                    let root = this.root.clone();
+                    AppStore::update(cx, move |state| {
+                        state.project_mut(&root).trusted = Some(trusted);
+                    });
+                    this.apply_permissions(cx);
+                }
+            });
+        })
+        .detach();
     }
 
     /// A window with one tab showing `session`.
@@ -128,7 +215,13 @@ impl ProjectWindow {
         let geometry_root = root.clone();
         let release_root = root.clone();
         let search = cx.new(|cx| EditableTextState::new(StringStorage::default(), cx));
+        let changes = cx.new(|_| ChangesPanel::new(root.clone()));
         let subscriptions = vec![
+            cx.subscribe_in(&changes, window, |this, _, event, window, cx| match event {
+                ChangesPanelEvent::OpenDiff { items, index } => {
+                    this.open_diff(items.clone(), *index, window, cx)
+                }
+            }),
             cx.observe_window_appearance(window, |_, window, cx| {
                 if Theme::sync_with_appearance(window.appearance(), cx) {
                     cx.refresh_windows();
@@ -162,6 +255,10 @@ impl ProjectWindow {
             sidebar: sidebar::Sidebar::new(search),
             menu: None,
             rename: None,
+            changes,
+            diff: None,
+            diff_layout: DiffLayout::Unified,
+            trust_prompt_open: false,
             focus_handle,
             _subscriptions: subscriptions,
         };
@@ -189,7 +286,54 @@ impl ProjectWindow {
             window.set_window_title(&Self::title_for(&self.root));
         }
         self.load_sessions(cx);
+        if self.changes.read(cx).mode() == ChangesMode::Git {
+            self.changes.update(cx, |panel, cx| panel.refresh_git(cx));
+        }
         cx.notify();
+    }
+
+    /// The changes panel (tests).
+    #[cfg(any(test, feature = "visual-tests"))]
+    pub fn changes_panel(&self) -> &Entity<ChangesPanel> {
+        &self.changes
+    }
+
+    /// The diff shown instead of the conversation (tests).
+    #[cfg(test)]
+    pub fn diff_view(&self) -> Option<Entity<DiffView>> {
+        self.diff.as_ref().map(|diff| diff.view.clone())
+    }
+
+    /// Shows `items` in a diff view over the conversation.
+    pub(crate) fn open_diff(
+        &mut self,
+        items: Vec<DiffItem>,
+        index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let layout = self.diff_layout;
+        let view = cx.new(|cx| DiffView::new(items, index, layout, cx));
+        let events = cx.subscribe_in(&view, window, |this, view, event, window, cx| match event {
+            DiffViewEvent::Close => {
+                this.diff_layout = view.read(cx).layout();
+                this.close_diff(window, cx);
+            }
+        });
+        view.read(cx).focus_handle(cx).focus(window, cx);
+        self.diff = Some(OpenDiff {
+            view,
+            _events: events,
+        });
+        cx.notify();
+    }
+
+    pub(crate) fn close_diff(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(diff) = self.diff.take() {
+            self.diff_layout = diff.view.read(cx).layout();
+            self.focus_active(window, cx);
+            cx.notify();
+        }
     }
 
     fn save_layout(&self, cx: &mut App) {
@@ -373,12 +517,13 @@ impl ProjectWindow {
             .flex()
             .flex_col()
             .child(self.render_tab_bar(cx))
-            .child(
-                div()
+            .child(match &self.diff {
+                Some(diff) => div().flex_1().min_h_0().child(diff.view.clone()),
+                None => div()
                     .flex_1()
                     .min_h_0()
                     .children(self.active_conversation().cloned()),
-            )
+            })
     }
 
     fn render_right_panel(&self, cx: &App) -> impl IntoElement {
@@ -388,18 +533,10 @@ impl ProjectWindow {
             .w(px(self.layout.right_panel_width))
             .h_full()
             .flex_shrink_0()
-            .flex()
-            .flex_col()
             .bg(colors.surface)
             .border_l_1()
             .border_color(colors.border)
-            .child(section_header("CHANGES", cx))
-            .child(
-                div()
-                    .px_3()
-                    .text_color(colors.text_muted)
-                    .child("No changes yet"),
-            )
+            .child(self.changes.clone())
     }
 
     fn render_title_bar(&self, cx: &App) -> impl IntoElement {
@@ -431,7 +568,20 @@ impl ProjectWindow {
             .iter()
             .filter(|tab| tab.conversation.read(cx).is_running())
             .count();
+        let changed_files = self.changes.read(cx).file_count();
+        let waiting = self
+            .tabs
+            .iter()
+            .filter(|tab| tab.conversation.read(cx).needs_attention())
+            .count();
+        let restricted = self.is_restricted(cx);
         let mut right = Vec::new();
+        if waiting > 0 {
+            right.push(format!(
+                "{waiting} tab{} awaiting approval",
+                if waiting == 1 { "" } else { "s" }
+            ));
+        }
         if running_tabs > 1 {
             right.push(format!("{running_tabs} tabs running"));
         } else if status.as_ref().is_some_and(|s| s.running) {
@@ -476,12 +626,46 @@ impl ProjectWindow {
             .border_t_1()
             .border_color(colors.border)
             .child(
-                div().child(
-                    self.branch
-                        .as_ref()
-                        .map(|branch| format!("⎇ {branch}"))
-                        .unwrap_or_default(),
-                ),
+                div()
+                    .flex()
+                    .gap_3()
+                    .child(
+                        self.branch
+                            .as_ref()
+                            .map(|branch| format!("⎇ {branch}"))
+                            .unwrap_or_default(),
+                    )
+                    .when(restricted, |this| {
+                        this.child(
+                            div()
+                                .id("status-restricted")
+                                .cursor_pointer()
+                                .text_color(colors.warning)
+                                .hover_style(|s| s.text_color(colors.text))
+                                .child("Restricted Mode")
+                                .tooltip(crate::ui::tooltip(
+                                    "The project's instructions and settings are ignored. Click to review.",
+                                ))
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.prompt_trust(window, cx)
+                                })),
+                        )
+                    })
+                    .when(changed_files > 0, |this| {
+                        this.child(
+                            div()
+                                .id("status-changes")
+                                .cursor_pointer()
+                                .hover_style(|s| s.text_color(colors.text))
+                                .child(format!(
+                                    "{changed_files} file{} changed",
+                                    if changed_files == 1 { "" } else { "s" }
+                                ))
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.toggle_right_panel(&ToggleRightPanel, window, cx)
+                                })),
+                        )
+                    }),
             )
             .child(div().child(right.join("  ·  ")))
     }

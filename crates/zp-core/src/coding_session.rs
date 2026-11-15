@@ -5,24 +5,85 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use anyhow::{Context as _, bail};
+use futures::future::BoxFuture;
+use tokio_util::sync::CancellationToken;
 use zp_agent::{
-    Agent, AgentError, AgentEvent, AgentHooks, AgentMessage, AgentOptions, AgentTool, PromptInput,
-    Subscription,
+    AfterToolCall, Agent, AgentError, AgentEvent, AgentHooks, AgentMessage, AgentOptions,
+    AgentTool, BeforeToolCall, PromptInput, Subscription, ToolCallDecision, ToolResultOverride,
 };
 use zp_ai::{Message, Model, Models, StopReason, StreamOptions, ThinkingLevel, Usage, UserContent};
 use zp_session::{COMPACTION_SUMMARY_TYPE, Session};
 
+use crate::changes::{ChangeLog, restore_message};
+use crate::checkpoint::{BlobStore, RecordedChange, store_tool_change};
+use crate::permissions::PermissionGate;
 use crate::system_prompt::{SystemPromptOptions, build_system_prompt, load_context_files};
 
 const COMPACTION_PREFIX: &str = "The conversation history before this point was compacted into the following summary:\n\n<summary>\n";
 const COMPACTION_SUFFIX: &str = "\n</summary>";
 
-/// Shows custom transcript messages to the model as user messages; compaction summaries
-/// are wrapped so the model knows what they are.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct CodingHooks;
+/// Shows custom transcript messages to the model as user messages (compaction summaries
+/// are wrapped so the model knows what they are), checks tool calls against the
+/// permissions, and moves file contents of `write` / `edit` results into the snapshot
+/// store.
+#[derive(Clone)]
+pub struct CodingHooks {
+    /// Where file versions are kept.
+    pub blobs: BlobStore,
+    /// Permission checks; `None` allows every call.
+    pub permissions: Option<Arc<PermissionGate>>,
+    /// Resolves the model of a call (for auto-review).
+    pub models: Models,
+}
 
 impl AgentHooks for CodingHooks {
+    fn before_tool_call<'a>(
+        &'a self,
+        call: BeforeToolCall<'a>,
+        cancel: &'a CancellationToken,
+    ) -> BoxFuture<'a, ToolCallDecision> {
+        Box::pin(async move {
+            let Some(gate) = &self.permissions else {
+                return ToolCallDecision::Allow;
+            };
+            let message = call.assistant_message;
+            let model = self.models.model(&message.provider, &message.model);
+            gate.check(
+                call.tool_call,
+                call.args,
+                model.as_ref(),
+                call.messages,
+                cancel,
+            )
+            .await
+        })
+    }
+
+    fn after_tool_call<'a>(
+        &'a self,
+        call: AfterToolCall<'a>,
+        _cancel: &'a CancellationToken,
+    ) -> BoxFuture<'a, Option<ToolResultOverride>> {
+        let details = call
+            .result
+            .details
+            .as_ref()
+            .and_then(|details| store_tool_change(&self.blobs, details));
+        Box::pin(async move {
+            match details? {
+                Ok(details) => Some(ToolResultOverride {
+                    details: Some(details),
+                    ..ToolResultOverride::default()
+                }),
+                Err(error) => {
+                    // Keep the inline contents rather than losing the change.
+                    tracing::warn!(%error, "could not store file snapshots");
+                    None
+                }
+            }
+        })
+    }
+
     fn convert_to_llm(&self, messages: &[AgentMessage]) -> Vec<Message> {
         messages
             .iter()
@@ -73,6 +134,12 @@ pub struct CodingSessionOptions {
     pub append_system_prompt: Option<String>,
     /// Request template (max tokens, headers…).
     pub request_options: StreamOptions,
+    /// Where file versions are kept; `None` keeps them in memory.
+    pub blobs: Option<BlobStore>,
+    /// Permission checks; `None` allows every tool call.
+    pub permissions: Option<Arc<PermissionGate>>,
+    /// Whether the project is trusted: its instruction files are only loaded then.
+    pub trusted: bool,
 }
 
 impl CodingSessionOptions {
@@ -89,6 +156,9 @@ impl CodingSessionOptions {
             custom_system_prompt: None,
             append_system_prompt: None,
             request_options: StreamOptions::default(),
+            blobs: None,
+            permissions: None,
+            trusted: true,
         }
     }
 }
@@ -136,8 +206,38 @@ pub struct CodingSession {
     session: Arc<Mutex<Session>>,
     models: Models,
     cwd: PathBuf,
-    system_prompt: String,
+    system_prompt: Mutex<String>,
+    prompt_inputs: PromptInputs,
+    blobs: BlobStore,
+    permissions: Option<Arc<PermissionGate>>,
     _persistence: Subscription,
+}
+
+/// What the system prompt is built from (to rebuild it when trust changes).
+struct PromptInputs {
+    global_context_dir: Option<PathBuf>,
+    custom_system_prompt: Option<String>,
+    append_system_prompt: Option<String>,
+}
+
+/// Context files of `cwd`; without trust only the global one.
+fn context_files(
+    cwd: &Path,
+    global_dir: Option<&Path>,
+    trusted: bool,
+) -> Vec<crate::system_prompt::ContextFile> {
+    let files = load_context_files(cwd, global_dir);
+    if trusted {
+        return files;
+    }
+    let boundary = crate::project::trust_boundary(cwd);
+    files
+        .into_iter()
+        .filter(|file| {
+            !file.path.starts_with(&boundary)
+                || global_dir.is_some_and(|g| file.path.starts_with(g))
+        })
+        .collect()
 }
 
 impl CodingSession {
@@ -154,7 +254,11 @@ impl CodingSession {
             custom_system_prompt,
             append_system_prompt,
             request_options,
+            blobs,
+            permissions,
+            trusted,
         } = options;
+        let blobs = blobs.unwrap_or_else(BlobStore::in_memory);
         let context = session.context();
         let model = match model {
             Some(model) => model,
@@ -173,7 +277,7 @@ impl CodingSession {
         }
 
         let tools = tools.unwrap_or_else(|| zp_tools::coding_tools(&cwd));
-        let context_files = load_context_files(&cwd, global_context_dir.as_deref());
+        let context_files = context_files(&cwd, global_context_dir.as_deref(), trusted);
         let system_prompt = build_system_prompt(&SystemPromptOptions {
             cwd: &cwd,
             tools: &tools,
@@ -187,7 +291,11 @@ impl CodingSession {
         agent_options.system_prompt = Some(system_prompt.clone());
         agent_options.tools = tools;
         agent_options.messages = context.messages;
-        agent_options.hooks = Arc::new(CodingHooks);
+        agent_options.hooks = Arc::new(CodingHooks {
+            blobs: blobs.clone(),
+            permissions: permissions.clone(),
+            models: models.clone(),
+        });
         agent_options.request_options = StreamOptions {
             session_id: Some(session.id().to_owned()),
             ..request_options
@@ -211,7 +319,14 @@ impl CodingSession {
             session,
             models,
             cwd,
-            system_prompt,
+            system_prompt: Mutex::new(system_prompt),
+            prompt_inputs: PromptInputs {
+                global_context_dir,
+                custom_system_prompt,
+                append_system_prompt,
+            },
+            blobs,
+            permissions,
             _persistence: persistence,
         })
     }
@@ -236,9 +351,77 @@ impl CodingSession {
         &self.cwd
     }
 
+    /// Where file versions are kept.
+    pub fn blobs(&self) -> &BlobStore {
+        &self.blobs
+    }
+
+    /// The file changes along the current branch.
+    pub fn change_log(&self) -> ChangeLog {
+        ChangeLog::from_path(&self.session().branch_path(None))
+    }
+
+    /// The file changes along the branch ending at `leaf` (`None`: before any entry).
+    pub fn change_log_at(&self, leaf: Option<&str>) -> ChangeLog {
+        match leaf {
+            Some(leaf) => ChangeLog::from_path(&self.session().branch_path(Some(leaf))),
+            None => ChangeLog::default(),
+        }
+    }
+
+    /// Records files the user restored (so the model knows), on the current branch.
+    pub fn record_restore(
+        &self,
+        description: &str,
+        changes: &[RecordedChange],
+    ) -> anyhow::Result<()> {
+        if changes.is_empty() {
+            return Ok(());
+        }
+        if self.agent.is_streaming() {
+            bail!("cannot record a restore while the agent is running");
+        }
+        let message = AgentMessage::Custom(restore_message(description, changes, &self.cwd));
+        let messages = {
+            let mut session = self.session();
+            session.append_message(message)?;
+            session.context().messages
+        };
+        self.agent.set_messages(messages);
+        Ok(())
+    }
+
     /// The system prompt in use.
-    pub fn system_prompt(&self) -> &str {
-        &self.system_prompt
+    pub fn system_prompt(&self) -> String {
+        self.system_prompt
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Permission checks, if any.
+    pub fn permissions(&self) -> Option<&Arc<PermissionGate>> {
+        self.permissions.as_ref()
+    }
+
+    /// Rebuilds the system prompt with or without the project's instruction files (after
+    /// the user decided whether to trust the project). Applies from the next request.
+    pub fn set_trusted(&self, trusted: bool) {
+        let inputs = &self.prompt_inputs;
+        let tools = self.agent.tools();
+        let files = context_files(&self.cwd, inputs.global_context_dir.as_deref(), trusted);
+        let prompt = build_system_prompt(&SystemPromptOptions {
+            cwd: &self.cwd,
+            tools: &tools,
+            context_files: &files,
+            custom_prompt: inputs.custom_system_prompt.as_deref(),
+            append: inputs.append_system_prompt.as_deref(),
+        });
+        self.agent.set_system_prompt(Some(prompt.clone()));
+        *self
+            .system_prompt
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = prompt;
     }
 
     /// Runs a prompt to completion (see [`Agent::prompt`]).

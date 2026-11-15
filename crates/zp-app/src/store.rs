@@ -26,6 +26,15 @@ impl AppPaths {
         cx.set_global(Self { data_dir });
     }
 
+    /// The snapshot store of the data directory.
+    pub fn blobs(cx: &App) -> Option<zp_core::checkpoint::BlobStore> {
+        let paths = cx.try_global::<Self>()?;
+        paths
+            .data_dir
+            .as_deref()
+            .map(zp_core::checkpoint::BlobStore::in_data_dir)
+    }
+
     pub fn sessions_dir(cx: &App) -> Option<PathBuf> {
         let paths = cx.try_global::<Self>()?;
         paths.data_dir.as_deref().map(zp_core::paths::sessions_dir)

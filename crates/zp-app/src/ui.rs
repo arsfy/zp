@@ -1,8 +1,8 @@
 //! Small shared UI pieces.
 
 use gpui::{
-    App, ClickEvent, Div, ElementId, MouseButton, SharedString, Stateful, Window, div, prelude::*,
-    px,
+    AnyView, App, ClickEvent, Context, Div, ElementId, IntoElement, MouseButton, Render,
+    SharedString, Stateful, Window, div, prelude::*, px,
 };
 
 use crate::theme::ActiveTheme;
@@ -136,6 +136,35 @@ pub fn section_header(label: impl Into<SharedString>, cx: &App) -> Div {
         .text_size(px(11.))
         .text_color(cx.theme().colors.text_muted)
         .child(label.into())
+}
+
+/// A plain text tooltip.
+pub struct TextTooltip(SharedString);
+
+impl Render for TextTooltip {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let colors = cx.theme().colors.clone();
+        div()
+            .px_2()
+            .py_1()
+            .max_w(px(320.))
+            .rounded(px(4.))
+            .border_1()
+            .border_color(colors.border)
+            .bg(colors.surface)
+            .shadow_md()
+            .text_size(px(12.))
+            .text_color(colors.text)
+            .child(self.0.clone())
+    }
+}
+
+/// Builds a [`TextTooltip`], for `.tooltip(…)`.
+pub fn tooltip(
+    text: impl Into<SharedString>,
+) -> impl Fn(&mut Window, &mut App) -> AnyView + 'static {
+    let text = text.into();
+    move |_, cx| cx.new(|_| TextTooltip(text.clone())).into()
 }
 
 #[cfg(test)]

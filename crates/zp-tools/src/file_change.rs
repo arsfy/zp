@@ -31,27 +31,16 @@ impl FileChange {
         self.before.is_none()
     }
 
-    /// `(added, removed)` line counts, from a line-level comparison of the two versions
-    /// (lines are matched by their longest common subsequence prefix/suffix only, which
-    /// is exact for the typical single-region change).
+    /// `(added, removed)` line counts.
     pub fn line_stats(&self) -> (usize, usize) {
-        let before: Vec<&str> = self.before.as_deref().unwrap_or_default().lines().collect();
-        let after: Vec<&str> = self.after.lines().collect();
-        let prefix = before
-            .iter()
-            .zip(&after)
-            .take_while(|(a, b)| a == b)
-            .count();
-        let suffix = before[prefix..]
-            .iter()
-            .rev()
-            .zip(after[prefix..].iter().rev())
-            .take_while(|(a, b)| a == b)
-            .count();
-        (
-            after.len() - prefix - suffix,
-            before.len() - prefix - suffix,
-        )
+        let before = self.before.as_deref().unwrap_or_default();
+        let diff = similar::TextDiff::from_lines(before, self.after.as_str());
+        diff.iter_all_changes()
+            .fold((0, 0), |(added, removed), change| match change.tag() {
+                similar::ChangeTag::Insert => (added + 1, removed),
+                similar::ChangeTag::Delete => (added, removed + 1),
+                similar::ChangeTag::Equal => (added, removed),
+            })
     }
 }
 

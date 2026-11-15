@@ -1,5 +1,6 @@
 //! Headless entry point for ZP, used to exercise the core crates without the GUI.
 
+mod approve;
 mod run;
 
 use std::io::IsTerminal as _;

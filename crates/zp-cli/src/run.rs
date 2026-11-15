@@ -9,9 +9,19 @@ use clap::Args;
 use tokio::io::AsyncBufReadExt as _;
 use zp_agent::{AgentEvent, AgentMessage, AgentToolResult, PromptInput};
 use zp_ai::{AssistantMessageEvent, Models, StopReason, StreamOptions, ThinkingLevel, UserContent};
+use zp_core::checkpoint::RecordedChange;
+use zp_core::permissions::{PermissionGate, PermissionMode};
+use zp_core::settings::ProjectSettings;
+
+use crate::approve::{InputLines, TerminalApprover};
+
+fn parse_mode(name: &str) -> Result<PermissionMode, String> {
+    PermissionMode::from_cli_name(name).ok_or_else(|| {
+        format!("unknown mode `{name}` (use ask, auto-edit, auto-review or full-auto)")
+    })
+}
 use zp_core::{CodingSession, CodingSessionOptions, session_model};
 use zp_session::{Session, SessionManager};
-use zp_tools::FileChange;
 
 #[derive(Args, Clone, Default)]
 pub(crate) struct RunArgs {
@@ -56,6 +66,10 @@ pub(crate) struct RunArgs {
     /// first message.
     #[arg(short, long)]
     interactive: bool,
+    /// Permission mode: ask, auto-edit, auto-review or full-auto (default: the settings,
+    /// else ask). Approvals are asked on the terminal.
+    #[arg(long, value_name = "MODE", value_parser = parse_mode)]
+    permissions: Option<PermissionMode>,
     /// The prompt. Read from stdin when piped; omit on a terminal for interactive mode.
     prompt: Vec<String>,
 }
@@ -71,7 +85,7 @@ pub(crate) struct SessionsArgs {
 }
 
 #[derive(Clone, Copy)]
-struct Style {
+pub(crate) struct Style {
     enabled: bool,
 }
 
@@ -82,7 +96,7 @@ impl Style {
         }
     }
 
-    fn paint(&self, code: &str, text: &str) -> String {
+    pub(crate) fn paint(&self, code: &str, text: &str) -> String {
         if self.enabled {
             format!("\x1b[{code}m{text}\x1b[0m")
         } else {
@@ -170,6 +184,29 @@ pub(crate) async fn run(models: &Models, args: RunArgs) -> Result<()> {
     options.model = model;
     options.thinking_level = args.thinking;
     options.tools = tools;
+    if !args.no_session {
+        options.blobs = Some(zp_core::checkpoint::BlobStore::in_data_dir(&data_dir));
+    }
+    // The project is trusted unless the user declined it in the app.
+    let trusted = zp_core::app_state::AppState::load(&zp_core::paths::state_file(&data_dir))
+        .project(&cwd)
+        .trusted
+        != Some(false);
+    let settings = ProjectSettings::load(Some(&data_dir), &cwd, trusted);
+    let policy = settings.permission_policy(&cwd, args.permissions);
+    // Approvals read the same stdin as the interactive prompt.
+    let input: Option<InputLines> = std::io::stdin().is_terminal().then(|| {
+        Arc::new(tokio::sync::Mutex::new(
+            tokio::io::BufReader::new(tokio::io::stdin()).lines(),
+        ))
+    });
+    let approver = Arc::new(TerminalApprover::new(input.clone(), Style::detect()));
+    options.permissions = Some(Arc::new(PermissionGate::new(
+        policy,
+        approver,
+        models.clone(),
+    )));
+    options.trusted = trusted;
     options.global_context_dir = Some(data_dir);
     options.custom_system_prompt = args.system_prompt;
     options.append_system_prompt = args.append_system_prompt;
@@ -197,7 +234,7 @@ pub(crate) async fn run(models: &Models, args: RunArgs) -> Result<()> {
                 eprintln!("{}", style.paint("31", &format!("error: {error:#}")));
             }
             print_usage(&coding, style);
-            interactive(&coding, models, style).await
+            interactive(&coding, models, style, input).await
         }
         Some(prompt) => {
             let added = run_prompt(&coding, prompt).await?;
@@ -212,7 +249,7 @@ pub(crate) async fn run(models: &Models, args: RunArgs) -> Result<()> {
             }
             Ok(())
         }
-        None => interactive(&coding, models, style).await,
+        None => interactive(&coding, models, style, input).await,
     }
 }
 
@@ -286,12 +323,21 @@ async fn run_prompt(
     }
 }
 
-async fn interactive(coding: &CodingSession, models: &Models, style: Style) -> Result<()> {
+async fn interactive(
+    coding: &CodingSession,
+    models: &Models,
+    style: Style,
+    input: Option<InputLines>,
+) -> Result<()> {
     eprintln!(
         "{}",
         style.paint("2", "Type a message (end a line with \\ to continue it), /help for commands, Ctrl-D to quit.")
     );
-    let mut lines = tokio::io::BufReader::new(tokio::io::stdin()).lines();
+    let stdin_lines = input.unwrap_or_else(|| {
+        Arc::new(tokio::sync::Mutex::new(
+            tokio::io::BufReader::new(tokio::io::stdin()).lines(),
+        ))
+    });
     'session: loop {
         let mut input = String::new();
         let mut prompt_marker = "› ";
@@ -299,7 +345,7 @@ async fn interactive(coding: &CodingSession, models: &Models, style: Style) -> R
             eprint!("{}", style.paint("1;32", prompt_marker));
             let _ = std::io::stderr().flush();
             let line = tokio::select! {
-                line = lines.next_line() => line?,
+                line = async { stdin_lines.lock().await.next_line().await } => line?,
                 _ = tokio::signal::ctrl_c() => {
                     eprintln!();
                     break 'session;
@@ -566,9 +612,12 @@ fn summarize_result(tool: &str, result: &AgentToolResult, is_error: bool) -> Str
         let shown = &lines[lines.len().saturating_sub(PREVIEW_LINES)..];
         return indent(shown);
     }
-    if let Some(change) = result.details.as_ref().and_then(FileChange::from_details) {
-        let (added, removed) = change.line_stats();
-        return format!("  +{added} -{removed}");
+    if let Some(change) = result
+        .details
+        .as_ref()
+        .and_then(RecordedChange::from_details)
+    {
+        return format!("  +{} -{}", change.added, change.removed);
     }
     match tool {
         "read" => format!("  {} lines", lines.len()),

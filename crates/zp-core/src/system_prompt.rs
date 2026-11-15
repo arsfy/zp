@@ -47,16 +47,30 @@ fn context_file_in(dir: &Path) -> Option<ContextFile> {
 /// instructions come last.
 pub fn load_context_files(cwd: &Path, global_dir: Option<&Path>) -> Vec<ContextFile> {
     let mut files: Vec<ContextFile> = global_dir.and_then(context_file_in).into_iter().collect();
-    let mut ancestors: Vec<&Path> = cwd.ancestors().collect();
-    ancestors.reverse();
-    for dir in ancestors {
-        if let Some(file) = context_file_in(dir)
+    for path in project_context_files(cwd) {
+        if let Some(file) = path.parent().and_then(context_file_in)
             && !files.iter().any(|seen| seen.path == file.path)
         {
             files.push(file);
         }
     }
     files
+}
+
+/// The context files of `cwd` and its ancestors (without the global one): what an
+/// untrusted project could use to instruct the agent.
+pub fn project_context_files(cwd: &Path) -> Vec<PathBuf> {
+    let mut ancestors: Vec<&Path> = cwd.ancestors().collect();
+    ancestors.reverse();
+    ancestors
+        .into_iter()
+        .filter_map(|dir| {
+            CONTEXT_FILE_NAMES
+                .iter()
+                .map(|name| dir.join(name))
+                .find(|path| path.is_file())
+        })
+        .collect()
 }
 
 /// Inputs of [`build_system_prompt`].

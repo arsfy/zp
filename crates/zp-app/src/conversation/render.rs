@@ -7,11 +7,12 @@ use gpui::{
 };
 use gpui_elements::editable_text::{text_area, text_input};
 use zp_ai::{AssistantContent, StopReason, ToolCall};
-use zp_tools::FileChange;
+use zp_core::checkpoint::RecordedChange;
 
 use super::transcript::{Row, ToolStatus};
-use super::{ConversationView, Picker};
+use super::{ConversationEvent, ConversationView, Picker};
 use crate::actions::KEY_SEND;
+use crate::diff_view::{DiffColors, render_unified_row};
 use crate::markdown::{IdGen, MarkdownStyle, render_markdown};
 use crate::theme::ActiveTheme;
 
@@ -19,6 +20,8 @@ use crate::theme::ActiveTheme;
 const CONTENT_WIDTH: f32 = 820.0;
 /// Lines of tool output shown in an expanded card.
 const OUTPUT_PREVIEW_LINES: usize = 30;
+/// Diff rows shown under a tool card.
+const INLINE_DIFF_ROWS: usize = 40;
 /// Models listed at once in the picker.
 const PICKER_LIMIT: usize = 200;
 
@@ -65,6 +68,21 @@ impl ConversationView {
         let content = match &row {
             Some(Row::User { text, images, .. }) => self.render_user(text, *images, cx),
             Some(Row::Assistant { .. }) => self.render_assistant(ix, cx),
+            Some(Row::Notice { kind, text, .. }) if kind == zp_core::changes::FILE_RESTORE_TYPE => {
+                let colors = &cx.theme().colors;
+                div()
+                    .flex()
+                    .gap_2()
+                    .px_3()
+                    .py_1p5()
+                    .rounded(px(6.))
+                    .bg(colors.surface)
+                    .text_size(px(12.))
+                    .text_color(colors.text_muted)
+                    .child(div().text_color(colors.warning).child("↺"))
+                    .child(text.clone())
+                    .into_any_element()
+            }
             Some(Row::Notice { kind, text, .. }) => {
                 let colors = &cx.theme().colors;
                 div()
@@ -128,8 +146,9 @@ impl ConversationView {
             ));
         } else {
             bar = bar.child(
-                ghost_button(id("branch", ix), "Branch from here", cx)
-                    .on_click(cx.listener(move |this, _, _, cx| this.branch_from(ix, cx))),
+                ghost_button(id("branch", ix), "Branch from here", cx).on_click(
+                    cx.listener(move |this, _, window, cx| this.branch_from(ix, window, cx)),
+                ),
             );
         }
         bar = bar.child(
@@ -287,7 +306,13 @@ impl ConversationView {
         let mono = cx.theme().metrics.mono_font.clone();
         let state = self.transcript.tool(&call.id);
         let status = state.map(|state| state.status);
+        let change = state
+            .filter(|state| state.status == ToolStatus::Done)
+            .and_then(|state| state.details.as_ref())
+            .and_then(RecordedChange::from_details);
+        // File changes show their diff by default.
         let default_expanded = matches!(status, Some(ToolStatus::Error))
+            || change.is_some()
             || (call.name == "bash" && matches!(status, Some(ToolStatus::Running)));
         let expanded = self
             .tool_expanded
@@ -295,17 +320,16 @@ impl ConversationView {
             .copied()
             .unwrap_or(default_expanded);
 
-        let change = state
-            .and_then(|state| state.details.as_ref())
-            .and_then(FileChange::from_details);
+        let approval = self.render_approval(&call.id, cx);
         let (status_text, status_color) = match status {
+            _ if approval.is_some() => ("awaiting approval".to_owned(), colors.warning),
             None => ("pending".to_owned(), colors.text_muted),
             Some(ToolStatus::Running) => ("running…".to_owned(), colors.accent),
             Some(ToolStatus::Done) => match &change {
-                Some(change) => {
-                    let (added, removed) = change.line_stats();
-                    (format!("+{added} −{removed}"), colors.success)
-                }
+                Some(change) => (
+                    format!("+{} −{}", change.added, change.removed),
+                    colors.success,
+                ),
                 None => ("done".to_owned(), colors.success),
             },
             Some(ToolStatus::Error) => ("failed".to_owned(), colors.error),
@@ -352,7 +376,11 @@ impl ConversationView {
                 cx.listener(move |this, _, _, cx| this.toggle_tool(&call_id, row, expanded, cx)),
             );
 
-        let body = expanded.then(|| {
+        let diff_body = change
+            .as_ref()
+            .filter(|_| expanded)
+            .map(|change| self.render_inline_diff(&call.id, change, cx));
+        let body = (expanded && diff_body.is_none() && approval.is_none()).then(|| {
             let output = state.map(|state| state.output.as_str()).unwrap_or_default();
             let lines: Vec<&str> = output.lines().collect();
             let (shown, note) = if lines.len() <= OUTPUT_PREVIEW_LINES {
@@ -413,8 +441,90 @@ impl ConversationView {
             })
             .bg(colors.surface)
             .overflow_hidden()
+            .when(approval.is_some(), |this| this.border_color(colors.warning))
             .child(header)
+            .children(approval)
+            .children(diff_body)
             .children(body)
+            .into_any_element()
+    }
+
+    /// The diff of a file change under its tool card (the first lines; the rest in the
+    /// diff view).
+    fn render_inline_diff(
+        &self,
+        call_id: &str,
+        change: &RecordedChange,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let colors = cx.theme().colors.clone();
+        let diff_colors = DiffColors::of(cx);
+        let footer = |hidden: Option<String>| {
+            let call_id = call_id.to_owned();
+            let change = change.clone();
+            div()
+                .flex()
+                .items_center()
+                .justify_between()
+                .px_3()
+                .py_1()
+                .text_size(px(12.))
+                .text_color(colors.text_muted)
+                .child(div().children(hidden))
+                .child(
+                    div()
+                        .id(ElementId::Name(format!("open-diff-{call_id}").into()))
+                        .px_1p5()
+                        .rounded(px(4.))
+                        .cursor_pointer()
+                        .hover_style(|s| s.bg(colors.surface_hover).text_color(colors.text))
+                        .child("Open diff")
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            if let Some(item) = this.tool_diff_item(&call_id, &change) {
+                                cx.emit(ConversationEvent::OpenDiff(item));
+                            }
+                        })),
+                )
+        };
+        let content = match &*self.tool_diff(call_id, change) {
+            Err(error) => div()
+                .px_3()
+                .py_2()
+                .text_size(px(12.))
+                .text_color(colors.text_muted)
+                .child(format!("The diff is not available: {error}"))
+                .into_any_element(),
+            Ok(tool_diff) if tool_diff.diff.too_large => div()
+                .px_3()
+                .py_2()
+                .text_size(px(12.))
+                .text_color(colors.text_muted)
+                .child("The file is too large to compare.")
+                .into_any_element(),
+            Ok(tool_diff) => {
+                let hidden = tool_diff.rows.len().saturating_sub(INLINE_DIFF_ROWS);
+                div()
+                    .flex()
+                    .flex_col()
+                    .py_1()
+                    .children(
+                        tool_diff
+                            .rows
+                            .iter()
+                            .take(INLINE_DIFF_ROWS)
+                            .map(|row| render_unified_row(row, &diff_colors)),
+                    )
+                    .child(footer(
+                        (hidden > 0).then(|| format!("… {hidden} more lines")),
+                    ))
+                    .into_any_element()
+            }
+        };
+        div()
+            .border_t_1()
+            .border_color(colors.border)
+            .bg(colors.code_background)
+            .child(content)
             .into_any_element()
     }
 
@@ -556,7 +666,7 @@ impl ConversationView {
     }
 
     /// Wraps menu content in a floating panel that opens upward from its anchor.
-    fn popover(&self, content: gpui::Div, cx: &mut Context<Self>) -> AnyElement {
+    pub(super) fn popover(&self, content: gpui::Div, cx: &mut Context<Self>) -> AnyElement {
         let colors = cx.theme().colors.clone();
         deferred(
             anchored()
@@ -600,6 +710,7 @@ impl ConversationView {
                     this.child(match picker {
                         Picker::Model => self.render_model_picker(cx),
                         Picker::Thinking => self.render_thinking_picker(cx),
+                        Picker::Permissions => self.render_permission_picker(cx),
                     })
                 })
                 .child(
@@ -607,6 +718,7 @@ impl ConversationView {
                         match picker {
                             Picker::Model => "model-button",
                             Picker::Thinking => "thinking-button",
+                            Picker::Permissions => "permissions-button",
                         },
                         format!("{label} ▾"),
                         cx,
@@ -707,6 +819,11 @@ impl ConversationView {
                                         cx,
                                     ))
                                 })
+                                .child(picker_button(
+                                    Picker::Permissions,
+                                    self.permission_mode().label().to_owned(),
+                                    cx,
+                                ))
                                 .child(div().flex_1())
                                 .child(
                                     div()
@@ -818,7 +935,9 @@ impl ConversationView {
                             .child("fork"),
                     )
                 })
-                .on_click(cx.listener(move |this, _, _, cx| this.switch_branch(&id, cx)))
+                .on_click(
+                    cx.listener(move |this, _, window, cx| this.switch_branch(&id, window, cx)),
+                )
         });
         div()
             .id("session-tree")
@@ -895,6 +1014,7 @@ impl Render for ConversationView {
             .on_action(cx.listener(Self::stop))
             .on_action(cx.listener(Self::close_picker))
             .on_action(cx.listener(Self::pick_first_model))
+            .on_action(cx.listener(Self::deny_focused_approval))
             .size_full()
             .relative()
             .flex()
