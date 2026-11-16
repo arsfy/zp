@@ -1164,6 +1164,20 @@ impl ConversationView {
                 "Composer"
             })
             .capture_action(cx.listener(
+                |this, _: &gpui_elements::editable_text::actions::NavUp, window, cx| {
+                    if this.recall_prompt(true, window, cx) {
+                        cx.stop_propagation();
+                    }
+                },
+            ))
+            .capture_action(cx.listener(
+                |this, _: &gpui_elements::editable_text::actions::NavDown, window, cx| {
+                    if this.recall_prompt(false, window, cx) {
+                        cx.stop_propagation();
+                    }
+                },
+            ))
+            .capture_action(cx.listener(
                 |this, _: &gpui_elements::editable_text::actions::Paste, _, cx| {
                     if this.paste_attachments(cx) {
                         cx.stop_propagation();

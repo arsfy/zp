@@ -126,6 +126,10 @@ pub struct ConversationView {
     /// Error from the last attempt to start a run.
     run_error: Option<String>,
     composer: Entity<EditableTextState>,
+    /// Sent prompts, before template expansion, and the position being recalled.
+    prompt_history: Vec<String>,
+    history_index: Option<usize>,
+    history_draft: String,
     model_filter: Entity<EditableTextState>,
     picker: Option<Picker>,
     /// When a popover was last closed by clicking outside it; a click on its own toggle
@@ -200,6 +204,13 @@ impl ConversationView {
             // The composer redraws itself; only the completion menu depends on its text.
             cx.subscribe(&composer, |this, composer, _: &TextChanged, cx| {
                 let text = composer.read(cx).as_str();
+                if this
+                    .history_index
+                    .is_some_and(|index| this.prompt_history[index] != text)
+                {
+                    this.history_index = None;
+                    this.history_draft.clear();
+                }
                 if this.suppress_completion.as_deref() == Some(text) {
                     return;
                 }
@@ -216,6 +227,9 @@ impl ConversationView {
             running: false,
             run_error: None,
             composer,
+            prompt_history: Vec::new(),
+            history_index: None,
+            history_draft: String::new(),
             model_filter,
             picker: None,
             picker_closed_at: None,
@@ -253,6 +267,15 @@ impl ConversationView {
             Ok(()) => {}
             Err(error) => this.unavailable = Some(format!("{error:#}")),
         }
+        this.prompt_history = this
+            .transcript
+            .rows()
+            .iter()
+            .filter_map(|row| match row {
+                transcript::Row::User { text, .. } if !text.trim().is_empty() => Some(text.clone()),
+                _ => None,
+            })
+            .collect();
         this.focus_composer(window, cx);
         this
     }
@@ -1045,6 +1068,7 @@ impl ConversationView {
         }
         self.composer
             .update(cx, |composer, cx| composer.emplace("", cx));
+        self.remember_prompt(&text);
         self.picker = None;
         cx.emit(ConversationEvent::Activity);
         let text = coding.expand_input(&text);

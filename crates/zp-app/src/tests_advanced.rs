@@ -82,6 +82,13 @@ fn commands_templates_and_skills(cx: &mut TestAppContext) {
     send(window, "/review \"the parser\"", cx);
     idle(&conversation, 2, cx);
     assert_eq!(text_of(&last_prompt(&faux)), "Review the parser carefully.");
+    cx.simulate_keystrokes(window.into(), "up");
+    assert_eq!(
+        conversation.read_with(cx, |view, cx| view.draft(cx)),
+        "/review \"the parser\""
+    );
+    assert!(conversation.read_with(cx, |view, _| view.completion().is_none()));
+    cx.simulate_keystrokes(window.into(), "down");
 
     // `/skill:name` loads the skill.
     send(window, "/skill:release now", cx);

@@ -5,7 +5,9 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use gpui::{App, ClipboardEntry, Context, ExternalPaths, Window};
+use gpui::{
+    App, Bounds, ClipboardEntry, Context, EntityInputHandler as _, ExternalPaths, Window, px,
+};
 use zp_ai::ThinkingLevel;
 use zp_core::attachments::{ImageAttachment, fuzzy_filter, image_mime};
 use zp_core::permissions::PermissionMode;
@@ -136,6 +138,85 @@ pub enum WindowCommand {
 }
 
 impl ConversationView {
+    pub(super) fn remember_prompt(&mut self, text: &str) {
+        if !text.is_empty() && self.prompt_history.last().is_none_or(|last| last != text) {
+            self.prompt_history.push(text.to_owned());
+        }
+        self.history_index = None;
+        self.history_draft.clear();
+    }
+
+    /// Returns whether a history entry consumed the vertical navigation action.
+    pub(super) fn recall_prompt(
+        &mut self,
+        previous: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if self.completion.is_some()
+            || self.prompt_history.is_empty()
+            || (!previous && self.history_index.is_none())
+        {
+            return false;
+        }
+        let can_recall = self.composer.update(cx, |input, cx| {
+            if input.marked_text_range(window, cx).is_some() {
+                return false;
+            }
+            let Some(selection) = input.selected_text_range(false, window, cx) else {
+                return false;
+            };
+            if !selection.range.is_empty() {
+                return false;
+            }
+            if self.history_index.is_some() {
+                return true;
+            }
+            if input
+                .as_str()
+                .encode_utf16()
+                .take(selection.range.start)
+                .any(|unit| unit == u16::from(b'\n'))
+            {
+                return false;
+            }
+            let caret =
+                input.bounds_for_range(selection.range.clone(), Bounds::default(), window, cx);
+            let boundary = input.bounds_for_range(0..0, Bounds::default(), window, cx);
+            match (caret, boundary) {
+                (Some(caret), Some(boundary)) => (caret.top() - boundary.top()).abs() < px(1.),
+                _ => selection.range.start == 0 || !input.as_str().contains('\n'),
+            }
+        });
+        if !can_recall {
+            return false;
+        }
+        if self.history_index.is_none() {
+            self.history_draft = self.composer.read(cx).as_str().to_owned();
+        }
+        let index = match (self.history_index, previous) {
+            (None, _) => self.prompt_history.len() - 1,
+            (Some(index), true) => index.saturating_sub(1),
+            (Some(index), false) => index + 1,
+        };
+        let text = if index == self.prompt_history.len() {
+            self.history_index = None;
+            std::mem::take(&mut self.history_draft)
+        } else {
+            self.history_index = Some(index);
+            self.prompt_history[index].clone()
+        };
+        // Recalling a slash command must leave arrows available for history navigation.
+        self.completion = None;
+        self.suppress_completion = Some(text.clone());
+        self.composer.update(cx, |input, cx| {
+            input.emplace(&text, cx);
+            input.move_to(text.len(), cx);
+        });
+        cx.notify();
+        true
+    }
+
     /// The open completion menu (tests).
     #[cfg(test)]
     pub fn completion(&self) -> Option<&Completion> {

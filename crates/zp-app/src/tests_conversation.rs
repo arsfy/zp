@@ -128,6 +128,118 @@ fn write_session(data: &TempDir, project: &Path, first: &str) -> PathBuf {
 }
 
 #[gpui::test]
+fn prompt_history_recalls_sent_text_and_restores_drafts(cx: &mut TestAppContext) {
+    let faux = FauxProvider::default();
+    faux.push(FauxResponse::text("one"));
+    faux.push(FauxResponse::text("two"));
+    let _data = setup_models(cx, &[&faux], false);
+    let (_dir, project) = project_dir();
+    let window = open(cx, &project);
+    let conversation = active(window, cx);
+    cx.simulate_keystrokes(window.into(), "up down");
+    assert_eq!(conversation.read_with(cx, |view, cx| view.draft(cx)), "");
+
+    send(window, "first prompt", cx);
+    idle(&conversation, 2, cx);
+    send(window, "second prompt\nwith two lines", cx);
+    idle(&conversation, 4, cx);
+    conversation.update(cx, |view, cx| view.set_draft("unfinished draft", cx));
+    cx.run_until_parked();
+    for (key, expected) in [
+        ("up", "second prompt\nwith two lines"),
+        ("up", "first prompt"),
+        ("up", "first prompt"),
+        ("down", "second prompt\nwith two lines"),
+        ("down", "unfinished draft"),
+        ("down", "unfinished draft"),
+    ] {
+        cx.simulate_keystrokes(window.into(), key);
+        cx.run_until_parked();
+        assert_eq!(
+            conversation.read_with(cx, |view, cx| view.draft(cx)),
+            expected
+        );
+    }
+
+    cx.simulate_keystrokes(window.into(), "up");
+    cx.simulate_input(window.into(), " edited");
+    cx.run_until_parked();
+    cx.simulate_keystrokes(window.into(), "down");
+    assert_eq!(
+        conversation.read_with(cx, |view, cx| view.draft(cx)),
+        "second prompt\nwith two lines edited"
+    );
+    assert_eq!(faux.requests().len(), 2, "recalling does not send a prompt");
+}
+
+#[gpui::test]
+fn prompt_history_preserves_multiline_navigation_and_completion(cx: &mut TestAppContext) {
+    let faux = FauxProvider::default();
+    faux.push(FauxResponse::text("done"));
+    let _data = setup_models(cx, &[&faux], false);
+    let (_dir, project) = project_dir();
+    let window = open(cx, &project);
+    let conversation = active(window, cx);
+    send(window, "sent prompt", cx);
+    idle(&conversation, 2, cx);
+
+    conversation.update(cx, |view, cx| view.set_draft("first\nsecond", cx));
+    cx.run_until_parked();
+    cx.simulate_keystrokes(window.into(), "up");
+    assert_eq!(
+        conversation.read_with(cx, |view, cx| view.draft(cx)),
+        "first\nsecond"
+    );
+
+    conversation.update(cx, |view, cx| view.set_draft("/", cx));
+    cx.run_until_parked();
+    cx.simulate_keystrokes(window.into(), "down");
+    assert_eq!(
+        conversation.read_with(cx, |view, _| view.completion().unwrap().selected),
+        1
+    );
+    cx.simulate_keystrokes(window.into(), "up");
+    assert_eq!(
+        conversation.read_with(cx, |view, _| view.completion().unwrap().selected),
+        0
+    );
+    assert_eq!(conversation.read_with(cx, |view, cx| view.draft(cx)), "/");
+}
+
+#[gpui::test]
+fn prompt_history_restores_saved_messages_and_is_per_tab(cx: &mut TestAppContext) {
+    let faux = FauxProvider::default();
+    let data = setup_models(cx, &[&faux], false);
+    let (_dir, project) = project_dir();
+    let file = write_session(&data, &project, "saved prompt");
+    let window = open(cx, &project);
+    window
+        .update(cx, |view, window, cx| {
+            view.open_session_file(&file, false, window, cx)
+        })
+        .unwrap();
+    cx.run_until_parked();
+    let conversation = active(window, cx);
+    cx.simulate_keystrokes(window.into(), "up");
+    assert_eq!(
+        conversation.read_with(cx, |view, cx| view.draft(cx)),
+        "saved prompt"
+    );
+    cx.dispatch_action(window.into(), NewChat);
+    cx.run_until_parked();
+    let new_conversation = active(window, cx);
+    cx.simulate_keystrokes(window.into(), "up");
+    assert_eq!(
+        new_conversation.read_with(cx, |view, cx| view.draft(cx)),
+        ""
+    );
+    assert_eq!(
+        conversation.read_with(cx, |view, cx| view.draft(cx)),
+        "saved prompt"
+    );
+}
+
+#[gpui::test]
 fn sends_runs_tools_saves_and_restores_tabs(cx: &mut TestAppContext) {
     let faux = FauxProvider::default();
     faux.push(FauxResponse::tool_call(
