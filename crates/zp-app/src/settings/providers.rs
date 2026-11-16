@@ -1218,10 +1218,12 @@ impl SettingsWindow {
         let row = |name: &'static str, field: AnyElement| {
             div()
                 .flex()
+                .w_full()
+                .min_w_0()
                 .items_start()
                 .gap_2()
                 .child(label(name))
-                .child(div().flex_1().child(field))
+                .child(div().flex_1().min_w_0().overflow_x_hidden().child(field))
         };
         let anthropic = form.anthropic;
         let editing = form.editing.clone();
