@@ -190,6 +190,33 @@ async fn read_edit_test_then_resume() {
 }
 
 #[tokio::test]
+async fn default_thinking_and_recorded_override() {
+    let project = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let manager = SessionManager::new(data.path().join("sessions"));
+    let faux = FauxProvider::default();
+    faux.push(FauxResponse::text("hello"));
+    let session = manager.create(project.path());
+    let mut options = CodingSessionOptions::new(models(&faux), project.path(), session);
+    options.model = Some(faux.model());
+    let coding = CodingSession::new(options).unwrap();
+    assert_eq!(coding.agent().thinking_level(), ThinkingLevel::High);
+    assert_eq!(
+        coding.session().context().thinking_level,
+        Some(ThinkingLevel::High)
+    );
+    coding.prompt("hi").await.unwrap();
+
+    coding.set_thinking_level(ThinkingLevel::Off).unwrap();
+    let session_file = coding.session().file().unwrap().to_path_buf();
+    drop(coding);
+    let session = manager.open(&session_file).unwrap();
+    let options = CodingSessionOptions::new(models(&faux), project.path(), session);
+    let resumed = CodingSession::new(options).unwrap();
+    assert_eq!(resumed.agent().thinking_level(), ThinkingLevel::Off);
+}
+
+#[tokio::test]
 async fn retry_after_a_failed_response() {
     let project = tempfile::tempdir().unwrap();
     let faux = FauxProvider::default();

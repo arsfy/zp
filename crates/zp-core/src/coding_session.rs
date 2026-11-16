@@ -285,7 +285,7 @@ impl CodingSession {
         }
         let thinking = thinking_level
             .or(context.thinking_level)
-            .unwrap_or(ThinkingLevel::Off);
+            .unwrap_or(ThinkingLevel::High);
         if context.thinking_level.unwrap_or(ThinkingLevel::Off) != thinking {
             session.append_thinking_level_change(thinking)?;
         }

@@ -231,6 +231,12 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("up", CompletionPrevious, Some(PALETTE_INPUT)),
         KeyBinding::new("enter", AcceptCompletion, Some(PALETTE_INPUT)),
         KeyBinding::new("escape", CloseCompletion, Some(PALETTE_INPUT)),
+        KeyBinding::new("escape", CloseCompletion, Some("ProviderDialog")),
+        KeyBinding::new(
+            "enter",
+            AcceptCompletion,
+            Some("ApiKeyInput > EditableText"),
+        ),
     ]);
     for shortcut in shortcuts() {
         let Some(keys) = shortcut_keys(shortcut.action, cx) else {

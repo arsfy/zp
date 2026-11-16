@@ -21,7 +21,7 @@ use crate::store::{AppModels, AppSettings};
 use crate::theme::ActiveTheme;
 use crate::ui::{CUSTOM_TITLE_BAR, title_bar};
 
-pub use providers::ProviderForm;
+pub use providers::ProviderDialog;
 
 const SETTINGS_SIZE: (f32, f32) = (980.0, 700.0);
 const SETTINGS_MIN_SIZE: (f32, f32) = (720.0, 480.0);
@@ -79,8 +79,8 @@ pub struct SettingsWindow {
     // Models
     model_search: Entity<EditableTextState>,
     // Providers
-    key_editor: Option<(String, Entity<EditableTextState>)>,
-    provider_form: Option<ProviderForm>,
+    dialog: Option<ProviderDialog>,
+    dialog_subscription: Option<Subscription>,
     // Permissions
     review_model: Entity<EditableTextState>,
     allow_commands: Entity<EditableTextState>,
@@ -175,8 +175,8 @@ impl SettingsWindow {
             model_menu_open: false,
             model_filter,
             model_search,
-            key_editor: None,
-            provider_form: None,
+            dialog: None,
+            dialog_subscription: None,
             review_model,
             allow_commands,
             directories,
@@ -196,6 +196,8 @@ impl SettingsWindow {
         if self.page != page {
             self.page = page;
             self.notice = None;
+            self.dialog = None;
+            self.dialog_subscription = None;
             self.stop_recording();
         }
         cx.notify();
@@ -420,7 +422,7 @@ impl SettingsWindow {
                         })),
                 )
         });
-        let thinking = settings.default_thinking.unwrap_or_default();
+        let thinking = settings.default_thinking.unwrap_or(ThinkingLevel::High);
         let levels = [
             ThinkingLevel::Off,
             ThinkingLevel::Minimal,
@@ -571,6 +573,15 @@ impl Render for SettingsWindow {
                     cx.notify();
                 }),
             )
+            .on_action(
+                cx.listener(|this, _: &crate::actions::CloseCompletion, _, cx| {
+                    this.close_dialog(cx)
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &crate::actions::AcceptCompletion, _, cx| this.save_key(cx)),
+            )
+            .relative()
             .size_full()
             .flex()
             .flex_col()
@@ -635,6 +646,7 @@ impl Render for SettingsWindow {
                             ),
                     ),
             )
+            .children(self.render_provider_dialog(cx))
     }
 }
 

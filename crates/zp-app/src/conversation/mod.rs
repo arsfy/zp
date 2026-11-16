@@ -133,6 +133,8 @@ pub struct ConversationView {
     attachments: Vec<zp_core::attachments::ImageAttachment>,
     /// A note above the composer (command output, attachment problems).
     info: Option<String>,
+    /// The provider a message could not be sent to for lack of an API key.
+    needs_key: Option<String>,
     compacting: bool,
     /// The current request was already retried after a context overflow.
     overflow_retried: bool,
@@ -196,6 +198,7 @@ impl ConversationView {
             loading_files: false,
             attachments: Vec::new(),
             info: None,
+            needs_key: None,
             compacting: false,
             overflow_retried: false,
             tree_open: false,
@@ -222,12 +225,11 @@ impl ConversationView {
             .ok_or_else(|| anyhow::anyhow!("models are not initialized"))?;
         let model = match session_model(&models, &session) {
             Some(_) => None,
-            None => Some(AppModels::default_model(cx).ok_or_else(|| {
-                anyhow::anyhow!(
-                    "No model is configured. Set an API key such as ANTHROPIC_API_KEY, \
-                     OPENROUTER_API_KEY or DEEPSEEK_API_KEY and restart ZP."
-                )
-            })?),
+            // Without any key yet, still open the conversation; sending asks for one.
+            None => Some(
+                AppModels::fallback_model(cx)
+                    .ok_or_else(|| anyhow::anyhow!("no model providers are registered"))?,
+            ),
         };
         let mut options = CodingSessionOptions::new(models, &self.root, session);
         if model.is_some() {
@@ -428,6 +430,14 @@ impl ConversationView {
             item_ix: row,
             offset_in_item: px(0.),
         });
+    }
+
+    /// The provider whose key is missing for the last attempt to send, while it still is
+    /// (tests and rendering).
+    pub fn needs_key(&self, cx: &App) -> Option<String> {
+        self.needs_key
+            .clone()
+            .filter(|provider| !AppModels::has_credentials(provider, cx))
     }
 
     /// Re-reads the project's prompt templates and skills, and its tools (MCP servers
@@ -687,6 +697,7 @@ impl ConversationView {
     }
 
     /// Models the picker offers: those of providers with credentials.
+    /// Models the picker offers: those of providers with credentials (or that need none).
     fn model_choices(&self, cx: &App) -> Vec<ModelChoice> {
         let Some(app_models) = cx.try_global::<AppModels>() else {
             return Vec::new();
@@ -705,6 +716,12 @@ impl ConversationView {
                     })
             })
             .collect()
+    }
+
+    /// The picker's models (tests).
+    #[cfg(test)]
+    pub fn model_choices_for_test(&self, cx: &App) -> Vec<ModelChoice> {
+        self.model_choices(cx)
     }
 
     fn filtered_models(&self, cx: &App) -> Vec<ModelChoice> {
@@ -761,9 +778,17 @@ impl ConversationView {
             return;
         };
         self.info = None;
+        self.needs_key = None;
         if !self.running && self.run_builtin(&text, window, cx) {
             self.composer
                 .update(cx, |composer, cx| composer.emplace("", cx));
+            return;
+        }
+        // No key for the chosen model's provider: keep the draft and ask for one.
+        let provider = coding.agent().model().provider;
+        if !AppModels::has_credentials(&provider, cx) {
+            self.needs_key = Some(provider);
+            cx.notify();
             return;
         }
         if !self.attachments.is_empty() && !coding.agent().model().supports_images() {
@@ -1016,9 +1041,23 @@ impl ConversationView {
             }
         }
         self.picker = None;
+        self.needs_key = None;
         self.focus_composer(window, cx);
         cx.emit(ConversationEvent::StatusChanged);
         cx.notify();
+    }
+
+    /// Opens Settings → Providers with the key field of `provider`.
+    pub(crate) fn add_api_key(&mut self, provider: Option<String>, cx: &mut Context<Self>) {
+        let Some(window) =
+            crate::settings::SettingsWindow::open_at(crate::settings::Page::Providers, cx)
+        else {
+            return;
+        };
+        let _ = window.update(cx, |view, window, cx| match provider {
+            Some(provider) => view.edit_key(&provider, window, cx),
+            None => view.open_add_dialog(window, cx),
+        });
     }
 
     pub(crate) fn select_thinking(

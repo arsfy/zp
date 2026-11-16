@@ -646,3 +646,47 @@ fn names_new_sessions_with_a_model(cx: &mut TestAppContext) {
     idle(&conversation, 4, cx);
     assert_eq!(faux.requests().len(), 3);
 }
+
+#[gpui::test]
+fn conversations_open_without_any_api_key(cx: &mut TestAppContext) {
+    cx.executor().allow_parking();
+    let _data = setup(cx, None);
+    cx.update(|cx| {
+        gpui_tokio::init(cx);
+        let models = Models::builtin().with_env(Arc::new(|_| None));
+        AppModels::set(models, false, cx);
+    });
+    let (_dir, project) = project_dir();
+    let window = open(cx, &project);
+    let conversation = active(window, cx);
+
+    // The conversation opens with a model, but the picker offers none: no provider can
+    // be used yet.
+    let model = conversation
+        .read_with(cx, |view, _| view.status().model)
+        .expect("a model even without keys");
+    let choices = conversation.read_with(cx, |view, cx| view.model_choices_for_test(cx).len());
+    assert_eq!(choices, 0);
+
+    // Sending keeps the draft and asks for the provider's key; no request is made.
+    conversation.update(cx, |view, cx| view.set_draft("hello", cx));
+    cx.dispatch_action(window.into(), SendMessage);
+    cx.run_until_parked();
+    let (needs, draft, running) = conversation.read_with(cx, |view, cx| {
+        (view.needs_key(cx), view.draft(cx), view.is_running())
+    });
+    assert_eq!(needs.as_deref(), Some(model.provider.as_str()));
+    assert_eq!((draft.as_str(), running), ("hello", false));
+
+    // Once a key is stored, the notice goes away.
+    cx.update(|cx| {
+        cx.global::<AppModels>()
+            .credentials
+            .set(&model.provider, "sk-test")
+            .unwrap()
+    });
+    assert_eq!(
+        conversation.read_with(cx, |view, cx| view.needs_key(cx)),
+        None
+    );
+}

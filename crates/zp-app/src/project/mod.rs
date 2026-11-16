@@ -7,9 +7,9 @@ mod tabs;
 use std::path::{Path, PathBuf};
 
 use gpui::{
-    AnyElement, App, ColorExt as _, Context, DismissEvent, DragMoveEvent, Entity, FocusHandle,
-    Focusable, FontWeight, IntoElement, Pixels, Point, Render, Subscription, Window, anchored,
-    deferred, div, prelude::*, px, rgb_to_hsla,
+    AnyElement, App, Context, DismissEvent, DragMoveEvent, Entity, FocusHandle, Focusable,
+    FontWeight, IntoElement, Pixels, Point, Render, Subscription, Window, anchored, deferred, div,
+    prelude::*, px, rgb_to_hsla,
 };
 use gpui_elements::editable_text::{EditableTextState, StringStorage, TextChanged, text_input};
 use zp_core::app_state::PanelLayout;
@@ -34,7 +34,8 @@ const SIDEBAR_WIDTH: (f32, f32) = (160.0, 480.0);
 const RIGHT_PANEL_WIDTH: (f32, f32) = (220.0, 640.0);
 /// The conversation column never gets narrower than this when resizing panels.
 const CENTER_MIN_WIDTH: f32 = 320.0;
-const RESIZE_HANDLE_WIDTH: f32 = 6.0;
+/// Width of the invisible grab area centered on a panel's border.
+const RESIZE_HANDLE_WIDTH: f32 = 8.0;
 
 /// Which panel a resize drag moves.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -585,18 +586,28 @@ impl ProjectWindow {
 
     // ----- rendering ---------------------------------------------------------------
 
-    fn resize_handle(&self, edge: PanelEdge, cx: &App) -> impl IntoElement {
-        let accent = cx.theme().colors.accent;
+    /// The grab area for resizing a panel, centered on its border like Zed's: nothing
+    /// is drawn, the cursor changes, and pressing anywhere on the border line starts the
+    /// resize. Laid over the whole panel row (after the center column), so neither the
+    /// panel nor the center covers it.
+    fn resize_handle(&self, edge: PanelEdge) -> impl IntoElement {
+        let half = RESIZE_HANDLE_WIDTH / 2.0;
         div()
             .id(match edge {
                 PanelEdge::Sidebar => "resize-sidebar",
                 PanelEdge::Right => "resize-right-panel",
             })
+            .absolute()
+            .top_0()
+            .bottom_0()
             .w(px(RESIZE_HANDLE_WIDTH))
-            .h_full()
-            .flex_shrink_0()
+            .map(|this| match edge {
+                // The sidebar's border is its last pixel column.
+                PanelEdge::Sidebar => this.left(px(self.layout.sidebar_width - 0.5 - half)),
+                // The right panel's border is its first pixel column.
+                PanelEdge::Right => this.right(px(self.layout.right_panel_width - 0.5 - half)),
+            })
             .cursor_col_resize()
-            .hover_style(move |style| style.bg(accent.opacity(0.35)))
             .on_drag(PanelResize(edge), |_, _, _, cx| cx.new(|_| NoPreview))
     }
 
@@ -962,18 +973,24 @@ impl Render for ProjectWindow {
             })
             .child(
                 div()
+                    .relative()
                     .flex_1()
                     .min_h_0()
                     .flex()
                     .flex_row()
                     .when(self.layout.sidebar_visible, |row| {
                         row.child(self.render_sidebar(cx))
-                            .child(self.resize_handle(PanelEdge::Sidebar, cx))
                     })
                     .child(self.render_center(cx))
                     .when(self.layout.right_panel_visible, |row| {
-                        row.child(self.resize_handle(PanelEdge::Right, cx))
-                            .child(self.render_right_panel(cx))
+                        row.child(self.render_right_panel(cx))
+                    })
+                    // Last, so they sit above both neighbors of each border.
+                    .when(self.layout.sidebar_visible, |row| {
+                        row.child(self.resize_handle(PanelEdge::Sidebar))
+                    })
+                    .when(self.layout.right_panel_visible, |row| {
+                        row.child(self.resize_handle(PanelEdge::Right))
                     }),
             )
             .child(self.render_status_bar(cx))

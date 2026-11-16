@@ -755,9 +755,23 @@ fn settings_pages(cx: &mut VisualTestAppContext, out: &std::path::Path) {
                     .save(out.join(name))
                     .unwrap();
             };
+            let step = |cx: &mut VisualTestAppContext,
+                        f: &dyn Fn(
+                &mut SettingsWindow,
+                &mut gpui::Window,
+                &mut gpui::Context<SettingsWindow>,
+            )| {
+                cx.update_window(window.into(), |_, window, cx| {
+                    let view = window.root::<SettingsWindow>().flatten().unwrap();
+                    view.update(cx, |view, cx| f(view, window, cx));
+                })
+                .unwrap();
+            };
+            step(cx, &|view, window, cx| view.open_add_dialog(window, cx));
+            shot(cx, "24-settings-add-provider.png");
+            step(cx, &|view, window, cx| view.edit_key("openai", window, cx));
             cx.update_window(window.into(), |_, window, cx| {
                 let view = window.root::<SettingsWindow>().flatten().unwrap();
-                view.update(cx, |view, cx| view.edit_key("faux", window, cx));
                 if let Some(field) = view.read(cx).key_input() {
                     field.update(cx, |input, cx| {
                         input.emplace("sk-proj-0123456789abcdef", cx)
@@ -765,13 +779,11 @@ fn settings_pages(cx: &mut VisualTestAppContext, out: &std::path::Path) {
                 }
             })
             .unwrap();
-            shot(cx, "24-settings-api-key.png");
-            cx.update_window(window.into(), |_, window, cx| {
-                let view = window.root::<SettingsWindow>().flatten().unwrap();
-                view.update(cx, |view, cx| view.open_provider_form(None, window, cx));
-            })
-            .unwrap();
-            shot(cx, "25-settings-provider-form.png");
+            shot(cx, "25-settings-api-key.png");
+            step(cx, &|view, window, cx| {
+                view.open_provider_form(None, window, cx)
+            });
+            shot(cx, "30-settings-custom-provider.png");
         }
     }
 }

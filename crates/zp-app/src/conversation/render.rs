@@ -649,13 +649,30 @@ impl ConversationView {
             .pb_1()
             .children(items)
             .when(total == 0, |this| {
+                let none_available = self.model_choices(cx).is_empty();
                 this.child(div().px_2().py_1().text_color(colors.text_muted).child(
-                    if self.model_choices(cx).is_empty() {
-                        "No provider has credentials. Set an API key and restart."
+                    if none_available {
+                        "No available models"
                     } else {
                         "No matching models"
                     },
                 ))
+                .when(none_available, |this| {
+                    this.child(
+                        div()
+                            .id("picker-add-key")
+                            .mx_2()
+                            .mb_1()
+                            .cursor_pointer()
+                            .text_color(colors.accent)
+                            .hover_style(|s| s.text_color(colors.text))
+                            .child("Add a provider…")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.picker = None;
+                                this.add_api_key(None, cx);
+                            })),
+                    )
+                })
             })
             .when(total > PICKER_LIMIT, |this| {
                 this.child(
@@ -760,6 +777,14 @@ impl ConversationView {
         let model = coding.agent().model();
         let thinking = model.clamp_thinking_level(coding.agent().thinking_level());
         let queued = coding.agent().steering_queue().len();
+        // The session's model may belong to a provider without a key.
+        let model_label = if crate::store::AppModels::has_credentials(&model.provider, cx) {
+            model.qualified_id()
+        } else if self.model_choices(cx).is_empty() {
+            "No available models".to_owned()
+        } else {
+            format!("{} · no key", model.qualified_id())
+        };
 
         let picker_button = |picker: Picker, label: String, cx: &mut Context<Self>| {
             let open = self.picker == Some(picker);
@@ -826,6 +851,36 @@ impl ConversationView {
                     )
                 })
                 .when_some(self.render_completion(cx), |this, menu| this.child(menu))
+                .when_some(self.needs_key(cx), |this, provider| {
+                    let name = cx
+                        .try_global::<crate::store::AppModels>()
+                        .and_then(|app| app.models.provider(&provider))
+                        .map_or_else(|| provider.clone(), |p| p.name().to_owned());
+                    this.child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .px_3()
+                            .py_1p5()
+                            .rounded(px(6.))
+                            .border_1()
+                            .border_color(colors.warning)
+                            .text_size(px(12.))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .child(format!("{name} needs an API key before ZP can send this message. Add one, or pick another model.")),
+                            )
+                            .child(
+                                ghost_button("add-api-key", "Add API Key…", cx)
+                                    .text_color(colors.accent)
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.add_api_key(Some(provider.clone()), cx)
+                                    })),
+                            ),
+                    )
+                })
                 .when_some(self.info.clone(), |this, info| {
                     this.child(
                         div()
@@ -942,7 +997,7 @@ impl ConversationView {
                                 .gap_1()
                                 .px_2()
                                 .pb_1p5()
-                                .child(picker_button(Picker::Model, model.qualified_id(), cx))
+                                .child(picker_button(Picker::Model, model_label, cx))
                                 .when(model.reasoning, |this| {
                                     this.child(picker_button(
                                         Picker::Thinking,
@@ -958,6 +1013,7 @@ impl ConversationView {
                                 .child(div().flex_1())
                                 .child(
                                     div()
+                                        .mr_2()
                                         .text_size(px(11.))
                                         .text_color(colors.text_muted)
                                         .child(if self.running {
@@ -968,8 +1024,7 @@ impl ConversationView {
                                                 cx,
                                             ) {
                                                 Some(keys) if keys == KEY_SEND => format!(
-                                                    "{} to send · Shift+{} for newline",
-                                                    crate::ui::shortcut_label(&keys),
+                                                    "Shift+{} for newline",
                                                     crate::ui::shortcut_label(&keys)
                                                 ),
                                                 Some(keys) => format!(
@@ -987,8 +1042,12 @@ impl ConversationView {
         .into_any_element()
     }
 
-    fn render_empty(&self, cx: &App) -> AnyElement {
-        let colors = &cx.theme().colors;
+    fn render_empty(&self, cx: &mut Context<Self>) -> AnyElement {
+        let colors = cx.theme().colors.clone();
+        let no_keys = self.coding.is_some()
+            && cx
+                .try_global::<crate::store::AppModels>()
+                .is_some_and(|app| app.models.available_providers().is_empty());
         div()
             .size_full()
             .flex()
@@ -1008,6 +1067,27 @@ impl ConversationView {
                     .text_color(colors.text_muted)
                     .child(zp_core::project::tilde_path(&self.root)),
             )
+            .when(no_keys, |this| {
+                this.child(
+                    div()
+                        .mt_4()
+                        .flex()
+                        .flex_col()
+                        .items_center()
+                        .gap_1()
+                        .text_color(colors.text_muted)
+                        .child("No model provider has an API key yet. Pick a model below and add its key, or")
+                        .child(
+                            div()
+                                .id("empty-add-key")
+                                .cursor_pointer()
+                                .text_color(colors.accent)
+                                .hover_style(|s| s.text_color(colors.text))
+                                .child("open Settings → Providers")
+                                .on_click(cx.listener(|this, _, _, cx| this.add_api_key(None, cx))),
+                        ),
+                )
+            })
             .when_some(self.unavailable.clone(), |this, reason| {
                 this.child(
                     div()

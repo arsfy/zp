@@ -64,7 +64,35 @@ fn api_keys_and_custom_providers(cx: &mut TestAppContext) {
     let models = models.with_env(Arc::new(|_| None));
     let window = settings_window(Page::Providers, cx);
 
-    // A key makes the provider available and refreshes its model list.
+    // Only configured providers are listed; the dialog offers the others.
+    let configured = |cx: &mut TestAppContext| {
+        window
+            .update(cx, |view, _, cx| view.configured_providers(cx))
+            .unwrap()
+    };
+    assert_eq!(configured(cx), ["faux"], "keyless");
+    window
+        .update(cx, |view, window, cx| view.open_add_dialog(window, cx))
+        .unwrap();
+    let offered = window
+        .update(cx, |view, _, cx| {
+            assert!(matches!(
+                view.dialog(),
+                Some(crate::settings::ProviderDialog::Choose { .. })
+            ));
+            view.addable_providers(cx)
+        })
+        .unwrap();
+    assert!(
+        offered
+            .iter()
+            .any(|(id, _, configured)| id == "deepseek" && !configured)
+    );
+    assert!(
+        !offered.iter().any(|(id, _, _)| id == "faux"),
+        "needs no key"
+    );
+    // Choosing one asks for its key; saving makes it available and refreshes its models.
     assert!(models.resolve_auth("deepseek").is_none());
     window
         .update(cx, |view, window, cx| {
@@ -74,6 +102,13 @@ fn api_keys_and_custom_providers(cx: &mut TestAppContext) {
             view.save_key(cx);
         })
         .unwrap();
+    assert!(
+        window
+            .update(cx, |view, _, _| view.dialog().is_none())
+            .unwrap(),
+        "closed"
+    );
+    assert_eq!(configured(cx), ["faux", "deepseek"]);
     let auth = models.resolve_auth("deepseek").unwrap();
     assert_eq!(auth.api_key.as_deref(), Some("sk-test"));
     assert_eq!(auth.source, zp_ai::AuthSource::Stored);
@@ -83,6 +118,7 @@ fn api_keys_and_custom_providers(cx: &mut TestAppContext) {
         .update(cx, |view, _, cx| view.remove_key("deepseek", cx))
         .unwrap();
     assert!(models.resolve_auth("deepseek").is_none());
+    assert_eq!(configured(cx), ["faux"]);
 
     // A custom provider: validated, saved, registered and usable.
     window

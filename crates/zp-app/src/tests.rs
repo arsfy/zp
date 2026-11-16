@@ -218,3 +218,60 @@ fn reopens_at_the_remembered_position(cx: &mut TestAppContext) {
         ))
     );
 }
+
+#[gpui::test]
+fn panels_resize_by_dragging_their_border(cx: &mut TestAppContext) {
+    use gpui::{Modifiers, MouseButton, VisualTestContext};
+    let _data = setup(cx, None);
+    let (_dir, project) = project_dir();
+    let window = cx
+        .update(|cx| workspace::open_project(&project, None, cx))
+        .unwrap();
+    cx.run_until_parked();
+    cx.dispatch_action(window.into(), crate::actions::ToggleRightPanel);
+    cx.run_until_parked();
+    let (sidebar, right, width) = window
+        .update(cx, |view, window, _| {
+            let layout = view.layout();
+            (
+                layout.sidebar_width,
+                layout.right_panel_width,
+                window.viewport_size().width.as_f32(),
+            )
+        })
+        .unwrap();
+    let mut cx = VisualTestContext::from_window(window.into(), cx);
+    let none = Modifiers::none();
+    let drag = |from: f32, to: f32, cx: &mut VisualTestContext| {
+        let y = 300.0;
+        cx.simulate_mouse_down(point(px(from), px(y)), MouseButton::Left, none);
+        for step in 1..=4 {
+            let x = from + (to - from) * step as f32 / 4.0;
+            cx.simulate_mouse_move(point(px(x), px(y)), MouseButton::Left, none);
+        }
+        cx.simulate_mouse_up(point(px(to), px(y)), MouseButton::Left, none);
+        cx.run_until_parked();
+    };
+
+    // Pressing right on the sidebar's border line drags it.
+    drag(sidebar - 0.5, 320.0, &mut cx);
+    let layout = window
+        .update(&mut cx, |view, _, _| view.layout().clone())
+        .unwrap();
+    assert_eq!(layout.sidebar_width, 320.0);
+
+    // The right panel's border, from just outside it (the center side).
+    drag(width - right - 2.0, width - 400.0, &mut cx);
+    let layout = window
+        .update(&mut cx, |view, _, _| view.layout().clone())
+        .unwrap();
+    assert_eq!(layout.right_panel_width, 400.0);
+    assert_eq!(layout.sidebar_width, 320.0);
+
+    // Away from the borders nothing resizes.
+    drag(layout.sidebar_width + 80.0, 500.0, &mut cx);
+    let layout = window
+        .update(&mut cx, |view, _, _| view.layout().clone())
+        .unwrap();
+    assert_eq!(layout.sidebar_width, 320.0);
+}
