@@ -1,7 +1,9 @@
 //! The Models page: catalog sync status, a forced refresh, and every model offered by the
 //! configured providers with where it comes from.
 
-use gpui::{AnyElement, App, Context, IntoElement, div, prelude::*, px, uniform_list};
+use std::collections::HashMap;
+
+use gpui::{AnyElement, App, Context, IntoElement, div, prelude::*, px};
 use zp_ai::{Model, ModelSource};
 use zp_core::model_catalog::{SyncOutcome, SyncReport};
 
@@ -60,6 +62,17 @@ fn tokens(count: u64) -> String {
     }
 }
 
+fn price(model: &Model) -> Option<(f64, f64)> {
+    (model.cost.input > 0.0 || model.cost.output > 0.0)
+        .then_some((model.cost.input, model.cost.output))
+}
+
+fn price_key(id: &str) -> String {
+    id.rsplit_once('/')
+        .map_or(id, |(_, name)| name)
+        .to_ascii_lowercase()
+}
+
 impl SettingsWindow {
     /// Models of providers with credentials, matching the search.
     pub fn model_rows(&self, cx: &App) -> Vec<ModelRow> {
@@ -70,6 +83,17 @@ impl SettingsWindow {
             .map(|p| p.id.clone())
             .collect();
         let query = self.model_search.read(cx).as_str().trim().to_lowercase();
+        let catalog = models.models(None);
+        let mut prices: HashMap<String, (f64, f64)> = catalog
+            .iter()
+            .filter_map(|model| price(model).map(|price| (model.id.to_ascii_lowercase(), price)))
+            .collect();
+        // Prefer a bare catalog id over a reseller's prefixed id for fallback prices.
+        for model in &catalog {
+            if let Some(price) = price(model) {
+                prices.entry(price_key(&model.id)).or_insert(price);
+            }
+        }
         models
             .available_providers()
             .iter()
@@ -84,8 +108,7 @@ impl SettingsWindow {
                 id: model.qualified_id(),
                 name: model.name.clone(),
                 context: model.context_window,
-                price: (model.cost.input > 0.0 || model.cost.output > 0.0)
-                    .then_some((model.cost.input, model.cost.output)),
+                price: price(&model).or_else(|| prices.get(&price_key(&model.id)).copied()),
             })
             .collect()
     }
@@ -109,71 +132,71 @@ impl SettingsWindow {
         };
         let rows = self.model_rows(cx);
         let count = rows.len();
-        let list = uniform_list("model-rows", count, {
-            let colors = colors.clone();
-            move |range, _, _| {
-                range
-                    .map(|ix| {
-                        let row = &rows[ix];
-                        let badge = match row.source {
-                            ModelSource::BuiltIn => colors.text_muted,
-                            ModelSource::ModelsDev => colors.accent,
-                            ModelSource::Upstream => colors.warning,
-                        };
+        let list = div()
+            .w_full()
+            .flex()
+            .flex_col()
+            .flex_shrink_0()
+            .children(rows.into_iter().map(|row| {
+                let badge = match row.source {
+                    ModelSource::BuiltIn => colors.text_muted,
+                    ModelSource::ModelsDev => colors.accent,
+                    ModelSource::Upstream => colors.warning,
+                };
+                div()
+                    .h(px(28.))
+                    .flex_shrink_0()
+                    .w_full()
+                    .flex()
+                    .items_center()
+                    .gap_3()
+                    .px_2()
+                    .border_b_1()
+                    .border_color(colors.border)
+                    .text_size(px(12.))
+                    .child(div().flex_1().min_w_0().truncate().child(row.id.clone()))
+                    .child(
                         div()
-                            .h(px(28.))
-                            .w_full()
-                            .flex()
-                            .items_center()
-                            .gap_3()
-                            .px_2()
-                            .border_b_1()
-                            .border_color(colors.border)
-                            .text_size(px(12.))
-                            .child(div().flex_1().min_w_0().truncate().child(row.id.clone()))
+                            .w(px(180.))
+                            .truncate()
+                            .text_color(colors.text_muted)
+                            .child(row.name.clone()),
+                    )
+                    .child(
+                        div()
+                            .w(px(50.))
+                            .text_color(colors.text_muted)
+                            .child(tokens(row.context)),
+                    )
+                    .child(
+                        div()
+                            .w(px(120.))
+                            .flex_shrink_0()
+                            .truncate()
+                            .text_color(colors.text_muted)
                             .child(
-                                div()
-                                    .w(px(180.))
-                                    .truncate()
-                                    .text_color(colors.text_muted)
-                                    .child(row.name.clone()),
-                            )
-                            .child(
-                                div()
-                                    .w(px(50.))
-                                    .text_color(colors.text_muted)
-                                    .child(tokens(row.context)),
-                            )
-                            .child(
-                                div().w(px(90.)).text_color(colors.text_muted).child(
-                                    row.price
-                                        .map(|(i, o)| format!("${i:.2} / ${o:.2}"))
-                                        .unwrap_or_else(|| "—".into()),
-                                ),
-                            )
-                            .child(
-                                div().w(px(84.)).flex().justify_end().child(
-                                    div()
-                                        .px_1()
-                                        .rounded(px(3.))
-                                        .text_size(px(10.))
-                                        .border_1()
-                                        .border_color(badge)
-                                        .text_color(badge)
-                                        .child(
-                                            if row.custom && row.source == ModelSource::BuiltIn {
-                                                "custom"
-                                            } else {
-                                                row.source.label()
-                                            },
-                                        ),
-                                ),
-                            )
-                    })
-                    .collect::<Vec<_>>()
-            }
-        })
-        .h(px(380.));
+                                row.price
+                                    .map(|(i, o)| format!("${i:.2} / ${o:.2}"))
+                                    .unwrap_or_else(|| "—".into()),
+                            ),
+                    )
+                    .child(
+                        div().w(px(84.)).flex().justify_end().child(
+                            div()
+                                .px_1()
+                                .rounded(px(3.))
+                                .text_size(px(10.))
+                                .border_1()
+                                .border_color(badge)
+                                .text_color(badge)
+                                .child(if row.custom && row.source == ModelSource::BuiltIn {
+                                    "custom"
+                                } else {
+                                    row.source.label()
+                                }),
+                        ),
+                    )
+            }));
 
         page_body()
             .child(section(
@@ -226,14 +249,7 @@ impl SettingsWindow {
                     .text_color(colors.text_muted)
                     .child(format!("{count} models")),
             )
-            .child(
-                div()
-                    .rounded(px(6.))
-                    .border_1()
-                    .border_color(colors.border)
-                    .overflow_hidden()
-                    .child(list),
-            )
+            .child(list)
             .into_any_element()
     }
 }

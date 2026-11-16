@@ -51,6 +51,78 @@ fn one_settings_window(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+fn model_prices_match_unprefixed_model_names(cx: &mut TestAppContext) {
+    let faux = FauxProvider::default();
+    let _data = setup_models(cx, &[&faux], false);
+    cx.update(|cx| {
+        let models = &cx.global::<AppModels>().models;
+        let mut canonical = models.model("faux", "faux-1").unwrap();
+        canonical.id = "Catalog-Model".into();
+        canonical.provider = "catalog".into();
+        canonical.cost.input = 3.0;
+        canonical.cost.output = 9.0;
+        models.register(Arc::new(zp_ai::HttpProvider::new(
+            "catalog",
+            "Catalog",
+            ["UNCONFIGURED_CATALOG_KEY"],
+            vec![canonical.clone()],
+        )));
+
+        let custom = [
+            "catalog-model",
+            "CATALOG-MODEL",
+            "vendor/catalog-model",
+            "vendor/Catalog-Model",
+            "gateway/vendor/catalog-model",
+            "Gateway/Vendor/CATALOG-MODEL",
+            "priced/catalog-model",
+            "vendor/unknown-model",
+        ]
+        .into_iter()
+        .map(|id| {
+            let mut model = canonical.clone();
+            model.id = id.into();
+            model.provider = "custom".into();
+            model.cost = if id == "priced/catalog-model" {
+                zp_ai::ModelCost {
+                    input: 5.0,
+                    output: 10.0,
+                    ..Default::default()
+                }
+            } else {
+                zp_ai::ModelCost::default()
+            };
+            model
+        })
+        .collect::<Vec<_>>();
+        models.register(Arc::new(
+            zp_ai::HttpProvider::new("custom", "Custom", Vec::<String>::new(), custom)
+                .without_api_key(),
+        ));
+    });
+    let window = settings_window(Page::Models, cx);
+    let rows = window
+        .update(cx, |view, _, cx| view.model_rows(cx))
+        .unwrap();
+    for (id, expected) in [
+        ("catalog-model", Some((3.0, 9.0))),
+        ("CATALOG-MODEL", Some((3.0, 9.0))),
+        ("vendor/catalog-model", Some((3.0, 9.0))),
+        ("vendor/Catalog-Model", Some((3.0, 9.0))),
+        ("gateway/vendor/catalog-model", Some((3.0, 9.0))),
+        ("Gateway/Vendor/CATALOG-MODEL", Some((3.0, 9.0))),
+        ("priced/catalog-model", Some((5.0, 10.0))),
+        ("vendor/unknown-model", None),
+    ] {
+        let row = rows
+            .iter()
+            .find(|row| row.id == format!("custom/{id}"))
+            .unwrap();
+        assert_eq!(row.price, expected, "{id}");
+    }
+}
+
+#[gpui::test]
 fn api_keys_and_custom_providers(cx: &mut TestAppContext) {
     let faux = FauxProvider::default();
     let data = setup_models(cx, &[&faux], false);
