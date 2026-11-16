@@ -346,7 +346,7 @@ impl PermissionPolicy {
                         .collect();
                     if !shell::all_allowed(command, &allowed) {
                         offer.extend(
-                            shell::prefixes(command)
+                            shell::unapproved_prefixes(command, &allowed)
                                 .into_iter()
                                 .map(SessionGrant::Command),
                         );
@@ -590,10 +590,7 @@ mod tests {
         );
         assert_eq!(
             ask(ask_mode.evaluate("bash", &test, &none)).1,
-            [
-                SessionGrant::Command("cargo test".into()),
-                SessionGrant::Command("git status".into())
-            ]
+            [SessionGrant::Command("cargo test".into())]
         );
         let (reasons, grants) = ask(ask_mode.evaluate("read", &read_outside, &none));
         assert_eq!(
@@ -664,6 +661,44 @@ mod tests {
         let full = policy(PermissionMode::FullAuto, &root);
         for (tool, args) in [("bash", &rm), ("read", &read_outside), ("edit", &edit)] {
             assert_eq!(full.evaluate(tool, args, &none), Evaluation::Allow);
+        }
+    }
+
+    #[test]
+    fn navigation_is_allowed_in_every_mode_and_omitted_from_grants() {
+        let dir = tempfile::tempdir().unwrap();
+        let none = Grants::default();
+        for mode in PermissionMode::ALL {
+            let policy = policy(mode, dir.path());
+            for command in ["pwd", "cd /tmp", "cd .. && pwd -P", "cd src && git status"] {
+                assert_eq!(
+                    policy.evaluate("bash", &json!({"command": command}), &none),
+                    Evaluation::Allow,
+                    "{mode:?}: {command}"
+                );
+            }
+            let evaluation = policy.evaluate(
+                "bash",
+                &json!({"command": "cd src && pwd && cargo test && git status"}),
+                &none,
+            );
+            let expected = vec![SessionGrant::Command("cargo test".into())];
+            match mode {
+                PermissionMode::FullAuto => assert_eq!(evaluation, Evaluation::Allow),
+                PermissionMode::AutoReview => {
+                    assert_eq!(evaluation, Evaluation::Review { grants: expected })
+                }
+                _ => assert_eq!(ask(evaluation).1, expected),
+            }
+            if mode != PermissionMode::FullAuto {
+                let (reasons, grants) = ask(policy.evaluate(
+                    "bash",
+                    &json!({"command": "cd src && rm -rf target && pwd"}),
+                    &none,
+                ));
+                assert!(matches!(&reasons[..], [AskReason::Dangerous(_)]));
+                assert!(grants.is_empty());
+            }
         }
     }
 

@@ -344,6 +344,7 @@ impl ConversationView {
         let button = |id: &str, label: String| {
             div()
                 .id(ElementId::Name(format!("{id}-{call_id}").into()))
+                .debug_selector(|| format!("approval-{id}"))
                 .px_2p5()
                 .py_1()
                 .rounded(px(4.))

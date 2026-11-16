@@ -1,7 +1,7 @@
 //! M8: approval cards, session grants, the permission mode picker, stopping while waiting
 //! and project trust — with real tools in a temp project.
 
-use gpui::{Entity, IntoElement as _, Render as _, TestAppContext};
+use gpui::{Entity, IntoElement as _, Modifiers, Render as _, TestAppContext, VisualTestContext};
 use serde_json::json;
 use zp_ai::{FauxProvider, FauxResponse};
 use zp_core::permissions::{Decision, PermissionMode};
@@ -62,11 +62,11 @@ fn approvals_with_reasons_grants_and_previews(cx: &mut TestAppContext) {
     ));
     faux.push(FauxResponse::tool_call(
         "bash",
-        json!({"command": "echo one"}),
+        json!({"command": "cd . && echo one"}),
     ));
     faux.push(FauxResponse::tool_call(
         "bash",
-        json!({"command": "echo two"}),
+        json!({"command": "pwd >/dev/null && cd . && echo two"}),
     ));
     faux.push(FauxResponse::tool_call(
         "edit",
@@ -104,11 +104,18 @@ fn approvals_with_reasons_grants_and_previews(cx: &mut TestAppContext) {
     conversation.update(cx, |view, cx| view.deny_approval(&first, cx));
 
     // Approving `echo` for the session lets the next `echo` run on its own.
-    let second = wait_for_approval(&conversation, cx);
-    assert_eq!(pending(&conversation, cx), ["$ echo one"]);
-    conversation.update(cx, |view, cx| {
-        view.answer_approval(&second, Decision::AllowForSession, cx)
+    wait_for_approval(&conversation, cx);
+    assert_eq!(pending(&conversation, cx), ["$ cd . && echo one"]);
+    wait_until(cx, |cx| {
+        VisualTestContext::from_window(window.into(), cx)
+            .debug_bounds("approval-approve-session")
+            .is_some()
     });
+    {
+        let mut visual = VisualTestContext::from_window(window.into(), cx);
+        let button = visual.debug_bounds("approval-approve-session").unwrap();
+        visual.simulate_click(button.center(), Modifiers::none());
+    }
 
     // The edit asks too, with a preview of the change.
     let edit = wait_for_approval(&conversation, cx);
@@ -145,6 +152,21 @@ fn approvals_with_reasons_grants_and_previews(cx: &mut TestAppContext) {
         "new\n"
     );
     assert!(pending(&conversation, cx).is_empty());
+
+    faux.push(FauxResponse::tool_call(
+        "bash",
+        json!({"command": "cd . && pwd >/dev/null && echo next-turn"}),
+    ));
+    faux.push(FauxResponse::text("done again"));
+    send(window, "continue", cx);
+    wait_until(cx, |cx| {
+        conversation.read_with(cx, |view, _| !view.is_running())
+    });
+    assert!(pending(&conversation, cx).is_empty());
+    assert_eq!(
+        tool_results(&conversation, cx).last(),
+        Some(&(false, "next-turn".to_owned()))
+    );
 }
 
 #[gpui::test]

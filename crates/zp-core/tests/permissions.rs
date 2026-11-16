@@ -83,8 +83,8 @@ async fn ask_mode_denials_grants_and_scope() {
 
     let faux = FauxProvider::default();
     faux.push(call("bash", json!({"command": "echo hi > out.txt"})));
-    faux.push(call("bash", json!({"command": "echo one"})));
-    faux.push(call("bash", json!({"command": "echo two"})));
+    faux.push(call("bash", json!({"command": "cd . && echo one"})));
+    faux.push(call("bash", json!({"command": "cd . && echo two"})));
     faux.push(call("write", json!({"path": "new.txt", "content": "x"})));
     faux.push(call("read", json!({"path": secret.to_str().unwrap()})));
     faux.push(call("read", json!({"path": "new.txt"})));
@@ -115,6 +115,16 @@ async fn ask_mode_denials_grants_and_scope() {
         ]
     );
     assert!(!root.join("out.txt").exists());
+
+    faux.push(call(
+        "bash",
+        json!({"command": "pwd >/dev/null && cd . && echo later"}),
+    ));
+    faux.push(FauxResponse::text("done again"));
+    assert_eq!(
+        results(&coding.prompt("continue").await.unwrap()),
+        [(false, "later".to_owned())]
+    );
 
     let requests = approver.requests.lock().unwrap();
     assert_eq!(requests.len(), 4, "`echo two` was granted for the session");

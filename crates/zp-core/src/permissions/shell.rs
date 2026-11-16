@@ -267,9 +267,33 @@ pub fn segment_matches(segment: &Segment, allowed: &str) -> bool {
 pub fn all_allowed(command: &str, allowed: &[String]) -> bool {
     let segments = segments(command);
     !segments.is_empty()
-        && segments.iter().all(|segment| {
-            command_words(segment).is_empty() || allowed.iter().any(|a| segment_matches(segment, a))
-        })
+        && segments
+            .iter()
+            .all(|segment| segment_allowed(segment, allowed))
+}
+
+fn segment_allowed(segment: &Segment, allowed: &[String]) -> bool {
+    let words = command_words(segment);
+    words.is_empty()
+        || matches!(program(words), Some("pwd" | "cd"))
+        || allowed
+            .iter()
+            .any(|prefix| segment_matches(segment, prefix))
+}
+
+/// Distinct command prefixes that still need approval, excluding directory navigation
+/// and commands already covered by configured or session grants.
+pub fn unapproved_prefixes(command: &str, allowed: &[String]) -> Vec<String> {
+    let mut prefixes = Vec::new();
+    for segment in segments(command) {
+        if !segment_allowed(&segment, allowed)
+            && let Some(prefix) = prefix(&segment)
+            && !prefixes.contains(&prefix)
+        {
+            prefixes.push(prefix);
+        }
+    }
+    prefixes
 }
 
 /// Why `command` is destructive or otherwise high-risk, if it is. Such commands always
@@ -374,6 +398,43 @@ mod tests {
         assert!(!all_allowed("cargo testx", &allowed));
         assert!(!all_allowed("", &allowed));
         assert!(all_allowed("/usr/bin/git status", &allowed));
+    }
+
+    #[test]
+    fn directory_navigation_needs_no_approval_or_session_grant() {
+        let allowed = vec!["git status".to_owned()];
+        for command in [
+            "pwd",
+            "pwd -P",
+            "/bin/pwd",
+            "cd",
+            "cd ..",
+            "cd /tmp && pwd",
+            "command cd -- 'a b'; command pwd",
+        ] {
+            assert!(all_allowed(command, &[]), "{command}");
+            assert!(unapproved_prefixes(command, &[]).is_empty(), "{command}");
+        }
+        assert!(all_allowed("cd src && pwd && git status -s", &allowed));
+        assert_eq!(
+            unapproved_prefixes(
+                "cd src && cargo test && pwd && git status && cargo test -p zp",
+                &allowed
+            ),
+            ["cargo test"]
+        );
+        for command in [
+            "cd src && curl example.com",
+            "pwd | tee output.txt",
+            "cd $(curl example.com)",
+            "pwd; rm -rf target",
+        ] {
+            assert!(!all_allowed(command, &allowed), "{command}");
+            assert!(
+                !unapproved_prefixes(command, &allowed).is_empty(),
+                "{command}"
+            );
+        }
     }
 
     #[test]
