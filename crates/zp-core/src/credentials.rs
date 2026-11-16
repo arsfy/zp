@@ -2,9 +2,12 @@
 //! Service on Linux): API keys as they are, and tokens from signing in to a provider as
 //! JSON (see [`zp_ai::Credential::encode`]).
 //!
+//! Credentials share one keychain entry, unlocked once per process.
 //! The keychain is only queried for providers listed in a small index file
 //! (`~/.zp/credentials.json`, ids only — never secrets), so providers without a stored key
 //! cost nothing and trigger no keychain prompts. Keys are cached in memory once read.
+
+mod vault;
 
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
@@ -13,8 +16,8 @@ use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use anyhow::Context as _;
 use zp_ai::{Credential, CredentialStore};
 
-/// Keychain service name of ZP's API keys.
-pub const KEYCHAIN_SERVICE: &str = "zp.api-keys";
+/// Keychain service name of ZP's credential vault.
+pub const KEYCHAIN_SERVICE: &str = "zp.credentials";
 
 /// Where secrets live.
 pub trait SecretBackend: Send + Sync {
@@ -100,8 +103,8 @@ impl SecretBackend for MemoryBackend {
 struct State {
     /// Providers with a stored key.
     stored: BTreeSet<String>,
-    /// Keys read so far.
-    cache: HashMap<String, String>,
+    /// Results read so far, including missing or inaccessible keys.
+    cache: HashMap<String, Option<String>>,
 }
 
 /// Stored API keys: a [`CredentialStore`] for [`zp_ai::Models`] that can also change them.
@@ -132,8 +135,9 @@ impl Credentials {
 
     /// The system keychain, indexed in `data_dir`.
     pub fn keychain(data_dir: &Path) -> Self {
+        let keyring = Arc::new(KeyringBackend::new(KEYCHAIN_SERVICE));
         Self::new(
-            Arc::new(KeyringBackend::new(KEYCHAIN_SERVICE)),
+            Arc::new(vault::VaultBackend::new(keyring)),
             Some(data_dir.join("credentials.json")),
         )
     }
@@ -159,17 +163,21 @@ impl Credentials {
     }
 
     fn set_secret(&self, provider: &str, secret: &str) -> anyhow::Result<()> {
-        self.backend.set(provider, secret)?;
         let mut state = self.state.write().unwrap_or_else(PoisonError::into_inner);
-        state.cache.insert(provider.to_owned(), secret.to_owned());
+        self.backend.set(provider, secret)?;
+        state.cache.retain(|_, secret| secret.is_some());
+        state
+            .cache
+            .insert(provider.to_owned(), Some(secret.to_owned()));
         state.stored.insert(provider.to_owned());
         self.save_index(&state.stored)
     }
 
     /// Deletes the stored key or sign-in of `provider`.
     pub fn remove(&self, provider: &str) -> anyhow::Result<()> {
-        self.backend.delete(provider)?;
         let mut state = self.state.write().unwrap_or_else(PoisonError::into_inner);
+        self.backend.delete(provider)?;
+        state.cache.retain(|_, secret| secret.is_some());
         state.cache.remove(provider);
         state.stored.remove(provider);
         self.save_index(&state.stored)
@@ -216,30 +224,35 @@ impl Credentials {
             if !state.stored.contains(provider) {
                 return None;
             }
-            if let Some(key) = state.cache.get(provider) {
-                return Some(key.clone());
+            if let Some(secret) = state.cache.get(provider) {
+                return secret.clone();
             }
         }
-        match self.backend.get(provider) {
-            Ok(Some(key)) => {
-                self.state
-                    .write()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .cache
-                    .insert(provider.to_owned(), key.clone());
-                Some(key)
-            }
-            Ok(None) => None,
+        // Serialize cache misses so startup tasks cannot unlock the same entry twice.
+        let mut state = self.state.write().unwrap_or_else(PoisonError::into_inner);
+        if !state.stored.contains(provider) {
+            return None;
+        }
+        if let Some(secret) = state.cache.get(provider) {
+            return secret.clone();
+        }
+        let secret = match self.backend.get(provider) {
+            Ok(secret) => secret,
             Err(error) => {
                 tracing::warn!(provider, error = %format!("{error:#}"), "could not read a credential");
                 None
             }
-        }
+        };
+        state.cache.insert(provider.to_owned(), secret.clone());
+        secret
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Barrier;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
     use super::*;
 
     /// Counts reads to check the index and cache.
@@ -247,11 +260,13 @@ mod tests {
     struct Counting {
         inner: MemoryBackend,
         reads: Mutex<usize>,
+        fail_read: AtomicBool,
     }
 
     impl SecretBackend for Counting {
         fn get(&self, provider: &str) -> anyhow::Result<Option<String>> {
             *self.reads.lock().unwrap() += 1;
+            anyhow::ensure!(!self.fail_read.load(Ordering::SeqCst), "read denied");
             self.inner.get(provider)
         }
         fn set(&self, provider: &str, secret: &str) -> anyhow::Result<()> {
@@ -301,5 +316,69 @@ mod tests {
         credentials.set("deepseek", "sk-1").unwrap();
         let auth = models.resolve_auth("deepseek").unwrap();
         assert_eq!(auth.source, zp_ai::AuthSource::Stored);
+    }
+
+    #[test]
+    fn concurrent_cache_misses_read_the_backend_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let index = dir.path().join("credentials.json");
+        let backend = Arc::new(Counting::default());
+        Credentials::new(backend.clone(), Some(index.clone()))
+            .set("one", "sk-one")
+            .unwrap();
+        let credentials = Credentials::new(backend.clone(), Some(index));
+        let barrier = Barrier::new(8);
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                scope.spawn(|| {
+                    barrier.wait();
+                    assert_eq!(credentials.api_key("one").as_deref(), Some("sk-one"));
+                });
+            }
+        });
+        assert_eq!(*backend.reads.lock().unwrap(), 1);
+    }
+
+    #[test]
+    fn missing_credentials_are_cached() {
+        let dir = tempfile::tempdir().unwrap();
+        let index = dir.path().join("credentials.json");
+        let backend = Arc::new(Counting::default());
+        std::fs::write(&index, r#"["missing"]"#).unwrap();
+        let credentials = Credentials::new(backend.clone(), Some(index));
+        assert_eq!(credentials.api_key("missing"), None);
+        assert_eq!(credentials.api_key("missing"), None);
+        assert_eq!(*backend.reads.lock().unwrap(), 1);
+    }
+
+    #[test]
+    fn denied_reads_are_cached_until_a_successful_edit() {
+        for remove in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let index = dir.path().join("credentials.json");
+            let backend = Arc::new(Counting::default());
+            let credentials = Credentials::new(backend.clone(), Some(index.clone()));
+            credentials.set("one", "sk-one").unwrap();
+            credentials.set("two", "sk-two").unwrap();
+            let credentials = Credentials::new(backend.clone(), Some(index));
+            backend.fail_read.store(true, Ordering::SeqCst);
+            assert_eq!(credentials.api_key("one"), None);
+            assert_eq!(credentials.api_key("one"), None);
+            assert_eq!(credentials.api_key("two"), None);
+            assert_eq!(*backend.reads.lock().unwrap(), 2);
+
+            backend.fail_read.store(false, Ordering::SeqCst);
+            if remove {
+                credentials.remove("two").unwrap();
+            } else {
+                credentials.set("two", "replacement").unwrap();
+            }
+            assert_eq!(credentials.api_key("one").as_deref(), Some("sk-one"));
+            assert_eq!(*backend.reads.lock().unwrap(), 3);
+            assert_eq!(
+                credentials.api_key("two").as_deref(),
+                if remove { None } else { Some("replacement") }
+            );
+        }
     }
 }
