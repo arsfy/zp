@@ -74,6 +74,13 @@ pub(crate) enum Followup {
     Retry,
 }
 
+/// A sent user message being edited in place.
+pub(crate) struct MessageEdit {
+    pub(crate) row: usize,
+    pub(crate) input: Entity<EditableTextState>,
+    _changed: Subscription,
+}
+
 /// Which popover is open.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Picker {
@@ -133,6 +140,10 @@ pub struct ConversationView {
     tool_diffs: RefCell<HashMap<String, Rc<Result<files::ToolDiff, String>>>>,
     /// Tool calls waiting for the user.
     approvals: Vec<permissions::Approval>,
+    /// The sent message being edited, if any.
+    editing: Option<MessageEdit>,
+    /// Measured height of the floating composer.
+    composer_height: Rc<std::cell::Cell<f32>>,
     /// The row whose text was just copied (shows a check mark briefly).
     copied_row: Option<usize>,
     /// Times the streaming response.
@@ -213,6 +224,8 @@ impl ConversationView {
             markdown_cache: RefCell::default(),
             tool_diffs: RefCell::default(),
             approvals: Vec::new(),
+            editing: None,
+            composer_height: Rc::default(),
             copied_row: None,
             response_timer: ResponseTimer::default(),
             tokens_per_second: None,
@@ -308,7 +321,9 @@ impl ConversationView {
         });
 
         self.transcript = Transcript::from_messages(&coding.agent().messages());
-        self.list_state = ListState::new(self.transcript.len(), ListAlignment::Top, px(1000.));
+        // One more item at the end: room for the floating composer.
+        self.list_state =
+            ListState::new(self.transcript.len() + 1, ListAlignment::Top, px(1000.));
         self.list_state.set_follow_mode(gpui::FollowMode::Tail);
         self.coding = Some(coding);
         self._agent_events = Some(subscription);
@@ -417,6 +432,12 @@ impl ConversationView {
         self.running || self.compacting
     }
 
+    /// Remeasures the space kept for the composer after the last row.
+    pub(super) fn refresh_spacer(&mut self) {
+        let len = self.transcript.len();
+        self.list_state.splice(len..len + 1, 1);
+    }
+
     /// Remeasures the last row, which shows the working indicator while busy.
     pub(super) fn refresh_last_row(&mut self) {
         let len = self.transcript.len();
@@ -429,7 +450,8 @@ impl ConversationView {
     fn reload_transcript(&mut self) {
         if let Some(coding) = &self.coding {
             self.transcript = Transcript::from_messages(&coding.agent().messages());
-            self.list_state.reset(self.transcript.len());
+            self.editing = None;
+            self.list_state.reset(self.transcript.len() + 1);
             self.list_state.set_follow_mode(gpui::FollowMode::Tail);
         }
     }
@@ -693,17 +715,67 @@ impl ConversationView {
         );
     }
 
-    /// Rewinds to before user message `row` and puts its text back in the composer.
+    /// Edits user message `row` in place. Nothing changes until the edit is sent.
     pub(crate) fn edit_and_resend(
         &mut self,
         row: usize,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.is_busy() {
+            return;
+        }
         let Some(transcript::Row::User { text, .. }) = self.transcript.rows().get(row).cloned()
         else {
             return;
         };
+        if let Some(previous) = self.editing.take() {
+            self.list_state.splice(previous.row..previous.row + 1, 1);
+        }
+        let input = cx.new(|cx| EditableTextState::new(StringStorage::from(text.clone()), cx));
+        input.update(cx, |input, cx| input.move_to(text.len(), cx));
+        input.read(cx).focus_handle(cx).focus(window, cx);
+        // The field may grow or shrink the row.
+        let changed = cx.subscribe(&input, move |this, _, _: &TextChanged, cx| {
+            if this.editing.as_ref().is_some_and(|edit| edit.row == row) {
+                this.list_state.splice(row..row + 1, 1);
+                cx.notify();
+            }
+        });
+        self.editing = Some(MessageEdit {
+            row,
+            input,
+            _changed: changed,
+        });
+        self.list_state.splice(row..row + 1, 1);
+        cx.notify();
+    }
+
+    /// The message being edited (rendering and tests).
+    pub(crate) fn editing(&self) -> Option<&MessageEdit> {
+        self.editing.as_ref()
+    }
+
+    /// Stops editing without changing anything.
+    pub(crate) fn cancel_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(edit) = self.editing.take() {
+            self.list_state.splice(edit.row..edit.row + 1, 1);
+            self.focus_composer(window, cx);
+            cx.notify();
+        }
+    }
+
+    /// Sends the edited message: the conversation continues from before the original
+    /// message on a new branch (the original stays in the session tree).
+    pub(crate) fn submit_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(edit) = self.editing.as_ref() else {
+            return;
+        };
+        let text = edit.input.read(cx).as_str().trim().to_owned();
+        if text.is_empty() || self.is_busy() {
+            return;
+        }
+        let row = edit.row;
         let (Some(coding), Some(entry)) = (self.coding.clone(), self.entry_for_row(row)) else {
             return;
         };
@@ -715,14 +787,33 @@ impl ConversationView {
             parent,
             Box::new(move |this, window, cx| {
                 let result = coding.branch_before(&entry);
-                this.composer
-                    .update(cx, |composer, cx| composer.emplace(&text, cx));
-                this.focus_composer(window, cx);
+                let ok = result.is_ok();
                 this.after_branch_change(result, cx);
+                if ok {
+                    this.send_text(&text, window, cx);
+                }
             }),
             window,
             cx,
         );
+    }
+
+    /// Sends `text` as if typed in the composer, keeping the composer's own draft.
+    fn send_text(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let draft = self.composer.read(cx).as_str().to_owned();
+        let attachments = std::mem::take(&mut self.attachments);
+        self.composer
+            .update(cx, |composer, cx| composer.emplace(text, cx));
+        self.send(&SendMessage, window, cx);
+        if self.running {
+            self.composer
+                .update(cx, |composer, cx| composer.emplace(&draft, cx));
+            self.attachments = attachments;
+        } else {
+            // Not sent (e.g. a key is missing): the text waits in the composer.
+            self.attachments.extend(attachments);
+        }
+        self.completion = None;
     }
 
     fn after_branch_change(&mut self, result: anyhow::Result<()>, cx: &mut Context<Self>) {

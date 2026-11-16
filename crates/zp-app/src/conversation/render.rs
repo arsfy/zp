@@ -5,7 +5,8 @@ use std::time::Duration;
 use gpui::{
     Anchor, Animation, AnimationExt as _, AnyElement, App, ClipboardItem, ColorExt as _, Context,
     ElementId, FontWeight, IntoElement, Render, SharedString, Window, anchored, deferred, div,
-    list, point, prelude::*, px, relative, rgb_to_hsla, svg,
+    canvas, linear_color_stop, linear_gradient, list, point, prelude::*, px, relative,
+    rgb_to_hsla, svg,
 };
 use gpui_elements::editable_text::{text_area, text_input};
 use zp_ai::{AssistantContent, StopReason, ToolCall};
@@ -65,6 +66,8 @@ fn loading_dots(cx: &App) -> AnyElement {
         .into_any_element()
 }
 
+/// Height of the fade above the floating composer.
+const COMPOSER_FADE: f32 = 24.0;
 /// Height of the line under a message (actions or the working indicator).
 const ACTION_SIZE: f32 = 22.0;
 const ICON_COPY: &[u8] = include_bytes!("../../../../assets/icons/copy.svg");
@@ -119,8 +122,17 @@ impl ConversationView {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        if ix >= self.transcript.len() {
+            // Room for the floating composer at the end.
+            return div()
+                .h(px(self.composer_height.get() + COMPOSER_FADE))
+                .into_any_element();
+        }
         let row = self.transcript.rows().get(ix).cloned();
         let content = match &row {
+            Some(Row::User { .. }) if self.editing().is_some_and(|edit| edit.row == ix) => {
+                self.render_user_editor(cx)
+            }
             Some(Row::User {
                 text,
                 images,
@@ -245,6 +257,9 @@ impl ConversationView {
             return None;
         }
         let slot = div().h(px(ACTION_SIZE)).flex().items_center();
+        if self.editing().is_some_and(|edit| edit.row == ix) {
+            return Some(slot.into_any_element());
+        }
         if self.is_busy() {
             return Some(
                 slot.when(last, |this| this.child(loading_dots(cx)))
@@ -308,6 +323,74 @@ impl ConversationView {
                 .on_click(cx.listener(move |this, _, _, cx| this.fork_from(ix, cx))),
         );
         Some(bar)
+    }
+
+    /// A sent message being edited: the full width, with Cancel and Send.
+    fn render_user_editor(&self, cx: &mut Context<Self>) -> AnyElement {
+        let Some(edit) = self.editing() else {
+            return div().into_any_element();
+        };
+        let colors = cx.theme().colors.clone();
+        div()
+            .key_context("MessageEditor")
+            .on_action(cx.listener(|this, _: &crate::actions::SubmitEdit, window, cx| {
+                this.submit_edit(window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &crate::actions::CancelEdit, window, cx| {
+                this.cancel_edit(window, cx)
+            }))
+            .w_full()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .px_3()
+            .py_2()
+            .rounded(px(10.))
+            .bg(colors.surface)
+            .child(
+                text_area("message-editor")
+                    .state(edit.input.downgrade())
+                    .caret_color(rgb_to_hsla(colors.text))
+                    .selection_color(rgb_to_hsla(colors.accent).opacity(0.35))
+                    .w_full()
+                    .max_h(px(320.))
+                    .overflow_y_scroll(),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_end()
+                    .gap_2()
+                    .child(
+                        div()
+                            .flex_1()
+                            .text_size(px(11.))
+                            .text_color(colors.text_muted)
+                            .child("Sending starts a new branch from here; the original stays in the session tree."),
+                    )
+                    .child(
+                        ghost_button("edit-cancel", "Cancel", cx).on_click(cx.listener(
+                            |this, _, window, cx| this.cancel_edit(window, cx),
+                        )),
+                    )
+                    .child(
+                        div()
+                            .id("edit-send")
+                            .px_3()
+                            .py_0p5()
+                            .rounded(px(4.))
+                            .text_size(px(12.))
+                            .bg(colors.accent)
+                            .text_color(colors.accent_text)
+                            .cursor_pointer()
+                            .child("Send")
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.submit_edit(window, cx)
+                            })),
+                    ),
+            )
+            .into_any_element()
     }
 
     /// The user's message: a bubble as wide as its text, on the right.
@@ -927,12 +1010,10 @@ impl ConversationView {
                 }))
         };
 
-        centered(
-            div()
+        let notes = div()
                 .flex()
                 .flex_col()
                 .gap_1()
-                .pb_3()
                 .when_some(self.run_error.clone(), |this, error| {
                     this.child(
                         div()
@@ -941,7 +1022,6 @@ impl ConversationView {
                             .child(error),
                     )
                 })
-                .when_some(self.render_completion(cx), |this, menu| this.child(menu))
                 .when_some(self.needs_key(cx), |this, provider| {
                     let registered = cx
                         .try_global::<crate::store::AppModels>()
@@ -1058,8 +1138,8 @@ impl ConversationView {
                             )),
                     )
                 })
-                .child(
-                    div()
+;
+        let input = div()
                         .key_context(if self.completion.is_some() {
                             "Composer CompletionMenu"
                         } else {
@@ -1173,10 +1253,8 @@ impl ConversationView {
                                         }),
                                 )
                                 .child(action),
-                        ),
-                ),
-        )
-        .into_any_element()
+                        );
+        self.floating_composer(notes, input, cx)
     }
 
     fn render_empty(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -1400,15 +1478,82 @@ impl Render for ConversationView {
             )
             .size_full()
             .relative()
-            .flex()
-            .flex_col()
-            .child(div().flex_1().min_h_0().pt_2().child(transcript))
+            .child(div().size_full().pt_2().child(transcript))
             .child(self.render_composer(cx))
             .when(self.tree_open, |this| this.child(self.render_tree(cx)))
     }
 }
 
 impl ConversationView {
+    /// The composer floats over the bottom of the transcript on an opaque backdrop (with
+    /// a fade above it). Its height is measured so the transcript can end with a spacer
+    /// of the same height: nothing is hidden behind it, and the transcript keeps its size
+    /// when the composer grows. The completion menu floats above it without taking space.
+    fn floating_composer(
+        &self,
+        notes: gpui::Div,
+        input: gpui::Div,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let colors = cx.theme().colors.clone();
+        let solid = rgb_to_hsla(colors.background);
+        let clear = solid.opacity(0.);
+        let height = self.composer_height.clone();
+        let view = cx.entity().downgrade();
+        let measure = canvas(
+            move |bounds, _, cx| {
+                let measured = f32::from(bounds.size.height);
+                if (height.get() - measured).abs() >= 0.5 {
+                    height.set(measured);
+                    cx.defer(move |cx| {
+                        let _ = view.update(cx, |this, cx| {
+                            this.refresh_spacer();
+                            cx.notify();
+                        });
+                    });
+                }
+            },
+            |_, _, _, _| {},
+        )
+        .absolute()
+        .top_0()
+        .left_0()
+        .size_full();
+        div()
+            .absolute()
+            .bottom_0()
+            .left_0()
+            .right_0()
+            .pb_3()
+            .bg(colors.background)
+            .child(
+                div()
+                    .absolute()
+                    .top(px(-COMPOSER_FADE))
+                    .left_0()
+                    .right_0()
+                    .h(px(COMPOSER_FADE))
+                    .bg(linear_gradient(
+                        180.,
+                        linear_color_stop(clear, 0.),
+                        linear_color_stop(solid, 1.),
+                    )),
+            )
+            .child(measure)
+            .child(centered(div().flex().flex_col().gap_1().child(notes).child(input)))
+            .when_some(self.render_completion(cx), |this, menu| {
+                this.child(
+                    div()
+                        .absolute()
+                        .bottom(relative(1.))
+                        .left_0()
+                        .right_0()
+                        .child(centered(div().pb_1().child(menu))),
+                )
+            })
+            .into_any_element()
+    }
+
     /// The `/` or `@` completion menu above the composer.
     fn render_completion(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let completion = self.completion.as_ref()?;

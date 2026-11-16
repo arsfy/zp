@@ -47,7 +47,9 @@ actions!(
         CommandPalette,
         CompactConversation,
         CheckForUpdates,
-        ReloadResources
+        ReloadResources,
+        SubmitEdit,
+        CancelEdit
     ]
 );
 
@@ -63,6 +65,8 @@ pub const KEY_SEND: &str = "enter";
 
 /// The composer's text field.
 const COMPOSER_INPUT: &str = "Composer > EditableText";
+/// The field editing a sent message.
+const MESSAGE_EDITOR_INPUT: &str = "MessageEditor > EditableText";
 /// The model picker's filter field.
 const MODEL_FILTER_INPUT: &str = "ModelPicker > EditableText";
 /// The sidebar's session search field.
@@ -208,6 +212,9 @@ pub fn bind_keys(cx: &mut App) {
     cx.bind_keys(default_bindings().as_keybindings(Some(DEFAULT_INPUT_CONTEXT)));
     cx.bind_keys([
         KeyBinding::new("shift-enter", Enter, Some(COMPOSER_INPUT)),
+        KeyBinding::new("enter", SubmitEdit, Some(MESSAGE_EDITOR_INPUT)),
+        KeyBinding::new("shift-enter", Enter, Some(MESSAGE_EDITOR_INPUT)),
+        KeyBinding::new("escape", CancelEdit, Some(MESSAGE_EDITOR_INPUT)),
         KeyBinding::new("escape", StopRun, Some(COMPOSER_INPUT)),
         KeyBinding::new("enter", PickFirstModel, Some(MODEL_FILTER_INPUT)),
         KeyBinding::new("escape", ClosePicker, Some(MODEL_FILTER_INPUT)),
