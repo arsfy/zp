@@ -189,6 +189,7 @@ pub fn run(out: PathBuf) {
     changes(&mut cx, &faux, &out);
     approvals(&mut cx, &faux, &out);
     settings_pages(&mut cx, &out);
+    advanced(&mut cx, &faux, &data_dir_of(&data), &out);
     println!("screenshots written to {}", out.display());
 }
 
@@ -773,4 +774,139 @@ fn settings_pages(cx: &mut VisualTestAppContext, out: &std::path::Path) {
             shot(cx, "25-settings-provider-form.png");
         }
     }
+}
+
+/// M10: the `/` and `@` menus with an attachment, the compaction card, the command
+/// palette and the MCP settings page.
+fn advanced(
+    cx: &mut VisualTestAppContext,
+    faux: &FauxProvider,
+    data: &std::path::Path,
+    out: &std::path::Path,
+) {
+    use crate::settings::{Page, SettingsWindow};
+    let write = |path: PathBuf, text: &str| {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, text).unwrap();
+    };
+    write(
+        data.join("prompts/review.md"),
+        "---\ndescription: Review the staged changes\nargument-hint: \"[focus]\"\n---\nReview ${1:-everything}.",
+    );
+    write(
+        data.join("prompts/changelog.md"),
+        "---\ndescription: Draft a changelog entry from recent commits\n---\nWrite a changelog.",
+    );
+    write(
+        data.join("skills/release/SKILL.md"),
+        "---\nname: release\ndescription: Cut a release: bump versions, tag, publish\n---\nSteps",
+    );
+    let script = r#"while IFS= read -r line; do id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p'); case "$line" in *initialize*) printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$id";; *tools/list*) printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":[{"name":"search_docs","description":"Search the product docs"},{"name":"get_page"}]}}\n' "$id";; esac; done"#;
+    std::fs::write(
+        zp_mcp::config::user_file(data),
+        json!({"mcpServers": {
+            "docs": {"command": "sh", "args": ["-c", script], "description": "Product documentation"},
+            "github": {"command": "github-mcp-server", "args": ["stdio"]},
+            "old": {"enabled": false, "url": "https://example.com/mcp"}
+        }})
+        .to_string(),
+    )
+    .unwrap();
+
+    let project = tempfile::tempdir().unwrap();
+    let root = zp_core::project::normalize_project_path(project.path()).unwrap();
+    for file in ["src/main.rs", "src/parser.rs", "src/lexer.rs", "README.md"] {
+        write(root.join(file), "// code\n");
+    }
+    std::fs::write(root.join("screenshot.png"), [0x89, b'P', b'N', b'G']).unwrap();
+    cx.update(|cx| {
+        let root = root.clone();
+        crate::store::AppStore::update(cx, move |state| {
+            state.project_mut(&root).permission_mode =
+                Some(zp_core::permissions::PermissionMode::FullAuto);
+        });
+        // The settings scene made a real provider the default; only the scripted one
+        // may answer here.
+        let _ = cx.global::<AppModels>().credentials.remove("deepseek");
+        crate::store::AppSettings::update(cx, |settings| {
+            settings.default_model = Some("faux/faux-1".into());
+            settings.keybindings.clear();
+            settings.generate_titles = Some(false);
+        })
+        .unwrap();
+    });
+    let window = cx
+        .open_offscreen_window(size(px(1280.), px(820.)), |window, cx| {
+            cx.new(|cx| ProjectWindow::new(root.clone(), window, cx))
+        })
+        .unwrap();
+    let any = window.into();
+    pump(cx, Duration::from_millis(300));
+    let conversation = cx.update(|cx| {
+        window
+            .read(cx)
+            .map(|v| v.active_conversation().unwrap().clone())
+            .unwrap()
+    });
+
+    // Two turns, then a compaction.
+    faux.push(FauxResponse::text(
+        "The parser is a recursive descent parser in src/parser.rs.",
+    ));
+    faux.push(FauxResponse::text("Errors carry the token position."));
+    faux.push(FauxResponse::text("## Goal\nUnderstand the parser.\n\n## Progress\n### Done\n- [x] Read src/parser.rs\n\n## Next Steps\n1. Improve error messages"));
+    for question in ["How does the parser work?", "And error handling?"] {
+        cx.simulate_input(any, question);
+        cx.dispatch_action(any, SendMessage);
+        pump(cx, Duration::from_millis(1500));
+    }
+    cx.update(|cx| conversation.update(cx, |c, cx| c.compact(None, cx)));
+    pump(cx, Duration::from_millis(800));
+    cx.update(|cx| conversation.update(cx, |c, cx| c.toggle_tool("compaction-0", 0, false, cx)));
+    pump(cx, Duration::from_millis(100));
+
+    cx.simulate_input(any, "/");
+    pump(cx, Duration::from_millis(200));
+    cx.capture_screenshot(any)
+        .unwrap()
+        .save(out.join("26-slash-commands.png"))
+        .unwrap();
+
+    cx.update(|cx| conversation.update(cx, |c, cx| c.set_draft("", cx)));
+    cx.update_window(any, |_, window, cx| {
+        conversation.update(cx, |c, cx| {
+            let paths = gpui::ExternalPaths([root.join("screenshot.png")].into_iter().collect());
+            c.drop_paths(&paths, window, cx);
+        });
+    })
+    .unwrap();
+    cx.simulate_input(any, "explain the errors in @pars");
+    pump(cx, Duration::from_millis(600));
+    cx.capture_screenshot(any)
+        .unwrap()
+        .save(out.join("27-file-completion.png"))
+        .unwrap();
+
+    cx.update(|cx| conversation.update(cx, |c, cx| c.set_draft("", cx)));
+    cx.update_window(any, |_, window, cx| {
+        let view = window.root::<ProjectWindow>().flatten().unwrap();
+        view.update(cx, |view, cx| view.toggle_palette(window, cx));
+    })
+    .unwrap();
+    pump(cx, Duration::from_millis(200));
+    cx.capture_screenshot(any)
+        .unwrap()
+        .save(out.join("28-command-palette.png"))
+        .unwrap();
+
+    let settings = cx
+        .open_offscreen_window(size(px(980.), px(700.)), |window, cx| {
+            cx.new(|cx| SettingsWindow::new_on(Page::Mcp, window, cx))
+        })
+        .unwrap();
+    pump(cx, Duration::from_millis(800));
+    cx.capture_screenshot(settings.into())
+        .unwrap()
+        .save(out.join("29-settings-mcp.png"))
+        .unwrap();
 }

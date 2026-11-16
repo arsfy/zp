@@ -86,6 +86,8 @@ pub struct SystemPromptOptions<'a> {
     pub custom_prompt: Option<&'a str>,
     /// Extra text appended after the rules.
     pub append: Option<&'a str>,
+    /// The skills section (see [`crate::resources::Resources::skills_prompt`]).
+    pub skills: Option<&'a str>,
 }
 
 impl Default for SystemPromptOptions<'_> {
@@ -96,6 +98,7 @@ impl Default for SystemPromptOptions<'_> {
             context_files: &[],
             custom_prompt: None,
             append: None,
+            skills: None,
         }
     }
 }
@@ -135,6 +138,9 @@ pub fn build_system_prompt(options: &SystemPromptOptions<'_>) -> String {
             ));
         }
         sections.push(("project_context", text));
+    }
+    if let Some(skills) = options.skills.filter(|text| !text.trim().is_empty()) {
+        sections.push(("skills", skills.trim().to_owned()));
     }
     sections.push(("cwd", options.cwd.to_string_lossy().replace('\\', "/")));
 

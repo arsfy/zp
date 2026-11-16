@@ -8341,11 +8341,13 @@ dependencies = [
  "pulldown-cmark",
  "serde_json",
  "tempfile",
+ "tokio",
  "tracing",
  "trash",
  "zp-agent",
  "zp-ai",
  "zp-core",
+ "zp-mcp",
  "zp-session",
  "zp-tools",
 ]
@@ -8362,6 +8364,7 @@ dependencies = [
  "zp-agent",
  "zp-ai",
  "zp-core",
+ "zp-mcp",
  "zp-session",
  "zp-tools",
 ]
@@ -8371,9 +8374,12 @@ name = "zp-core"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "dirs 6.0.0",
  "futures",
+ "ignore",
  "keyring",
+ "reqwest",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -8386,6 +8392,25 @@ dependencies = [
  "zp-agent",
  "zp-ai",
  "zp-session",
+ "zp-tools",
+]
+
+[[package]]
+name = "zp-mcp"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "dirs 6.0.0",
+ "futures",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "zp-agent",
+ "zp-ai",
  "zp-tools",
 ]
 

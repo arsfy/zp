@@ -52,6 +52,12 @@ enum Command {
         #[command(subcommand)]
         action: AuthCommand,
     },
+    /// Connect the MCP servers of a project and list their tools.
+    Mcp {
+        /// Project directory (default: the current directory).
+        #[arg(short = 'C', long, value_name = "DIR")]
+        cwd: Option<std::path::PathBuf>,
+    },
     /// Print data locations.
     Paths,
 }
@@ -122,6 +128,7 @@ async fn main() -> Result<()> {
             list_providers(&models);
             Ok(())
         }
+        Command::Mcp { cwd } => list_mcp(cwd.as_deref(), data_dir.as_deref()).await,
         Command::Auth { action } => auth(&models, &credentials, cache.as_ref(), action),
         Command::Sync(args) => {
             let cache = cache.context("no data directory for the model cache")?;
@@ -142,9 +149,74 @@ async fn main() -> Result<()> {
                 "sessions: {}",
                 zp_core::paths::sessions_dir(&data_dir).display()
             );
+            println!(
+                "mcp:      {}",
+                zp_mcp::config::user_file(&data_dir).display()
+            );
+            println!("prompts:  {}", data_dir.join("prompts").display());
+            println!("skills:   {}", data_dir.join("skills").display());
             Ok(())
         }
     }
+}
+
+async fn list_mcp(cwd: Option<&std::path::Path>, data_dir: Option<&std::path::Path>) -> Result<()> {
+    let cwd = match cwd {
+        Some(dir) => dir.to_path_buf(),
+        None => std::env::current_dir()?,
+    };
+    let cwd = zp_core::project::normalize_project_path(&cwd)?;
+    let trusted = data_dir.is_none_or(|dir| {
+        zp_core::app_state::AppState::load(&zp_core::paths::state_file(dir))
+            .project(&cwd)
+            .trusted
+            != Some(false)
+    });
+    let env = |name: &str| std::env::var(name).ok();
+    let (servers, errors) = zp_mcp::config::load(data_dir, &cwd, trusted, &env);
+    for error in &errors {
+        eprintln!("invalid: {error}");
+    }
+    if servers.is_empty() {
+        eprintln!("no MCP servers configured (see `zp-cli paths` for mcp.json)");
+        return if errors.is_empty() {
+            Ok(())
+        } else {
+            bail!("invalid configuration")
+        };
+    }
+    let hub = zp_mcp::McpHub::new(servers, errors.clone());
+    hub.start();
+    let mut changes = hub.subscribe();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+    while hub
+        .statuses()
+        .iter()
+        .any(|s| s.state == zp_mcp::ServerState::Connecting)
+        && tokio::time::timeout_at(deadline, changes.changed())
+            .await
+            .is_ok()
+    {}
+    let mut failed = !errors.is_empty();
+    let mut rows = vec![["SERVER".to_owned(), "STATE".to_owned(), "TOOLS".to_owned()]];
+    for status in hub.statuses() {
+        let state = match &status.state {
+            zp_mcp::ServerState::Connected => "connected".to_owned(),
+            zp_mcp::ServerState::Connecting => "timed out".to_owned(),
+            zp_mcp::ServerState::Disabled => "disabled".to_owned(),
+            zp_mcp::ServerState::Failed(error) => {
+                failed = true;
+                format!("failed: {}", error.lines().next().unwrap_or_default())
+            }
+        };
+        rows.push([status.name.clone(), state, status.tools.join(", ")]);
+    }
+    print_table(&rows);
+    hub.shutdown();
+    if failed {
+        bail!("some servers are not connected");
+    }
+    Ok(())
 }
 
 fn auth(

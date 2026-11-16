@@ -70,7 +70,11 @@ pub(crate) struct RunArgs {
     /// else ask). Approvals are asked on the terminal.
     #[arg(long, value_name = "MODE", value_parser = parse_mode)]
     permissions: Option<PermissionMode>,
+    /// Do not start the MCP servers of `~/.zp/mcp.json` / `.zp/mcp.json`.
+    #[arg(long)]
+    no_mcp: bool,
     /// The prompt. Read from stdin when piped; omit on a terminal for interactive mode.
+    /// `@path` attaches a file; `/template args` and `/skill:name` expand.
     prompt: Vec<String>,
 }
 
@@ -217,6 +221,40 @@ pub(crate) async fn run(models: &Models, args: RunArgs) -> Result<()> {
         models.clone(),
     )));
     options.trusted = trusted;
+    options.resources = Arc::new(zp_core::resources::Resources::load(
+        Some(&data_dir),
+        &cwd,
+        trusted,
+    ));
+    let user_settings =
+        zp_core::settings::Settings::load_or_default(&zp_core::paths::settings_file(&data_dir));
+    options.compaction = user_settings.compaction.unwrap_or_default();
+    // MCP servers add their tools to the built-in ones (not with an explicit tool list).
+    let mcp = if options.tools.is_none() && !args.no_mcp {
+        let env = |name: &str| std::env::var(name).ok();
+        let (servers, errors) = zp_mcp::config::load(Some(&data_dir), &cwd, trusted, &env);
+        for error in &errors {
+            eprintln!("{}", Style::detect().paint("33", &format!("mcp: {error}")));
+        }
+        (!servers.is_empty()).then(|| zp_mcp::McpHub::new(servers, errors))
+    } else {
+        None
+    };
+    if let Some(hub) = &mcp {
+        hub.start();
+        wait_for_servers(hub).await;
+        for status in hub.statuses() {
+            if let zp_mcp::ServerState::Failed(error) = &status.state {
+                eprintln!(
+                    "{}",
+                    Style::detect().paint("33", &format!("mcp: {}: {error}", status.name))
+                );
+            }
+        }
+        let mut tools = zp_tools::coding_tools(&cwd);
+        tools.extend(hub.tools());
+        options.tools = Some(tools);
+    }
     options.global_context_dir = Some(data_dir);
     options.custom_system_prompt = args.system_prompt;
     options.append_system_prompt = args.append_system_prompt;
@@ -240,14 +278,14 @@ pub(crate) async fn run(models: &Models, args: RunArgs) -> Result<()> {
 
     match prompt {
         Some(prompt) if args.interactive => {
-            if let Err(error) = run_prompt(&coding, prompt).await {
+            if let Err(error) = run_prompt(&coding, &prompt).await {
                 eprintln!("{}", style.paint("31", &format!("error: {error:#}")));
             }
             print_usage(&coding, style);
             interactive(&coding, models, style, input).await
         }
         Some(prompt) => {
-            let added = run_prompt(&coding, prompt).await?;
+            let added = run_prompt(&coding, &prompt).await?;
             print_usage(&coding, style);
             let failed = added
                 .iter()
@@ -318,12 +356,53 @@ fn print_usage(coding: &CodingSession, style: Style) {
     );
 }
 
-/// Runs one prompt; Ctrl-C aborts it (the run still finishes cleanly and is saved).
-async fn run_prompt(
+/// Waits up to 10 seconds for MCP servers to connect.
+async fn wait_for_servers(hub: &Arc<zp_mcp::McpHub>) {
+    let mut changes = hub.subscribe();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    while hub
+        .statuses()
+        .iter()
+        .any(|s| s.state == zp_mcp::ServerState::Connecting)
+    {
+        if tokio::time::timeout_at(deadline, changes.changed())
+            .await
+            .is_err()
+        {
+            break;
+        }
+    }
+}
+
+/// Runs one prompt (templates and skills expanded, `@file`s attached, the context
+/// compacted when needed); Ctrl-C aborts it. A request too large for the context is
+/// compacted and retried once.
+async fn run_prompt(coding: &CodingSession, input: &str) -> Result<Vec<AgentMessage>> {
+    let style = Style::detect();
+    let text = coding.expand_input(input);
+    let (message, notes) = zp_core::attachments::build_message(&text, coding.cwd(), &[]);
+    for note in notes {
+        eprintln!("{}", style.paint("33", &note));
+    }
+    if coding.needs_compaction() {
+        compact(coding, None).await?;
+    }
+    let mut added = abortable(coding, coding.prompt(PromptInput(vec![message]))).await?;
+    if coding.overflowed() {
+        eprintln!(
+            "{}",
+            style.paint("2", "context overflow; compacting and retrying")
+        );
+        compact(coding, None).await?;
+        added.extend(abortable(coding, coding.agent().continue_run()).await?);
+    }
+    Ok(added)
+}
+
+async fn abortable(
     coding: &CodingSession,
-    input: impl Into<PromptInput>,
+    run: impl std::future::Future<Output = Result<Vec<AgentMessage>, zp_agent::AgentError>>,
 ) -> Result<Vec<AgentMessage>> {
-    let run = coding.prompt(input);
     tokio::pin!(run);
     loop {
         tokio::select! {
@@ -331,6 +410,20 @@ async fn run_prompt(
             _ = tokio::signal::ctrl_c() => coding.agent().abort(),
         }
     }
+}
+
+/// Summarizes older messages.
+async fn compact(coding: &CodingSession, focus: Option<&str>) -> Result<()> {
+    let style = Style::detect();
+    eprintln!("{}", style.paint("2", "compacting…"));
+    match coding.compact(focus).await? {
+        Some((before, after)) => eprintln!(
+            "{}",
+            style.paint("2", &format!("compacted: ~{before} → ~{after} tokens"))
+        ),
+        None => eprintln!("{}", style.paint("2", "nothing to compact yet")),
+    }
+    Ok(())
 }
 
 async fn interactive(
@@ -381,7 +474,15 @@ async fn interactive(
         if input.is_empty() {
             continue;
         }
-        if let Some(command) = input.strip_prefix('/') {
+        if let Some(focus) = input.strip_prefix("/compact") {
+            if let Err(error) = compact(coding, Some(focus.trim()).filter(|f| !f.is_empty())).await
+            {
+                eprintln!("{}", style.paint("31", &format!("error: {error:#}")));
+            }
+            continue;
+        }
+        let expands = coding.resources().expand(input).is_some();
+        if let Some(command) = input.strip_prefix('/').filter(|_| !expands) {
             match command_line(coding, models, command, style) {
                 Ok(true) => continue,
                 Ok(false) => break,
@@ -431,6 +532,8 @@ fn command_line(
              /name <text>           name this session\n\
              /session               show session details\n\
              /tools                 list enabled tools\n\
+             /compact [focus]       summarize older messages\n\
+             /<template> [args]     run a prompt template; /skill:<name> loads a skill\n\
              /exit                  quit"
         ),
         "model" if argument.is_empty() => eprintln!("{}", coding.agent().model().qualified_id()),

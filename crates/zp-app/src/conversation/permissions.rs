@@ -111,6 +111,9 @@ impl ConversationView {
         let reason = cx.new(|cx| EditableTextState::new(StringStorage::default(), cx));
         let preview = self.change_preview(&request).map(Rc::new);
         let call_id = request.tool_call_id.clone();
+        cx.emit(ConversationEvent::ApprovalRequested(
+            request.summary.clone(),
+        ));
         self.approvals.push(Approval {
             request,
             reply: Some(pending.reply),

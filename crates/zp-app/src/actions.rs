@@ -39,7 +39,15 @@ actions!(
         ToggleDiffLayout,
         DenyToolCall,
         OpenSettings,
-        CancelRecording
+        CancelRecording,
+        CompletionNext,
+        CompletionPrevious,
+        AcceptCompletion,
+        CloseCompletion,
+        CommandPalette,
+        CompactConversation,
+        CheckForUpdates,
+        ReloadResources
     ]
 );
 
@@ -59,6 +67,10 @@ const COMPOSER_INPUT: &str = "Composer > EditableText";
 const MODEL_FILTER_INPUT: &str = "ModelPicker > EditableText";
 /// The sidebar's session search field.
 const SESSION_SEARCH_INPUT: &str = "SessionSearch > EditableText";
+/// The composer while its completion menu is open.
+const COMPLETION_INPUT: &str = "CompletionMenu > EditableText";
+/// The command palette's filter field.
+const PALETTE_INPUT: &str = "CommandPalette > EditableText";
 /// The rename field.
 const RENAME_INPUT: &str = "RenameInput > EditableText";
 
@@ -89,7 +101,9 @@ macro_rules! shortcut {
 pub fn shortcuts() -> Vec<Shortcut> {
     let project = Some(PROJECT_CONTEXT);
     vec![
+        shortcut!("Command Palette", CommandPalette, "secondary-shift-p", None),
         shortcut!("New Chat", NewChat, "secondary-t", project),
+        shortcut!("Compact Conversation", CompactConversation, "", project),
         shortcut!("Send Message", SendMessage, KEY_SEND, Some(COMPOSER_INPUT)),
         shortcut!("Close Tab", CloseTab, "secondary-w", None),
         shortcut!("Next Tab", NextTab, "ctrl-tab", project),
@@ -209,6 +223,14 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("]", NextDiffFile, Some("DiffView")),
         KeyBinding::new("[", PreviousDiffFile, Some("DiffView")),
         KeyBinding::new("escape", CancelRecording, Some("Keybindings")),
+        KeyBinding::new("down", CompletionNext, Some(COMPLETION_INPUT)),
+        KeyBinding::new("up", CompletionPrevious, Some(COMPLETION_INPUT)),
+        KeyBinding::new("tab", AcceptCompletion, Some(COMPLETION_INPUT)),
+        KeyBinding::new("escape", CloseCompletion, Some(COMPLETION_INPUT)),
+        KeyBinding::new("down", CompletionNext, Some(PALETTE_INPUT)),
+        KeyBinding::new("up", CompletionPrevious, Some(PALETTE_INPUT)),
+        KeyBinding::new("enter", AcceptCompletion, Some(PALETTE_INPUT)),
+        KeyBinding::new("escape", CloseCompletion, Some(PALETTE_INPUT)),
     ]);
     for shortcut in shortcuts() {
         let Some(keys) = shortcut_keys(shortcut.action, cx) else {
@@ -228,6 +250,7 @@ fn set_menus(cx: &mut App) {
                 MenuItem::action(format!("About {app}"), About),
                 MenuItem::separator(),
                 MenuItem::action("Settings…", OpenSettings),
+                MenuItem::action("Check for Updates…", CheckForUpdates),
                 MenuItem::separator(),
                 MenuItem::action(format!("Quit {app}"), Quit),
             ],
@@ -248,6 +271,8 @@ fn set_menus(cx: &mut App) {
         Menu {
             name: "View".into(),
             items: vec![
+                MenuItem::action("Command Palette…", CommandPalette),
+                MenuItem::separator(),
                 MenuItem::action("Next Tab", NextTab),
                 MenuItem::action("Previous Tab", PreviousTab),
                 MenuItem::action("Session Tree", ToggleSessionTree),

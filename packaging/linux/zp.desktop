@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=ZP
+GenericName=Coding Agent
+Comment=A native GUI coding agent harness
+Exec=zp %F
+Icon=zp
+Terminal=false
+Categories=Development;IDE;
+StartupWMClass=zp

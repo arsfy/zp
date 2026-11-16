@@ -5,9 +5,11 @@
 //! state, and file change tracking (snapshots, diffs, restores, git). See `PLAN.md`.
 
 pub mod app_state;
+pub mod attachments;
 pub mod changes;
 pub mod checkpoint;
 pub mod coding_session;
+pub mod compaction;
 pub mod credentials;
 pub mod diff;
 pub mod git;
@@ -17,10 +19,12 @@ pub mod paths;
 pub mod permissions;
 pub mod project;
 pub mod providers;
+pub mod resources;
 pub mod restore;
 pub mod settings;
 pub mod system_prompt;
 pub mod title;
+pub mod update;
 
 pub use coding_session::{
     CodingHooks, CodingSession, CodingSessionOptions, UsageTotals, session_model,

@@ -71,6 +71,11 @@ struct Rename {
     position: Point<Pixels>,
 }
 
+struct OpenPalette {
+    view: Entity<crate::command_palette::CommandPalette>,
+    _events: Vec<Subscription>,
+}
+
 struct OpenDiff {
     view: Entity<DiffView>,
     _events: Subscription,
@@ -99,6 +104,11 @@ pub struct ProjectWindow {
     diff_layout: DiffLayout,
     /// Whether the trust question is on screen.
     trust_prompt_open: bool,
+    /// The trust the MCP servers were started with.
+    trusted_mcp: Option<bool>,
+    /// Follows the project's MCP servers.
+    mcp_task: gpui::Task<()>,
+    palette: Option<OpenPalette>,
     focus_handle: FocusHandle,
     _subscriptions: Vec<Subscription>,
 }
@@ -127,11 +137,85 @@ impl ProjectWindow {
     pub(crate) fn apply_permissions(&mut self, cx: &mut Context<Self>) {
         let policy = crate::approvals::project_policy(&self.root, cx);
         let trusted = crate::approvals::is_trusted(&self.root, cx);
+        let trust_changed =
+            crate::mcp::hub(&self.root, cx).is_some() && self.trusted_mcp != Some(trusted);
         for tab in &self.tabs {
             tab.conversation.update(cx, |view, cx| {
                 view.set_permission_policy(policy.clone(), cx);
                 view.set_trusted(trusted);
             });
+        }
+        if trust_changed {
+            // The project's own servers, templates and skills only load when trusted.
+            self.reload_resources(cx);
+        }
+        cx.notify();
+    }
+
+    /// Starts the project's MCP servers and updates the tabs whenever they change.
+    fn watch_mcp(root: &Path, cx: &mut Context<Self>) -> gpui::Task<()> {
+        let hub = crate::mcp::start(root, cx);
+        let mut changes = hub.subscribe();
+        cx.spawn(async move |this, cx| {
+            while changes.changed().await.is_ok() {
+                let alive = this.update(cx, |this, cx| {
+                    for tab in &this.tabs {
+                        tab.conversation
+                            .update(cx, |view, cx| view.refresh_tools(cx));
+                    }
+                    cx.notify();
+                });
+                if alive.is_err() {
+                    break;
+                }
+            }
+        })
+    }
+
+    /// Opens (or closes) the command palette.
+    pub(crate) fn toggle_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.palette.take().is_some() {
+            self.focus_active(window, cx);
+            cx.notify();
+            return;
+        }
+        let view = cx.new(|cx| crate::command_palette::CommandPalette::new(window, cx));
+        let events = vec![
+            cx.subscribe_in(&view, window, |this, _, event, window, cx| match event {
+                crate::command_palette::PaletteEvent::Run(action) => {
+                    this.palette = None;
+                    this.focus_active(window, cx);
+                    window.dispatch_action(action.boxed_clone(), cx);
+                    cx.notify();
+                }
+            }),
+            cx.subscribe_in(&view, window, |this, _, _: &DismissEvent, window, cx| {
+                this.palette = None;
+                this.focus_active(window, cx);
+                cx.notify();
+            }),
+        ];
+        self.palette = Some(OpenPalette {
+            view,
+            _events: events,
+        });
+        cx.notify();
+    }
+
+    /// The open command palette (tests).
+    #[cfg(test)]
+    pub fn palette(&self) -> Option<Entity<crate::command_palette::CommandPalette>> {
+        self.palette.as_ref().map(|p| p.view.clone())
+    }
+
+    /// `/reload`: re-reads templates, skills and the MCP configuration.
+    pub(crate) fn reload_resources(&mut self, cx: &mut Context<Self>) {
+        self.trusted_mcp = Some(crate::approvals::is_trusted(&self.root, cx));
+        let root = self.root.clone();
+        self.mcp_task = Self::watch_mcp(&root, cx);
+        for tab in &self.tabs {
+            tab.conversation
+                .update(cx, |view, cx| view.refresh_resources(cx));
         }
         cx.notify();
     }
@@ -242,10 +326,16 @@ impl ProjectWindow {
                 this.sidebar.on_search_changed();
                 cx.notify();
             }),
-            cx.on_release(move |_, cx| Workspaces::project_closed(&release_root, cx)),
+            cx.on_release(move |_, cx| {
+                crate::mcp::stop(&release_root, cx);
+                Workspaces::project_closed(&release_root, cx)
+            }),
         ];
 
+        let mcp_task = Self::watch_mcp(&root, cx);
+        let trusted_mcp = Some(crate::approvals::is_trusted(&root, cx));
         let mut this = Self {
+            mcp_task,
             name: zp_core::project::project_name(&root),
             branch: None,
             root,
@@ -259,6 +349,8 @@ impl ProjectWindow {
             diff: None,
             diff_layout: DiffLayout::Unified,
             trust_prompt_open: false,
+            trusted_mcp,
+            palette: None,
             focus_handle,
             _subscriptions: subscriptions,
         };
@@ -575,6 +667,15 @@ impl ProjectWindow {
             .filter(|tab| tab.conversation.read(cx).needs_attention())
             .count();
         let restricted = self.is_restricted(cx);
+        let update_badge = match crate::updates::state(cx) {
+            crate::updates::UpdateState::Available(update) => {
+                Some((format!("Update {} available", update.version), Some(update)))
+            }
+            crate::updates::UpdateState::Downloading(update) => {
+                Some((format!("Downloading {}…", update.version), None))
+            }
+            _ => None,
+        };
         let mut right = Vec::new();
         if waiting > 0 {
             right.push(format!(
@@ -649,6 +750,19 @@ impl ProjectWindow {
                                 .on_click(cx.listener(|this, _, window, cx| {
                                     this.prompt_trust(window, cx)
                                 })),
+                        )
+                    })
+                    .when_some(update_badge, |this, (label, update)| {
+                        this.child(
+                            div()
+                                .id("status-update")
+                                .cursor_pointer()
+                                .text_color(colors.accent)
+                                .hover_style(|s| s.text_color(colors.text))
+                                .child(label)
+                                .when_some(update, |this, update| {
+                                    this.on_click(move |_, _, cx| crate::updates::offer(&update, cx))
+                                }),
                         )
                     })
                     .when(changed_files > 0, |this| {
@@ -737,14 +851,7 @@ impl ProjectWindow {
     }
 }
 
-/// `1234` → `1.2k`, `2500000` → `2.5M`.
-fn format_tokens(tokens: u64) -> String {
-    match tokens {
-        t if t >= 1_000_000 => format!("{:.1}M", t as f64 / 1_000_000.0),
-        t if t >= 1_000 => format!("{:.1}k", t as f64 / 1_000.0),
-        t => t.to_string(),
-    }
-}
+use crate::ui::format_tokens;
 
 /// The session manager of the data directory, if any.
 fn session_manager(cx: &App) -> Option<SessionManager> {
@@ -825,6 +932,23 @@ impl Render for ProjectWindow {
                 this.clear_session_search(window, cx)
             }))
             .on_action(cx.listener(Self::confirm_rename))
+            .on_action(
+                cx.listener(|this, _: &crate::actions::CommandPalette, window, cx| {
+                    this.toggle_palette(window, cx)
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &crate::actions::CompactConversation, _, cx| {
+                    if let Some(conversation) = this.active_conversation().cloned() {
+                        conversation.update(cx, |view, cx| view.compact(None, cx));
+                    }
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &crate::actions::ReloadResources, _, cx| {
+                    this.reload_resources(cx)
+                }),
+            )
             .on_action(cx.listener(Self::cancel_rename))
             .on_drag_move(cx.listener(Self::on_resize_drag))
             .size_full()
@@ -854,6 +978,24 @@ impl Render for ProjectWindow {
             )
             .child(self.render_status_bar(cx))
             .children(self.render_overlays(cx))
+            .when_some(
+                self.palette.as_ref().map(|p| p.view.clone()),
+                |this, palette| {
+                    this.child(
+                        deferred(
+                            div()
+                                .absolute()
+                                .top(px(56.))
+                                .left_0()
+                                .right_0()
+                                .flex()
+                                .justify_center()
+                                .child(palette),
+                        )
+                        .priority(3),
+                    )
+                },
+            )
     }
 }
 

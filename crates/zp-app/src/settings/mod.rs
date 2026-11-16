@@ -3,6 +3,7 @@
 //! and applied to the running app at once.
 
 mod keybindings;
+mod mcp;
 mod models;
 mod providers;
 
@@ -35,13 +36,15 @@ pub enum Page {
     Permissions,
     Appearance,
     Keybindings,
+    Mcp,
 }
 
 impl Page {
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::General,
         Self::Models,
         Self::Providers,
+        Self::Mcp,
         Self::Permissions,
         Self::Appearance,
         Self::Keybindings,
@@ -55,6 +58,7 @@ impl Page {
             Self::Permissions => "Permissions",
             Self::Appearance => "Appearance",
             Self::Keybindings => "Keybindings",
+            Self::Mcp => "MCP Servers",
         }
     }
 }
@@ -228,6 +232,17 @@ impl SettingsWindow {
     pub fn set_default_thinking(&mut self, level: ThinkingLevel, cx: &mut Context<Self>) {
         let result = AppSettings::update(cx, |s| s.default_thinking = Some(level))
             .map(|()| format!("Default thinking level: {level}"));
+        self.report(result, cx);
+    }
+
+    pub fn set_notifications(&mut self, on: bool, cx: &mut Context<Self>) {
+        let result = AppSettings::update(cx, |s| s.notifications = Some(on)).map(|()| {
+            if on {
+                "Notifications on".to_owned()
+            } else {
+                "Notifications off".to_owned()
+            }
+        });
         self.report(result, cx);
     }
 
@@ -415,6 +430,7 @@ impl SettingsWindow {
             ThinkingLevel::XHigh,
         ];
         let titles = settings.generate_titles.unwrap_or(true);
+        let notifications = settings.notifications.unwrap_or(true);
         page_body()
             .child(section(
                 "Default model",
@@ -441,6 +457,15 @@ impl SettingsWindow {
             .child(div().flex().child(
                 checkbox("generate-titles", "Name conversations with a model", titles, cx)
                     .on_click(cx.listener(move |this, _, _, cx| this.set_generate_titles(!titles, cx))),
+            ))
+            .child(section(
+                "Notifications",
+                "Tell me when a conversation I'm not looking at finishes or needs an approval.",
+                cx,
+            ))
+            .child(div().flex().child(
+                checkbox("notifications", "Show system notifications", notifications, cx)
+                    .on_click(cx.listener(move |this, _, _, cx| this.set_notifications(!notifications, cx))),
             ))
             .into_any_element()
     }
@@ -529,6 +554,7 @@ impl Render for SettingsWindow {
             Page::Permissions => self.render_permissions(cx),
             Page::Appearance => self.render_appearance(cx),
             Page::Keybindings => self.render_keybindings(cx),
+            Page::Mcp => self.render_mcp(cx),
         };
         let notice = self.notice.clone().filter(|(text, _)| !text.is_empty());
         div()

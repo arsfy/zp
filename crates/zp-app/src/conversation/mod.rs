@@ -4,6 +4,7 @@
 //! [`Transcript`] in batches, at most ~30 times per second, so streaming does not redraw
 //! for every token.
 
+pub mod composer;
 mod files;
 mod permissions;
 mod render;
@@ -59,6 +60,18 @@ pub enum ConversationEvent {
     OpenDiff(DiffItem),
     /// The user picked a permission mode (for the whole project).
     PermissionModeChanged(zp_core::permissions::PermissionMode),
+    /// A `/` command the window handles.
+    Command(composer::WindowCommand),
+    /// A tool call waits for the user (its summary).
+    ApprovalRequested(String),
+}
+
+/// What runs after a compaction finishes.
+pub(crate) enum Followup {
+    /// Send this message.
+    Prompt(Box<zp_agent::AgentMessage>),
+    /// Retry the request that overflowed the context.
+    Retry,
 }
 
 /// Which popover is open.
@@ -109,6 +122,20 @@ pub struct ConversationView {
     tool_diffs: RefCell<HashMap<String, Rc<Result<files::ToolDiff, String>>>>,
     /// Tool calls waiting for the user.
     approvals: Vec<permissions::Approval>,
+    /// The `/` or `@` completion menu.
+    completion: Option<composer::Completion>,
+    /// The draft the user closed the menu for (not reopened until it changes).
+    suppress_completion: Option<String>,
+    /// Project files for `@` completion.
+    file_list: Option<Arc<Vec<String>>>,
+    loading_files: bool,
+    /// Images for the next message.
+    attachments: Vec<zp_core::attachments::ImageAttachment>,
+    /// A note above the composer (command output, attachment problems).
+    info: Option<String>,
+    compacting: bool,
+    /// The current request was already retried after a context overflow.
+    overflow_retried: bool,
     /// Whether the session tree overlay is shown.
     tree_open: bool,
     /// A model title was already requested for this session.
@@ -134,8 +161,18 @@ impl ConversationView {
         let composer = cx.new(|cx| EditableTextState::new(StringStorage::default(), cx));
         let model_filter = cx.new(|cx| EditableTextState::new(StringStorage::default(), cx));
         // The composer redraws itself while typing; only the model filter changes our list.
-        let subscriptions =
-            vec![cx.subscribe(&model_filter, |_, _, _: &TextChanged, cx| cx.notify())];
+        let subscriptions = vec![
+            cx.subscribe(&model_filter, |_, _, _: &TextChanged, cx| cx.notify()),
+            // The composer redraws itself; only the completion menu depends on its text.
+            cx.subscribe(&composer, |this, composer, _: &TextChanged, cx| {
+                let text = composer.read(cx).as_str();
+                if this.suppress_completion.as_deref() == Some(text) {
+                    return;
+                }
+                this.suppress_completion = None;
+                this.update_completion(cx);
+            }),
+        ];
         let mut this = Self {
             root,
             coding: None,
@@ -153,6 +190,14 @@ impl ConversationView {
             markdown_cache: RefCell::default(),
             tool_diffs: RefCell::default(),
             approvals: Vec::new(),
+            completion: None,
+            suppress_completion: None,
+            file_list: None,
+            loading_files: false,
+            attachments: Vec::new(),
+            info: None,
+            compacting: false,
+            overflow_retried: false,
             tree_open: false,
             title_requested: false,
             focus_handle: cx.focus_handle(),
@@ -193,6 +238,11 @@ impl ConversationView {
         options.global_context_dir = cx.try_global::<AppPaths>().and_then(|p| p.data_dir.clone());
         options.blobs = AppPaths::blobs(cx);
         options.trusted = crate::approvals::is_trusted(&self.root, cx);
+        options.resources = crate::mcp::project_resources(&self.root, cx);
+        options.compaction = crate::store::AppSettings::get(cx)
+            .compaction
+            .unwrap_or_default();
+        options.tools = Some(crate::mcp::project_tools(&self.root, cx));
         let (approval_sender, mut approval_receiver) = futures::channel::mpsc::unbounded();
         options.permissions = Some(Arc::new(zp_core::permissions::PermissionGate::new(
             crate::approvals::project_policy(&self.root, cx),
@@ -299,6 +349,28 @@ impl ConversationView {
         if let Some(name) = named {
             return name;
         }
+        // The first message of the branch (compacted ones are no longer in the transcript).
+        let first = self.coding.as_ref().and_then(|coding| {
+            coding
+                .session()
+                .branch_path(None)
+                .iter()
+                .find_map(|entry| match entry.message() {
+                    Some(zp_agent::AgentMessage::Llm(zp_ai::Message::User(user))) => Some(
+                        user.content
+                            .iter()
+                            .filter_map(zp_ai::UserContent::as_text)
+                            .collect::<String>(),
+                    ),
+                    _ => None,
+                })
+        });
+        if let Some(first) = first {
+            let (_, typed) = zp_core::attachments::split_file_blocks(&first);
+            if !typed.trim().is_empty() {
+                return zp_tools::shorten(typed.trim(), 32);
+            }
+        }
         self.transcript
             .rows()
             .iter()
@@ -309,8 +381,8 @@ impl ConversationView {
             .unwrap_or_else(|| "New Chat".to_owned())
     }
 
-    /// Replaces the composer text (tests).
-    #[cfg(test)]
+    /// Replaces the composer text (tests, screenshots).
+    #[cfg(any(test, feature = "visual-tests"))]
     pub fn set_draft(&self, text: &str, cx: &mut App) {
         self.composer
             .update(cx, |composer, cx| composer.emplace(text, cx));
@@ -358,12 +430,58 @@ impl ConversationView {
         });
     }
 
+    /// Re-reads the project's prompt templates and skills, and its tools (MCP servers
+    /// connected or gone).
+    pub fn refresh_resources(&mut self, cx: &mut Context<Self>) {
+        if let Some(coding) = &self.coding {
+            coding.set_resources(crate::mcp::project_resources(&self.root, cx));
+            if !self.running {
+                coding.set_tools(crate::mcp::project_tools(&self.root, cx));
+            }
+        }
+        self.update_completion(cx);
+    }
+
+    /// Updates the tools after MCP servers changed (not during a run).
+    pub fn refresh_tools(&mut self, cx: &mut Context<Self>) {
+        if let Some(coding) = &self.coding
+            && !self.running
+        {
+            coding.set_tools(crate::mcp::project_tools(&self.root, cx));
+        }
+    }
+
+    /// Names of the agent's tools (tests).
+    #[cfg(test)]
+    pub fn tool_names(&self) -> Vec<String> {
+        self.coding
+            .as_ref()
+            .map(|c| {
+                c.agent()
+                    .tools()
+                    .iter()
+                    .map(|t| t.name().to_owned())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     /// Stops the running agent, if any.
     pub fn abort(&mut self, cx: &mut Context<Self>) {
         if let Some(coding) = &self.coding {
             coding.agent().abort();
         }
         cx.notify();
+    }
+
+    /// The error of the last run, if it failed.
+    pub fn failure(&self) -> Option<String> {
+        self.run_error.clone().or_else(|| {
+            let row = self.transcript.failed_response()?;
+            self.transcript
+                .assistant(row)
+                .and_then(|m| m.error_message.clone())
+        })
     }
 
     /// Whether the last response failed.
@@ -623,25 +741,77 @@ impl ConversationView {
     // ----- actions -------------------------------------------------------------------
 
     fn send(&mut self, _: &SendMessage, window: &mut Window, cx: &mut Context<Self>) {
+        // Enter completes, unless the draft already is the selected command.
+        let draft = self.composer.read(cx).as_str().trim_end().to_owned();
+        let complete = self.completion.as_ref().is_some_and(|completion| {
+            completion
+                .items
+                .get(completion.selected)
+                .is_some_and(|item| item.replacement.trim_end() != draft)
+        });
+        if complete && self.accept_completion(None, window, cx) {
+            return;
+        }
+        self.completion = None;
         let text = self.composer.read(cx).as_str().trim().to_owned();
-        if text.is_empty() {
+        if (text.is_empty() && self.attachments.is_empty()) || self.compacting {
             return;
         }
         let Some(coding) = self.coding.clone() else {
             return;
         };
+        self.info = None;
+        if !self.running && self.run_builtin(&text, window, cx) {
+            self.composer
+                .update(cx, |composer, cx| composer.emplace("", cx));
+            return;
+        }
+        if !self.attachments.is_empty() && !coding.agent().model().supports_images() {
+            self.run_error = Some(format!(
+                "{} does not accept images; remove them or pick another model",
+                coding.agent().model().qualified_id()
+            ));
+            cx.notify();
+            return;
+        }
         self.composer
             .update(cx, |composer, cx| composer.emplace("", cx));
         self.picker = None;
         cx.emit(ConversationEvent::Activity);
+        let text = coding.expand_input(&text);
+        let (message, notes) =
+            zp_core::attachments::build_message(&text, &self.root, &self.attachments);
+        self.attachments.clear();
+        if !notes.is_empty() {
+            self.info = Some(notes.join("\n"));
+        }
         if self.running {
             // Typed while working: delivered after the current tool calls finish.
-            coding.agent().steer(text);
+            coding.agent().steer(message);
             cx.notify();
             return;
         }
-        self.start_run(cx, move |coding| async move { coding.prompt(text).await });
+        self.overflow_retried = false;
+        if coding.needs_compaction() {
+            self.compact_then(None, Some(Followup::Prompt(Box::new(message))), cx);
+        } else {
+            self.run_followup(Followup::Prompt(Box::new(message)), cx);
+        }
         self.focus_composer(window, cx);
+    }
+
+    pub(super) fn run_followup(&mut self, followup: Followup, cx: &mut Context<Self>) {
+        match followup {
+            Followup::Prompt(message) => self.start_run(cx, move |coding| async move {
+                coding.prompt(zp_agent::PromptInput(vec![*message])).await
+            }),
+            Followup::Retry => {
+                self.start_run(
+                    cx,
+                    |coding| async move { coding.agent().continue_run().await },
+                )
+            }
+        }
     }
 
     fn start_run<F, Fut>(&mut self, cx: &mut Context<Self>, run: F)
@@ -682,6 +852,14 @@ impl ConversationView {
     fn finish_run(&mut self, cx: &mut Context<Self>) {
         self.running = false;
         self.clear_approvals();
+        self.invalidate_files();
+        // A request too large for the context: compact once and try again.
+        if !self.overflow_retried && self.coding.as_ref().is_some_and(|c| c.overflowed()) {
+            self.overflow_retried = true;
+            cx.emit(ConversationEvent::StatusChanged);
+            self.compact_then(None, Some(Followup::Retry), cx);
+            return;
+        }
         let failed = self.has_failed();
         cx.emit(ConversationEvent::StatusChanged);
         cx.emit(ConversationEvent::RunFinished);

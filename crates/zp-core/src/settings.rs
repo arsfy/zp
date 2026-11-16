@@ -75,6 +75,18 @@ pub struct Settings {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub theme: Option<ThemeChoice>,
     pub permissions: PermissionSettings,
+    /// System notifications for background conversations (default on).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub notifications: Option<bool>,
+    /// Check for new versions at startup (default on).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub check_for_updates: Option<bool>,
+    /// Where to look for updates (default: the GitHub releases feed).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub update_feed: Option<String>,
+    /// Context compaction.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compaction: Option<crate::compaction::CompactionSettings>,
     /// User-defined providers.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub providers: Vec<CustomProvider>,

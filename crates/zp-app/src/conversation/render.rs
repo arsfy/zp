@@ -66,8 +66,60 @@ impl ConversationView {
     ) -> AnyElement {
         let row = self.transcript.rows().get(ix).cloned();
         let content = match &row {
-            Some(Row::User { text, images, .. }) => self.render_user(text, *images, cx),
+            Some(Row::User {
+                text,
+                images,
+                files,
+                ..
+            }) => self.render_user(text, *images, files, cx),
             Some(Row::Assistant { .. }) => self.render_assistant(ix, cx),
+            Some(Row::Notice { kind, text, .. }) if kind == zp_session::COMPACTION_SUMMARY_TYPE => {
+                let colors = cx.theme().colors.clone();
+                let key = format!("compaction-{ix}");
+                let expanded = self.tool_expanded.get(&key).copied().unwrap_or(false);
+                let toggle_key = key.clone();
+                let summary = expanded.then(|| {
+                    let blocks = self.parsed_markdown(text);
+                    let mut ids = IdGen::new(format!("compaction-md-{ix}"));
+                    render_markdown(&blocks, &MarkdownStyle::from_theme(cx), &mut ids)
+                });
+                div()
+                    .flex()
+                    .flex_col()
+                    .rounded(px(6.))
+                    .border_1()
+                    .border_color(colors.border)
+                    .bg(colors.surface)
+                    .child(
+                        div()
+                            .id(ElementId::Name(key.into()))
+                            .flex()
+                            .gap_2()
+                            .px_3()
+                            .py_1p5()
+                            .cursor_pointer()
+                            .text_size(px(12.))
+                            .text_color(colors.text_muted)
+                            .hover_style(|s| s.bg(colors.surface_hover))
+                            .child(if expanded { "▾" } else { "▸" })
+                            .child("Earlier messages were summarized to save context")
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.toggle_tool(&toggle_key, ix, expanded, cx)
+                            })),
+                    )
+                    .when_some(summary, |this, summary| {
+                        this.child(
+                            div()
+                                .px_3()
+                                .pb_2()
+                                .pt_1()
+                                .border_t_1()
+                                .border_color(colors.border)
+                                .child(summary),
+                        )
+                    })
+                    .into_any_element()
+            }
             Some(Row::Notice { kind, text, .. }) if kind == zp_core::changes::FILE_RESTORE_TYPE => {
                 let colors = &cx.theme().colors;
                 div()
@@ -165,7 +217,7 @@ impl ConversationView {
         Some(bar.into_any_element())
     }
 
-    fn render_user(&self, text: &str, images: usize, cx: &App) -> AnyElement {
+    fn render_user(&self, text: &str, images: usize, files: &[String], cx: &App) -> AnyElement {
         let colors = &cx.theme().colors;
         div()
             .px_3()
@@ -175,6 +227,14 @@ impl ConversationView {
             .border_1()
             .border_color(colors.border)
             .child(text.to_owned())
+            .when(!files.is_empty(), |this| {
+                this.child(
+                    div()
+                        .text_size(px(11.))
+                        .text_color(colors.text_muted)
+                        .child(format!("Attached: {}", files.join(", "))),
+                )
+            })
             .when(images > 0, |this| {
                 this.child(
                     div()
@@ -765,6 +825,37 @@ impl ConversationView {
                             .child(error),
                     )
                 })
+                .when_some(self.render_completion(cx), |this, menu| this.child(menu))
+                .when_some(self.info.clone(), |this, info| {
+                    this.child(
+                        div()
+                            .id("composer-info")
+                            .flex()
+                            .gap_2()
+                            .text_size(px(12.))
+                            .text_color(colors.text_muted)
+                            .child(div().flex_1().whitespace_normal().child(info))
+                            .child(
+                                div()
+                                    .id("dismiss-info")
+                                    .cursor_pointer()
+                                    .hover_style(|s| s.text_color(colors.text))
+                                    .child("×")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.info = None;
+                                        cx.notify();
+                                    })),
+                            ),
+                    )
+                })
+                .when(self.compacting, |this| {
+                    this.child(
+                        div()
+                            .text_size(px(12.))
+                            .text_color(colors.accent)
+                            .child("Compacting the conversation…"),
+                    )
+                })
                 .when(queued > 0, |this| {
                     this.child(
                         div()
@@ -777,20 +868,60 @@ impl ConversationView {
                 })
                 .child(
                     div()
-                        .key_context("Composer")
+                        .key_context(if self.completion.is_some() {
+                            "Composer CompletionMenu"
+                        } else {
+                            "Composer"
+                        })
+                        .capture_action(cx.listener(
+                            |this, _: &gpui_elements::editable_text::actions::Paste, _, cx| {
+                                if this.paste_attachments(cx) {
+                                    cx.stop_propagation();
+                                }
+                            },
+                        ))
                         .flex()
                         .flex_col()
                         .rounded(px(8.))
                         .border_1()
                         .border_color(colors.border)
                         .bg(colors.surface)
+                        .when(!self.attachments.is_empty(), |this| {
+                            this.child(div().flex().flex_wrap().gap_1p5().px_3().pt_2().children(
+                                self.attachments.iter().enumerate().map(|(index, image)| {
+                                    div()
+                                        .id(("attachment", index))
+                                        .flex()
+                                        .items_center()
+                                        .gap_1p5()
+                                        .px_2()
+                                        .py_0p5()
+                                        .rounded(px(4.))
+                                        .bg(colors.code_background)
+                                        .text_size(px(12.))
+                                        .child(div().text_color(colors.text_muted).child("Image"))
+                                        .child(image.name.clone())
+                                        .child(
+                                            div()
+                                                .id(("remove-attachment", index))
+                                                .cursor_pointer()
+                                                .text_color(colors.text_muted)
+                                                .hover_style(|s| s.text_color(colors.error))
+                                                .child("×")
+                                                .on_click(cx.listener(move |this, _, _, cx| {
+                                                    this.remove_attachment(index, cx)
+                                                })),
+                                        )
+                                }),
+                            ))
+                        })
                         .child(
                             text_area("composer-input")
                                 .state(self.composer.downgrade())
                                 .placeholder(if self.running {
                                     "Steer the agent… (sent after the current step)"
                                 } else {
-                                    "Message ZP…"
+                                    "Message ZP… (/ for commands, @ to attach files)"
                                 })
                                 .placeholder_color(rgb_to_hsla(colors.text_muted))
                                 .caret_color(rgb_to_hsla(colors.text))
@@ -1025,6 +1156,31 @@ impl Render for ConversationView {
             .on_action(cx.listener(Self::close_picker))
             .on_action(cx.listener(Self::pick_first_model))
             .on_action(cx.listener(Self::deny_focused_approval))
+            .on_action(
+                cx.listener(|this, _: &crate::actions::CompletionNext, _, cx| {
+                    this.move_completion(1, cx)
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &crate::actions::CompletionPrevious, _, cx| {
+                    this.move_completion(-1, cx)
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &crate::actions::AcceptCompletion, window, cx| {
+                    this.accept_completion(None, window, cx);
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &crate::actions::CloseCompletion, _, cx| {
+                    this.close_completion(cx)
+                }),
+            )
+            .on_drop(
+                cx.listener(|this, paths: &gpui::ExternalPaths, window, cx| {
+                    this.drop_paths(paths, window, cx)
+                }),
+            )
             .size_full()
             .relative()
             .flex()
@@ -1032,5 +1188,75 @@ impl Render for ConversationView {
             .child(div().flex_1().min_h_0().pt_2().child(transcript))
             .child(self.render_composer(cx))
             .when(self.tree_open, |this| this.child(self.render_tree(cx)))
+    }
+}
+
+impl ConversationView {
+    /// The `/` or `@` completion menu above the composer.
+    fn render_completion(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let completion = self.completion.as_ref()?;
+        let colors = cx.theme().colors.clone();
+        let mono = cx.theme().metrics.mono_font.clone();
+        Some(
+            div()
+                .id("completion")
+                .flex()
+                .flex_col()
+                .p_1()
+                .rounded(px(8.))
+                .border_1()
+                .border_color(colors.border)
+                .bg(colors.surface)
+                .max_h(px(280.))
+                .overflow_y_scroll()
+                .children(completion.items.iter().enumerate().map(|(index, item)| {
+                    let selected = index == completion.selected;
+                    div()
+                        .id(("completion-item", index))
+                        .flex()
+                        .items_baseline()
+                        .gap_3()
+                        .px_2()
+                        .py_1()
+                        .rounded(px(4.))
+                        .cursor_pointer()
+                        .when(selected, |this| this.bg(colors.surface_hover))
+                        .hover_style(|s| s.bg(colors.surface_hover))
+                        .child(
+                            div()
+                                .flex_shrink_0()
+                                .font_family(mono.clone())
+                                .text_size(px(12.))
+                                .child(item.label.clone()),
+                        )
+                        .child(
+                            div()
+                                .min_w_0()
+                                .truncate()
+                                .text_size(px(12.))
+                                .text_color(colors.text_muted)
+                                .child(item.detail.clone()),
+                        )
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.accept_completion(Some(index), window, cx);
+                        }))
+                }))
+                .child(
+                    div()
+                        .px_2()
+                        .pt_1()
+                        .text_size(px(11.))
+                        .text_color(colors.text_muted)
+                        .child(match completion.kind {
+                            super::composer::CompletionKind::Command => {
+                                "↑↓ to choose · Tab or Enter to complete · Esc to close"
+                            }
+                            super::composer::CompletionKind::File => {
+                                "↑↓ to choose · Tab or Enter to attach · Esc to close"
+                            }
+                        }),
+                )
+                .into_any_element(),
+        )
     }
 }

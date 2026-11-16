@@ -15,6 +15,7 @@ publish = false
 zp-agent = { path = "crates/zp-agent" }
 zp-ai = { path = "crates/zp-ai" }
 zp-core = { path = "crates/zp-core" }
+zp-mcp = { path = "crates/zp-mcp" }
 zp-session = { path = "crates/zp-session" }
 zp-tools = { path = "crates/zp-tools" }
 

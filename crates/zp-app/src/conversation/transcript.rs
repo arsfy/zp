@@ -33,6 +33,8 @@ pub enum Row {
     User {
         text: String,
         images: usize,
+        /// Files attached with `@path`.
+        files: Vec<String>,
         ordinal: usize,
     },
     /// A model response with its tool calls. While streaming, the current content is
@@ -185,10 +187,13 @@ impl Transcript {
                     .iter()
                     .filter(|c| matches!(c, UserContent::Image(_)))
                     .count();
+                let full = text_of(&user.content);
+                let (files, text) = zp_core::attachments::split_file_blocks(&full);
                 self.push(
                     Row::User {
-                        text: text_of(&user.content),
+                        text: text.to_owned(),
                         images,
+                        files,
                         ordinal,
                     },
                     changes,

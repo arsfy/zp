@@ -16,7 +16,9 @@ use zp_session::{COMPACTION_SUMMARY_TYPE, Session};
 
 use crate::changes::{ChangeLog, restore_message};
 use crate::checkpoint::{BlobStore, RecordedChange, store_tool_change};
+use crate::compaction::CompactionSettings;
 use crate::permissions::PermissionGate;
+use crate::resources::Resources;
 use crate::system_prompt::{SystemPromptOptions, build_system_prompt, load_context_files};
 
 const COMPACTION_PREFIX: &str = "The conversation history before this point was compacted into the following summary:\n\n<summary>\n";
@@ -140,6 +142,10 @@ pub struct CodingSessionOptions {
     pub permissions: Option<Arc<PermissionGate>>,
     /// Whether the project is trusted: its instruction files are only loaded then.
     pub trusted: bool,
+    /// When to compact the context.
+    pub compaction: CompactionSettings,
+    /// Prompt templates and skills.
+    pub resources: Arc<Resources>,
 }
 
 impl CodingSessionOptions {
@@ -159,6 +165,8 @@ impl CodingSessionOptions {
             blobs: None,
             permissions: None,
             trusted: true,
+            compaction: CompactionSettings::default(),
+            resources: Arc::default(),
         }
     }
 }
@@ -207,17 +215,21 @@ pub struct CodingSession {
     models: Models,
     cwd: PathBuf,
     system_prompt: Mutex<String>,
-    prompt_inputs: PromptInputs,
+    prompt_inputs: Mutex<PromptInputs>,
     blobs: BlobStore,
     permissions: Option<Arc<PermissionGate>>,
+    compaction: CompactionSettings,
     _persistence: Subscription,
 }
 
-/// What the system prompt is built from (to rebuild it when trust changes).
+/// What the system prompt is built from (to rebuild it when trust, resources or tools
+/// change).
 struct PromptInputs {
     global_context_dir: Option<PathBuf>,
     custom_system_prompt: Option<String>,
     append_system_prompt: Option<String>,
+    trusted: bool,
+    resources: Arc<Resources>,
 }
 
 /// Context files of `cwd`; without trust only the global one.
@@ -257,6 +269,8 @@ impl CodingSession {
             blobs,
             permissions,
             trusted,
+            compaction,
+            resources,
         } = options;
         let blobs = blobs.unwrap_or_else(BlobStore::in_memory);
         let context = session.context();
@@ -278,12 +292,14 @@ impl CodingSession {
 
         let tools = tools.unwrap_or_else(|| zp_tools::coding_tools(&cwd));
         let context_files = context_files(&cwd, global_context_dir.as_deref(), trusted);
+        let skills = resources.skills_prompt();
         let system_prompt = build_system_prompt(&SystemPromptOptions {
             cwd: &cwd,
             tools: &tools,
             context_files: &context_files,
             custom_prompt: custom_system_prompt.as_deref(),
             append: append_system_prompt.as_deref(),
+            skills: Some(&skills),
         });
 
         let mut agent_options = AgentOptions::with_models(models.clone(), model);
@@ -320,13 +336,16 @@ impl CodingSession {
             models,
             cwd,
             system_prompt: Mutex::new(system_prompt),
-            prompt_inputs: PromptInputs {
+            prompt_inputs: Mutex::new(PromptInputs {
                 global_context_dir,
                 custom_system_prompt,
                 append_system_prompt,
-            },
+                trusted,
+                resources,
+            }),
             blobs,
             permissions,
+            compaction,
             _persistence: persistence,
         })
     }
@@ -407,16 +426,65 @@ impl CodingSession {
     /// Rebuilds the system prompt with or without the project's instruction files (after
     /// the user decided whether to trust the project). Applies from the next request.
     pub fn set_trusted(&self, trusted: bool) {
-        let inputs = &self.prompt_inputs;
+        self.prompt_inputs
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .trusted = trusted;
+        self.rebuild_system_prompt();
+    }
+
+    /// Replaces the prompt templates and skills (e.g. after files changed).
+    pub fn set_resources(&self, resources: Arc<Resources>) {
+        self.prompt_inputs
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .resources = resources;
+        self.rebuild_system_prompt();
+    }
+
+    /// The prompt templates and skills in use.
+    pub fn resources(&self) -> Arc<Resources> {
+        self.prompt_inputs
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .resources
+            .clone()
+    }
+
+    /// Replaces the tools (e.g. MCP servers connected) and updates the system prompt.
+    pub fn set_tools(&self, tools: Vec<Arc<dyn AgentTool>>) {
+        self.agent.set_tools(tools);
+        self.rebuild_system_prompt();
+    }
+
+    /// Expands a `/template` or `/skill:name` command; other input is returned as is.
+    pub fn expand_input(&self, input: &str) -> String {
+        self.resources()
+            .expand(input.trim_start())
+            .unwrap_or_else(|| input.to_owned())
+    }
+
+    fn rebuild_system_prompt(&self) {
+        let inputs = self
+            .prompt_inputs
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         let tools = self.agent.tools();
-        let files = context_files(&self.cwd, inputs.global_context_dir.as_deref(), trusted);
+        let files = context_files(
+            &self.cwd,
+            inputs.global_context_dir.as_deref(),
+            inputs.trusted,
+        );
+        let skills = inputs.resources.skills_prompt();
         let prompt = build_system_prompt(&SystemPromptOptions {
             cwd: &self.cwd,
             tools: &tools,
             context_files: &files,
             custom_prompt: inputs.custom_system_prompt.as_deref(),
             append: inputs.append_system_prompt.as_deref(),
+            skills: Some(&skills),
         });
+        drop(inputs);
         self.agent.set_system_prompt(Some(prompt.clone()));
         *self
             .system_prompt
@@ -539,6 +607,85 @@ impl CodingSession {
         };
         self.agent.set_messages(messages);
         Ok(())
+    }
+
+    /// Estimated size of the current context in tokens.
+    pub fn context_tokens(&self) -> u64 {
+        crate::compaction::context_tokens(&self.agent.messages())
+    }
+
+    /// Whether the context is close enough to the window to compact before the next
+    /// request.
+    pub fn needs_compaction(&self) -> bool {
+        crate::compaction::should_compact(
+            self.context_tokens(),
+            self.agent.model().context_window,
+            &self.compaction,
+        )
+    }
+
+    /// Whether the last response failed because the context was too large.
+    pub fn overflowed(&self) -> bool {
+        self.agent
+            .messages()
+            .iter()
+            .rev()
+            .find_map(AgentMessage::as_assistant)
+            .is_some_and(|message| {
+                message.stop_reason == StopReason::Error
+                    && message
+                        .error_message
+                        .as_deref()
+                        .is_some_and(crate::compaction::is_context_overflow)
+            })
+    }
+
+    /// Summarizes older messages into a compaction entry. Returns `(tokens before,
+    /// tokens after)`, or `None` when there was nothing to compact.
+    pub async fn compact(&self, instructions: Option<&str>) -> anyhow::Result<Option<(u64, u64)>> {
+        if self.agent.is_streaming() {
+            bail!("cannot compact while the agent is running");
+        }
+        // A failed attempt (e.g. a context overflow) is dropped from the context first.
+        let failed = self
+            .agent
+            .messages()
+            .last()
+            .and_then(AgentMessage::as_assistant)
+            .is_some_and(|m| matches!(m.stop_reason, StopReason::Error | StopReason::Aborted));
+        if failed {
+            let _ = self.prepare_retry();
+        }
+        let preparation = {
+            let session = self.session();
+            crate::compaction::prepare(&session.branch_path(None), &self.compaction)
+        };
+        let Some(preparation) = preparation else {
+            return Ok(None);
+        };
+        let before = self.context_tokens();
+        let model = self.agent.model();
+        let result =
+            crate::compaction::summarize(&self.models, &model, preparation, instructions).await?;
+        let messages = {
+            let mut session = self.session();
+            session.append_compaction(
+                result.summary,
+                &result.first_kept_entry_id,
+                before,
+                Some(result.details),
+            )?;
+            session.context().messages
+        };
+        self.agent.set_messages(messages);
+        // Reported usage predates the summary; estimate the new context instead.
+        let after = self
+            .agent
+            .messages()
+            .iter()
+            .map(crate::compaction::estimate_tokens)
+            .sum();
+        Ok(Some((before, after)))
     }
 
     /// Usage of the assistant messages in the current transcript.

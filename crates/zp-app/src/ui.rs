@@ -167,6 +167,15 @@ pub fn tooltip(
     move |_, cx| cx.new(|_| TextTooltip(text.clone())).into()
 }
 
+/// `1234` → `1.2k`, `2500000` → `2.5M`.
+pub fn format_tokens(tokens: u64) -> String {
+    match tokens {
+        t if t >= 1_000_000 => format!("{:.1}M", t as f64 / 1_000_000.0),
+        t if t >= 1_000 => format!("{:.1}k", t as f64 / 1_000.0),
+        t => t.to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

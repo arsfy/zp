@@ -119,6 +119,12 @@ impl ProjectWindow {
                         if index != this.active {
                             this.tabs[index].unread = true;
                         }
+                        let view = conversation.read(cx);
+                        let body = match view.failure() {
+                            Some(error) => format!("Failed: {}", zp_tools::shorten(&error, 120)),
+                            None => "Finished".to_owned(),
+                        };
+                        this.notify_background(conversation, body, window, cx);
                         this.save_tabs(cx);
                         this.load_sessions(cx);
                     }
@@ -136,6 +142,24 @@ impl ProjectWindow {
                         }
                     }
                     ConversationEvent::FilesChanged => {}
+                    ConversationEvent::ApprovalRequested(summary) => {
+                        let body = format!("Needs approval: {}", zp_tools::shorten(summary, 120));
+                        this.notify_background(conversation, body, window, cx);
+                    }
+                    ConversationEvent::Command(command) => {
+                        use crate::conversation::composer::WindowCommand;
+                        match command {
+                            WindowCommand::NewChat => this.new_tab(window, cx),
+                            WindowCommand::Settings => crate::settings::SettingsWindow::open(cx),
+                            WindowCommand::Mcp => {
+                                crate::settings::SettingsWindow::open_at(
+                                    crate::settings::Page::Mcp,
+                                    cx,
+                                );
+                            }
+                            WindowCommand::Reload => this.reload_resources(cx),
+                        }
+                    }
                     ConversationEvent::OpenDiff(item) => {
                         this.open_diff(vec![item.clone()], 0, window, cx)
                     }
@@ -165,6 +189,39 @@ impl ProjectWindow {
         let index = self.tabs.len() - 1;
         self.activate_tab(index, window, cx);
         index
+    }
+
+    /// A system notification about `conversation`, unless the user is looking at it.
+    fn notify_background(
+        &self,
+        conversation: &Entity<ConversationView>,
+        body: String,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let visible = window.is_window_active()
+            && self.tabs.get(self.active).map(|t| &t.conversation) == Some(conversation);
+        if visible {
+            return;
+        }
+        let title = format!("{} — {}", self.name, conversation.read(cx).title());
+        crate::notifications::notify(window, conversation.entity_id(), title, body, cx);
+    }
+
+    /// Shows the tab of `conversation` (from a notification).
+    pub(crate) fn activate_conversation(
+        &mut self,
+        conversation: gpui::EntityId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(index) = self
+            .tabs
+            .iter()
+            .position(|tab| tab.conversation.entity_id() == conversation)
+        {
+            self.activate_tab(index, window, cx);
+        }
     }
 
     /// A new empty chat.
@@ -517,7 +574,7 @@ impl ProjectWindow {
         if view.needs_attention() {
             // Waiting for an approval: the most urgent state.
             Some(dot(colors.warning).into_any_element())
-        } else if view.is_running() {
+        } else if view.is_running() || view.is_compacting() {
             Some(
                 dot(colors.accent)
                     .with_animation(

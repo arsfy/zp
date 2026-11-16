@@ -6,20 +6,26 @@
 mod actions;
 mod approvals;
 mod changes_panel;
+mod command_palette;
 mod context_menu;
 mod conversation;
 mod diff_view;
 mod markdown;
+mod mcp;
+mod notifications;
 mod project;
 mod settings;
 mod store;
 mod theme;
 mod ui;
+mod updates;
 mod welcome;
 mod workspace;
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tests_advanced;
 #[cfg(test)]
 mod tests_changes;
 #[cfg(test)]
@@ -60,6 +66,7 @@ fn main() {
         init(data_dir, cx);
         // Refresh stale model catalog layers in the background.
         AppModels::sync(cx, Vec::new(), false);
+        updates::check_on_startup(cx);
         cx.on_app_quit(|cx| {
             workspace::prepare_quit(cx);
             async {}
@@ -93,6 +100,8 @@ pub fn init(data_dir: Option<PathBuf>, cx: &mut App) {
     AppModels::init(cx);
     Workspaces::init(cx);
     actions::init(cx);
+    notifications::init(cx);
+    updates::init(cx);
 }
 
 /// Applies changed settings to the running app: theme, shortcuts, titles and the
