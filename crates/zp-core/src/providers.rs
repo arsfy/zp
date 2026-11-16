@@ -46,7 +46,10 @@ fn api_of(def: &CustomProvider) -> anyhow::Result<Api> {
     match def.api.as_deref().unwrap_or("openai-completions") {
         "openai-completions" => Ok(Api::OpenAiCompletions),
         "anthropic-messages" => Ok(Api::AnthropicMessages),
-        other => bail!("unknown API `{other}` (use openai-completions or anthropic-messages)"),
+        "openai-responses" => Ok(Api::OpenAiResponses),
+        other => bail!(
+            "unknown API `{other}` (use openai-completions, openai-responses or anthropic-messages)"
+        ),
     }
 }
 

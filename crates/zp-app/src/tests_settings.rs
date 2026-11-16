@@ -11,7 +11,7 @@ use zp_core::settings::{Settings, ThemeChoice};
 use crate::settings::{Page, SettingsWindow};
 use crate::store::{AppModels, AppSettings};
 use crate::tests::project_dir;
-use crate::tests_conversation::{active, open, setup_models, tab_count};
+use crate::tests_conversation::{active, open, setup_models, tab_count, wait_until};
 
 fn settings_window(page: Page, cx: &mut TestAppContext) -> WindowHandle<SettingsWindow> {
     let window = cx
@@ -323,4 +323,116 @@ fn permission_settings_apply_to_open_projects(cx: &mut TestAppContext) {
         cx.update(|cx| AppSettings::get(cx).permissions.mode),
         Some(PermissionMode::AutoEdit)
     );
+}
+
+#[gpui::test]
+fn signing_in_to_providers(cx: &mut TestAppContext) {
+    use crate::settings::ProviderDialog;
+    let faux = FauxProvider::default();
+    let _data = setup_models(cx, &[&faux], false);
+    cx.update(|cx| {
+        let models = &cx.global::<AppModels>().models;
+        for provider in Models::builtin().providers() {
+            models.register(provider);
+        }
+    });
+    let window = settings_window(Page::Providers, cx);
+    let dialog_kind = |cx: &mut TestAppContext| {
+        window
+            .update(cx, |view, _, _| match view.dialog() {
+                Some(ProviderDialog::Key { .. }) => "key",
+                Some(ProviderDialog::Method { .. }) => "method",
+                Some(ProviderDialog::Login(_)) => "login",
+                Some(_) => "other",
+                None => "none",
+            })
+            .unwrap()
+    };
+
+    // Key only, key or sign-in, sign-in only.
+    for (provider, kind) in [
+        ("deepseek", "key"),
+        ("anthropic", "method"),
+        ("openrouter", "method"),
+    ] {
+        window
+            .update(cx, |view, window, cx| {
+                view.choose_provider(provider, window, cx)
+            })
+            .unwrap();
+        assert_eq!(dialog_kind(cx), kind, "{provider}");
+    }
+
+    // Signing in shows the page to open; a refused authorization is reported.
+    window
+        .update(cx, |view, window, cx| {
+            view.start_login("openrouter", window, cx)
+        })
+        .unwrap();
+    assert_eq!(dialog_kind(cx), "login");
+    let login_url = |cx: &mut TestAppContext| {
+        window
+            .update(cx, |view, _, _| view.login_state().and_then(|(url, _)| url))
+            .unwrap()
+    };
+    wait_until(cx, |cx| login_url(cx).is_some());
+    let url = login_url(cx).unwrap();
+    assert!(url.starts_with("https://openrouter.ai/auth?"), "{url}");
+    // The callback the browser would be sent to: http://localhost:<port>/<path>.
+    let callback = url
+        .split(['?', '&'])
+        .find_map(|pair| pair.strip_prefix("callback_url="))
+        .unwrap()
+        .replace("%3A", ":")
+        .replace("%2F", "/");
+    let (port, path) = callback
+        .strip_prefix("http://localhost:")
+        .and_then(|rest| rest.split_once('/'))
+        .unwrap();
+    let (port, path): (u16, String) = (port.parse().unwrap(), format!("/{path}"));
+    {
+        use std::io::{Read as _, Write as _};
+        let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        write!(
+            stream,
+            "GET {path}?error=access_denied HTTP/1.1\r\nhost: localhost\r\n\r\n"
+        )
+        .unwrap();
+        let mut reply = String::new();
+        let _ = stream.read_to_string(&mut reply);
+        assert!(reply.starts_with("HTTP/1.1 400"), "{reply}");
+    }
+    let login_error = |cx: &mut TestAppContext| {
+        window
+            .update(cx, |view, _, _| {
+                view.login_state().and_then(|(_, error)| error)
+            })
+            .unwrap()
+    };
+    wait_until(cx, |cx| login_error(cx).is_some());
+    assert!(login_error(cx).unwrap().contains("access_denied"));
+    window
+        .update(cx, |view, _, cx| view.close_dialog(cx))
+        .unwrap();
+
+    // A stored sign-in counts as configured until signing out.
+    let models = cx.update(|cx| cx.global::<AppModels>().models.clone());
+    cx.update(|cx| {
+        cx.global::<AppModels>()
+            .credentials
+            .set_credential(
+                "openai-codex",
+                &zp_ai::Credential::OAuth(zp_ai::OAuthCredential::new("t", "r", 3600.0, 0)),
+            )
+            .unwrap()
+    });
+    assert!(models.is_signed_in("openai-codex"));
+    let configured = window
+        .update(cx, |view, _, cx| view.configured_providers(cx))
+        .unwrap();
+    assert!(configured.contains(&"openai-codex".to_owned()));
+    window
+        .update(cx, |view, _, cx| view.sign_out("openai-codex", cx))
+        .unwrap();
+    assert!(!models.is_signed_in("openai-codex"));
 }

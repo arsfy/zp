@@ -1,13 +1,14 @@
 //! Unified LLM layer for ZP.
 //!
-//! - [`Models`] holds [`Provider`]s, resolves API keys and routes requests.
+//! - [`Models`] holds [`Provider`]s, resolves credentials (API keys or OAuth sign-ins, see
+//!   [`oauth`]) and routes requests.
 //! - [`Model`] describes a model: protocol, limits, pricing and reasoning support.
 //! - [`Context`] / [`Message`] describe the conversation sent to a model.
 //! - Responses stream as [`AssistantMessageEvent`]s ending in `Done` or `Error`;
 //!   [`StreamAccumulator`] folds them into the partial message.
 //!
-//! Supported protocols: Anthropic Messages and OpenAI Chat Completions (and compatible
-//! APIs). [`FauxProvider`] replays scripted responses for tests.
+//! Supported protocols: Anthropic Messages, OpenAI Chat Completions (and compatible
+//! APIs), the OpenAI Responses API and its ChatGPT Codex variant. [`FauxProvider`] replays scripted responses for tests.
 //!
 //! Model catalogs are compiled in and can be refreshed at runtime from models.dev and
 //! from each configured provider's model list; see [`sync`].
@@ -20,6 +21,7 @@ mod faux;
 mod http;
 mod model;
 mod models;
+pub mod oauth;
 mod options;
 pub mod partial_json;
 mod provider;
@@ -29,7 +31,8 @@ mod transform;
 mod types;
 
 pub use auth::{
-    AuthSource, CredentialStore, EnvLookup, MemoryCredentialStore, ResolvedAuth, process_env,
+    AuthSource, Credential, CredentialStore, EnvLookup, MemoryCredentialStore, OAuthCredential,
+    RequestAuth, ResolvedAuth, process_env,
 };
 pub use catalog::builtin_providers;
 pub use event::{

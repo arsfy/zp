@@ -8,6 +8,7 @@ use tokio_util::sync::CancellationToken;
 use crate::api;
 use crate::event::{AssistantMessageStream, error_stream};
 use crate::model::{Api, Model};
+use crate::oauth::OAuthFlow;
 use crate::options::StreamOptions;
 use crate::sync::{SyncError, UpstreamModel, list_upstream_models};
 use crate::types::{AssistantMessage, Context};
@@ -29,9 +30,19 @@ pub trait Provider: Send + Sync {
         &[]
     }
 
-    /// Whether requests need an API key.
+    /// Whether requests need a credential (an API key or a sign-in).
     fn requires_api_key(&self) -> bool {
         true
+    }
+
+    /// Whether an API key can be entered (`false` for sign-in-only providers).
+    fn accepts_api_key(&self) -> bool {
+        true
+    }
+
+    /// Signing in with the provider's account instead of an API key, if supported.
+    fn oauth(&self) -> Option<Arc<dyn OAuthFlow>> {
+        None
     }
 
     /// Model used when none is specified.
@@ -85,6 +96,8 @@ pub struct HttpProvider {
     endpoint: Option<(Api, String)>,
     models_dev_id: Option<String>,
     models: Arc<[Model]>,
+    oauth: Option<Arc<dyn OAuthFlow>>,
+    accepts_api_key: bool,
 }
 
 impl HttpProvider {
@@ -112,7 +125,21 @@ impl HttpProvider {
             endpoint: None,
             models_dev_id: None,
             models: models.into(),
+            oauth: None,
+            accepts_api_key: true,
         }
+    }
+
+    /// Lets users sign in with `flow` instead of entering an API key.
+    pub fn with_oauth(mut self, flow: Arc<dyn OAuthFlow>) -> Self {
+        self.oauth = Some(flow);
+        self
+    }
+
+    /// Only signing in is possible (no API keys).
+    pub fn oauth_only(mut self) -> Self {
+        self.accepts_api_key = false;
+        self
     }
 
     /// Sets the default model id.
@@ -165,6 +192,14 @@ impl Provider for HttpProvider {
         self.default_model.as_deref()
     }
 
+    fn accepts_api_key(&self) -> bool {
+        self.accepts_api_key
+    }
+
+    fn oauth(&self) -> Option<Arc<dyn OAuthFlow>> {
+        self.oauth.clone()
+    }
+
     fn api_endpoint(&self) -> Option<(Api, &str)> {
         self.endpoint
             .as_ref()
@@ -187,6 +222,9 @@ impl Provider for HttpProvider {
             }
             Api::OpenAiCompletions => {
                 api::openai_completions::stream(model.clone(), context.clone(), options)
+            }
+            Api::OpenAiResponses | Api::OpenAiCodexResponses => {
+                api::openai_responses::stream(model.clone(), context.clone(), options)
             }
             Api::Faux => error_stream(
                 AssistantMessage::empty(model.api.as_str(), &model.provider, &model.id),

@@ -45,6 +45,9 @@ async fn run(model: Model, context: Context, options: StreamOptions, mut sink: E
     {
         headers.push(("x-session-id", session_id));
     }
+    if model.provider == "github-copilot" {
+        headers.extend(super::github_copilot_headers(&context));
+    }
     headers.extend(model.headers.iter().map(|(k, v)| (k.as_str(), v.as_str())));
     headers.extend(
         options

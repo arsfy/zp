@@ -47,7 +47,7 @@ enum Command {
     Providers,
     /// Refresh model catalogs from models.dev and the configured providers' model lists.
     Sync(SyncArgs),
-    /// Manage API keys stored in the system keychain.
+    /// Sign in to providers, or manage API keys stored in the system keychain.
     Auth {
         #[command(subcommand)]
         action: AuthCommand,
@@ -64,12 +64,19 @@ enum Command {
 
 #[derive(Subcommand)]
 enum AuthCommand {
+    /// Sign in to a provider with your account (e.g. `anthropic` for Claude Pro/Max,
+    /// `openai-codex` for ChatGPT Plus/Pro, `github-copilot`).
+    Login {
+        /// Provider id (see `zp-cli providers`).
+        provider: String,
+    },
     /// Store the API key of a provider (read from stdin).
     Set {
         /// Provider id, e.g. `deepseek` (see `zp-cli providers`).
         provider: String,
     },
-    /// Delete the stored API key of a provider.
+    /// Delete the stored API key or sign-in of a provider.
+    #[command(alias = "logout")]
     Remove { provider: String },
 }
 
@@ -129,6 +136,15 @@ async fn main() -> Result<()> {
             Ok(())
         }
         Command::Mcp { cwd } => list_mcp(cwd.as_deref(), data_dir.as_deref()).await,
+        Command::Auth {
+            action: AuthCommand::Login { provider },
+        } => {
+            login(&models, data_dir.as_deref(), &provider).await?;
+            if let Some(cache) = &cache {
+                cache.clear_upstream(&models, &provider)?;
+            }
+            Ok(())
+        }
         Command::Auth { action } => auth(&models, &credentials, cache.as_ref(), action),
         Command::Sync(args) => {
             let cache = cache.context("no data directory for the model cache")?;
@@ -226,13 +242,22 @@ fn auth(
     action: AuthCommand,
 ) -> Result<()> {
     let provider = match &action {
-        AuthCommand::Set { provider } | AuthCommand::Remove { provider } => provider.clone(),
+        AuthCommand::Set { provider }
+        | AuthCommand::Remove { provider }
+        | AuthCommand::Login { provider } => provider.clone(),
     };
     if models.provider(&provider).is_none() {
         bail!("unknown provider `{provider}` (see `zp-cli providers`)");
     }
     match action {
+        AuthCommand::Login { .. } => unreachable!("handled by `login`"),
         AuthCommand::Set { .. } => {
+            if models
+                .provider(&provider)
+                .is_some_and(|p| !p.accepts_api_key())
+            {
+                bail!("{provider} does not take API keys; use `zp-cli auth login {provider}`");
+            }
             if std::io::stdin().is_terminal() {
                 eprint!("API key for {provider}: ");
             }
@@ -243,13 +268,80 @@ fn auth(
         }
         AuthCommand::Remove { .. } => {
             credentials.remove(&provider)?;
-            eprintln!("Removed the key of {provider}.");
+            eprintln!("Removed the key or sign-in of {provider}.");
         }
     }
     // The model list depends on the key.
     if let Some(cache) = cache {
         cache.clear_upstream(models, &provider)?;
     }
+    Ok(())
+}
+
+/// Opens `url` in the default browser (best effort).
+fn open_browser(url: &str) {
+    let command = if cfg!(target_os = "macos") {
+        "open"
+    } else if cfg!(windows) {
+        "explorer"
+    } else {
+        "xdg-open"
+    };
+    let _ = std::process::Command::new(command)
+        .arg(url)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+}
+
+/// Signs in to `provider` in the browser (or with a device code), reading a pasted
+/// redirect URL from stdin when the browser cannot reach this machine.
+async fn login(models: &Models, data_dir: Option<&std::path::Path>, provider: &str) -> Result<()> {
+    use zp_ai::oauth::{LoginEvent, LoginInteraction, LoginOptions};
+    let flow = models.oauth_flow(provider).with_context(|| {
+        format!("{provider} does not support signing in (see `zp-cli providers`)")
+    })?;
+    let options = LoginOptions {
+        device_id: data_dir.and_then(|dir| zp_core::paths::device_id(dir).ok()),
+        agent_name: None,
+    };
+    let cancel = zp_ai::CancellationToken::new();
+    let (interaction, input) = LoginInteraction::new(
+        cancel.clone(),
+        |event| match event {
+            LoginEvent::AuthUrl { url, instructions } => {
+                eprintln!("{instructions}\n\n  {url}\n");
+                open_browser(&url);
+            }
+            LoginEvent::DeviceCode {
+                user_code,
+                verification_uri,
+            } => {
+                eprintln!("Open {verification_uri} and enter the code: {user_code}\n");
+                open_browser(&verification_uri);
+            }
+            LoginEvent::Progress(message) => eprintln!("{message}"),
+        },
+        options,
+    );
+    // Pasted lines go to the login (ignored by device-code flows).
+    std::thread::spawn(move || {
+        for line in std::io::stdin().lines().map_while(Result::ok) {
+            if !input.submit(line) {
+                break;
+            }
+        }
+    });
+    eprintln!("Signing in: {}", flow.name());
+    let login = models.login(provider, interaction);
+    tokio::select! {
+        result = login => result.map_err(anyhow::Error::msg)?,
+        _ = tokio::signal::ctrl_c() => {
+            cancel.cancel();
+            bail!("login cancelled");
+        }
+    }
+    eprintln!("Signed in to {provider}.");
     Ok(())
 }
 
@@ -409,7 +501,13 @@ fn list_providers(models: &Models) {
     for provider in models.providers() {
         let auth = match models.resolve_auth(provider.id()) {
             Some(auth) => format!("ok ({})", auth.source),
-            None => format!("missing ({})", provider.api_key_env_vars().join(" / ")),
+            None => {
+                let mut ways = provider.api_key_env_vars().to_vec();
+                if provider.oauth().is_some() {
+                    ways.push("auth login".to_owned());
+                }
+                format!("missing ({})", ways.join(" / "))
+            }
         };
         rows.push([
             provider.id().to_owned(),

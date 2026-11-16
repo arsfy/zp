@@ -1,22 +1,155 @@
-//! API key resolution.
+//! Credentials and their resolution.
 //!
-//! Order: an explicit key on the request, then the credential store, then the provider's
-//! environment variables.
+//! A provider is authenticated by a stored [`Credential`] — an API key or an OAuth token
+//! obtained by signing in (see [`crate::oauth`]) — or by an API key in one of its
+//! environment variables. Stored credentials win over the environment.
 
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::{Arc, RwLock};
 
-/// Source of stored API keys (e.g. the system keychain, added in a later milestone).
+use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
+
+use crate::types::now_ms;
+
+/// Tokens obtained by signing in to a provider.
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+pub struct OAuthCredential {
+    /// Access token sent with requests.
+    pub access: String,
+    /// Refresh token (empty when the provider issues long-lived tokens).
+    #[serde(default)]
+    pub refresh: String,
+    /// When `access` expires, in milliseconds since the epoch (already reduced by a safety
+    /// margin).
+    pub expires: i64,
+    /// Provider-specific data (account id, enterprise domain, issued client id…).
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
+}
+
+impl OAuthCredential {
+    /// A credential expiring `expires_in` seconds from now, minus `margin_ms`.
+    pub fn new(
+        access: impl Into<String>,
+        refresh: impl Into<String>,
+        expires_in: f64,
+        margin_ms: i64,
+    ) -> Self {
+        Self {
+            access: access.into(),
+            refresh: refresh.into(),
+            expires: now_ms() + (expires_in * 1000.0) as i64 - margin_ms,
+            extra: Map::new(),
+        }
+    }
+
+    /// Whether the access token has expired.
+    pub fn is_expired(&self) -> bool {
+        now_ms() >= self.expires
+    }
+
+    /// A string from the provider-specific data.
+    pub fn extra_str(&self, key: &str) -> Option<&str> {
+        self.extra
+            .get(key)
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+    }
+
+    /// Sets provider-specific data.
+    pub fn with_extra(mut self, key: &str, value: impl Into<Value>) -> Self {
+        self.extra.insert(key.to_owned(), value.into());
+        self
+    }
+}
+
+impl fmt::Debug for OAuthCredential {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("OAuthCredential")
+            .field("expires", &self.expires)
+            .field("extra", &self.extra.keys().collect::<Vec<_>>())
+            .finish_non_exhaustive()
+    }
+}
+
+/// A stored credential.
+#[derive(Clone, PartialEq)]
+pub enum Credential {
+    /// An API key.
+    ApiKey(String),
+    /// Tokens from signing in.
+    OAuth(OAuthCredential),
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum Encoded {
+    #[serde(rename = "oauth")]
+    OAuth(OAuthCredential),
+}
+
+impl Credential {
+    /// The text kept in a secret store: an API key as is, OAuth tokens as JSON.
+    pub fn encode(&self) -> String {
+        match self {
+            Self::ApiKey(key) => key.clone(),
+            Self::OAuth(credential) => {
+                serde_json::to_string(&Encoded::OAuth(credential.clone())).unwrap_or_default()
+            }
+        }
+    }
+
+    /// Reads [`Self::encode`]'s output (plain text is an API key).
+    pub fn decode(text: &str) -> Self {
+        if text.trim_start().starts_with('{')
+            && let Ok(Encoded::OAuth(credential)) = serde_json::from_str(text)
+        {
+            return Self::OAuth(credential);
+        }
+        Self::ApiKey(text.to_owned())
+    }
+
+    /// Whether this is an OAuth credential.
+    pub fn is_oauth(&self) -> bool {
+        matches!(self, Self::OAuth(_))
+    }
+}
+
+impl fmt::Debug for Credential {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ApiKey(_) => f.write_str("ApiKey(<redacted>)"),
+            Self::OAuth(credential) => credential.fmt(f),
+        }
+    }
+}
+
+/// Source of stored credentials (e.g. the system keychain).
 pub trait CredentialStore: Send + Sync {
-    /// Returns the stored key for `provider`, if any.
-    fn api_key(&self, provider: &str) -> Option<String>;
+    /// The stored credential of `provider`, if any.
+    fn credential(&self, provider: &str) -> Option<Credential>;
+
+    /// Stores `credential` for `provider` (refreshed OAuth tokens are written back).
+    fn store(&self, provider: &str, credential: &Credential) -> Result<(), String> {
+        let _ = (provider, credential);
+        Err("this credential store is read-only".into())
+    }
+
+    /// The stored API key of `provider` (not OAuth tokens).
+    fn api_key(&self, provider: &str) -> Option<String> {
+        match self.credential(provider)? {
+            Credential::ApiKey(key) => Some(key),
+            Credential::OAuth(_) => None,
+        }
+    }
 }
 
 /// In-memory credential store.
 #[derive(Default)]
 pub struct MemoryCredentialStore {
-    keys: RwLock<HashMap<String, String>>,
+    credentials: RwLock<HashMap<String, Credential>>,
 }
 
 impl MemoryCredentialStore {
@@ -25,24 +158,34 @@ impl MemoryCredentialStore {
         Self::default()
     }
 
-    /// Stores `key` for `provider`.
+    /// Stores API key `key` for `provider`.
     pub fn set(&self, provider: impl Into<String>, key: impl Into<String>) {
-        if let Ok(mut keys) = self.keys.write() {
-            keys.insert(provider.into(), key.into());
+        self.set_credential(provider, Credential::ApiKey(key.into()));
+    }
+
+    /// Stores `credential` for `provider`.
+    pub fn set_credential(&self, provider: impl Into<String>, credential: Credential) {
+        if let Ok(mut credentials) = self.credentials.write() {
+            credentials.insert(provider.into(), credential);
         }
     }
 
-    /// Removes the key for `provider`.
+    /// Removes the credential of `provider`.
     pub fn remove(&self, provider: &str) {
-        if let Ok(mut keys) = self.keys.write() {
-            keys.remove(provider);
+        if let Ok(mut credentials) = self.credentials.write() {
+            credentials.remove(provider);
         }
     }
 }
 
 impl CredentialStore for MemoryCredentialStore {
-    fn api_key(&self, provider: &str) -> Option<String> {
-        self.keys.read().ok()?.get(provider).cloned()
+    fn credential(&self, provider: &str) -> Option<Credential> {
+        self.credentials.read().ok()?.get(provider).cloned()
+    }
+
+    fn store(&self, provider: &str, credential: &Credential) -> Result<(), String> {
+        self.set_credential(provider, credential.clone());
+        Ok(())
     }
 }
 
@@ -58,13 +201,15 @@ pub fn process_env() -> EnvLookup {
     })
 }
 
-/// Where a resolved key came from.
+/// Where a resolved credential came from.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AuthSource {
     /// Passed explicitly with the request.
     Explicit,
-    /// Read from the credential store.
+    /// An API key from the credential store.
     Stored,
+    /// Tokens from signing in, in the credential store.
+    OAuth,
     /// Read from the named environment variable.
     Env(String),
     /// The provider does not need a key.
@@ -76,6 +221,7 @@ impl fmt::Display for AuthSource {
         match self {
             Self::Explicit => f.write_str("explicit key"),
             Self::Stored => f.write_str("stored credential"),
+            Self::OAuth => f.write_str("signed in"),
             Self::Env(name) => f.write_str(name),
             Self::NotRequired => f.write_str("no key required"),
         }
@@ -85,7 +231,7 @@ impl fmt::Display for AuthSource {
 /// A resolved credential.
 #[derive(Clone, PartialEq, Eq)]
 pub struct ResolvedAuth {
-    /// The key, absent for providers that need none.
+    /// The key (or current access token), absent for providers that need none.
     pub api_key: Option<String>,
     /// Where it came from.
     pub source: AuthSource,
@@ -97,5 +243,64 @@ impl fmt::Debug for ResolvedAuth {
             .field("api_key", &self.api_key.as_ref().map(|_| "<redacted>"))
             .field("source", &self.source)
             .finish()
+    }
+}
+
+/// What a request is authenticated with.
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct RequestAuth {
+    /// Sent the protocol's usual way (`x-api-key` or `Authorization: Bearer`).
+    pub api_key: Option<String>,
+    /// Extra headers (they override model headers).
+    pub headers: HashMap<String, String>,
+    /// Replaces the model's base URL (e.g. a per-account endpoint).
+    pub base_url: Option<String>,
+}
+
+impl fmt::Debug for RequestAuth {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RequestAuth")
+            .field("api_key", &self.api_key.as_ref().map(|_| "<redacted>"))
+            .field("headers", &self.headers.keys().collect::<Vec<_>>())
+            .field("base_url", &self.base_url)
+            .finish()
+    }
+}
+
+impl RequestAuth {
+    /// Authenticates with `key` only.
+    pub fn api_key(key: impl Into<String>) -> Self {
+        Self {
+            api_key: Some(key.into()),
+            ..Self::default()
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn credentials_round_trip_through_their_encoding() {
+        let key = Credential::ApiKey("sk-test".into());
+        assert_eq!(key.encode(), "sk-test");
+        assert_eq!(Credential::decode("sk-test"), key);
+
+        let oauth = Credential::OAuth(
+            OAuthCredential::new("access", "refresh", 3600.0, 0).with_extra("accountId", "acc"),
+        );
+        let text = oauth.encode();
+        assert!(text.contains("\"type\":\"oauth\""), "{text}");
+        let decoded = Credential::decode(&text);
+        assert_eq!(decoded, oauth);
+        let Credential::OAuth(decoded) = decoded else {
+            unreachable!()
+        };
+        assert_eq!(decoded.extra_str("accountId"), Some("acc"));
+        assert!(!decoded.is_expired());
+
+        // A key that happens to look like JSON stays a key.
+        assert!(!Credential::decode("{not json").is_oauth());
     }
 }

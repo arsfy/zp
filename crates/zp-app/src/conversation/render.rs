@@ -850,10 +850,26 @@ impl ConversationView {
                 })
                 .when_some(self.render_completion(cx), |this, menu| this.child(menu))
                 .when_some(self.needs_key(cx), |this, provider| {
-                    let name = cx
+                    let registered = cx
                         .try_global::<crate::store::AppModels>()
-                        .and_then(|app| app.models.provider(&provider))
+                        .and_then(|app| app.models.provider(&provider));
+                    let name = registered
+                        .as_ref()
                         .map_or_else(|| provider.clone(), |p| p.name().to_owned());
+                    let (message, action) = match registered.as_ref().map(|p| (p.oauth().is_some(), p.accepts_api_key())) {
+                        Some((true, true)) => (
+                            format!("{name} needs a sign-in or an API key before ZP can send this message. Connect it, or pick another model."),
+                            "Connect…",
+                        ),
+                        Some((true, false)) => (
+                            format!("Sign in to {name} before ZP can send this message, or pick another model."),
+                            "Sign In…",
+                        ),
+                        _ => (
+                            format!("{name} needs an API key before ZP can send this message. Add one, or pick another model."),
+                            "Add API Key…",
+                        ),
+                    };
                     this.child(
                         div()
                             .flex()
@@ -865,13 +881,9 @@ impl ConversationView {
                             .border_1()
                             .border_color(colors.warning)
                             .text_size(px(12.))
+                            .child(div().flex_1().child(message))
                             .child(
-                                div()
-                                    .flex_1()
-                                    .child(format!("{name} needs an API key before ZP can send this message. Add one, or pick another model.")),
-                            )
-                            .child(
-                                ghost_button("add-api-key", "Add API Key…", cx)
+                                ghost_button("add-api-key", action, cx)
                                     .text_color(colors.accent)
                                     .on_click(cx.listener(move |this, _, _, cx| {
                                         this.add_api_key(Some(provider.clone()), cx)

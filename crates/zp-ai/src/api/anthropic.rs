@@ -16,6 +16,52 @@ use crate::types::{
 
 pub(crate) const API_VERSION: &str = "2023-06-01";
 const INTERLEAVED_THINKING_BETA: &str = "interleaved-thinking-2025-05-14";
+/// Betas a Claude Pro/Max sign-in needs.
+pub(crate) const OAUTH_BETAS: &str = "claude-code-20250219,oauth-2025-04-20";
+/// Requests with a Claude sign-in present themselves as Claude Code.
+const CLAUDE_CODE_VERSION: &str = "2.1.322";
+const CLAUDE_CODE_IDENTITY: &str = "You are Claude Code, Anthropic's official CLI for Claude.";
+/// Claude Code's tool names; tools matching one case-insensitively use its casing.
+const CLAUDE_CODE_TOOLS: [&str; 17] = [
+    "Read",
+    "Write",
+    "Edit",
+    "Bash",
+    "Grep",
+    "Glob",
+    "AskUserQuestion",
+    "EnterPlanMode",
+    "ExitPlanMode",
+    "KillShell",
+    "NotebookEdit",
+    "Skill",
+    "Task",
+    "TaskOutput",
+    "TodoWrite",
+    "WebFetch",
+    "WebSearch",
+];
+
+/// Whether `key` is an access token from a Claude sign-in rather than an API key.
+pub(crate) fn is_oauth_token(key: &str) -> bool {
+    key.contains("sk-ant-oat")
+}
+
+fn to_claude_code_name(name: &str) -> String {
+    CLAUDE_CODE_TOOLS
+        .iter()
+        .find(|tool| tool.eq_ignore_ascii_case(name))
+        .map_or_else(|| name.to_owned(), |tool| (*tool).to_owned())
+}
+
+/// Maps a tool name from the response back to the declared tool.
+fn from_claude_code_name(name: &str, tools: &[String]) -> String {
+    tools
+        .iter()
+        .find(|tool| tool.eq_ignore_ascii_case(name))
+        .cloned()
+        .unwrap_or_else(|| name.to_owned())
+}
 /// Output tokens always left for the answer when a thinking budget shares `max_tokens`.
 const MIN_ANSWER_TOKENS: u64 = 1024;
 
@@ -30,15 +76,38 @@ pub(crate) fn stream(
 }
 
 async fn run(model: Model, context: Context, options: StreamOptions, mut sink: EventSink) {
-    let request = build_request(&model, &context, &options);
-    let url = format!("{}/v1/messages", model.base_url.trim_end_matches('/'));
     let api_key = options.api_key.clone().unwrap_or_default();
-    let mut headers: Vec<(&str, &str)> = vec![
-        ("x-api-key", api_key.as_str()),
-        ("anthropic-version", API_VERSION),
-    ];
+    let oauth = is_oauth_token(&api_key);
+    let copilot = model.provider == "github-copilot";
+    let request = build_request_for(&model, &context, &options, oauth);
+    let url = format!("{}/v1/messages", model.base_url.trim_end_matches('/'));
+    let bearer = format!("Bearer {api_key}");
+    let mut headers: Vec<(&str, &str)> = vec![("anthropic-version", API_VERSION)];
+    let mut betas: Vec<&str> = Vec::new();
+    if oauth {
+        headers.extend([
+            ("authorization", bearer.as_str()),
+            ("accept", "application/json"),
+            ("anthropic-dangerous-direct-browser-access", "true"),
+            ("x-app", "cli"),
+        ]);
+        betas.push(OAUTH_BETAS);
+    } else if copilot {
+        headers.push(("authorization", bearer.as_str()));
+        headers.extend(super::github_copilot_headers(&context));
+    } else {
+        headers.push(("x-api-key", api_key.as_str()));
+    }
     if request.interleaved_thinking {
-        headers.push(("anthropic-beta", INTERLEAVED_THINKING_BETA));
+        betas.push(INTERLEAVED_THINKING_BETA);
+    }
+    let betas = betas.join(",");
+    if !betas.is_empty() {
+        headers.push(("anthropic-beta", betas.as_str()));
+    }
+    let user_agent = format!("claude-cli/{CLAUDE_CODE_VERSION}");
+    if oauth {
+        headers.push(("user-agent", user_agent.as_str()));
     }
     headers.extend(model.headers.iter().map(|(k, v)| (k.as_str(), v.as_str())));
     headers.extend(
@@ -64,6 +133,9 @@ async fn run(model: Model, context: Context, options: StreamOptions, mut sink: E
     let skeleton = sink.message().clone();
     sink.emit(AssistantMessageEvent::Start { message: skeleton });
     let mut decoder = Decoder::new(&model);
+    if oauth {
+        decoder.tool_names = context.tools.iter().map(|t| t.name.clone()).collect();
+    }
     let result = http::drive_sse(response, &options.cancel, |event| {
         decoder.handle(event.event.as_deref(), &event.data, &mut sink)
     })
@@ -117,7 +189,18 @@ fn effort(model: &Model, level: ThinkingLevel) -> String {
 }
 
 /// Builds the request body. Pure, for testing.
+#[cfg(test)]
 pub(crate) fn build_request(model: &Model, context: &Context, options: &StreamOptions) -> Request {
+    build_request_for(model, context, options, false)
+}
+
+/// Builds the request body; with `oauth` (a Claude sign-in) as Claude Code would.
+pub(crate) fn build_request_for(
+    model: &Model,
+    context: &Context,
+    options: &StreamOptions,
+    oauth: bool,
+) -> Request {
     let cache_control = json!({"type": "ephemeral"});
     let compat = &model.compat;
     let level = if model.reasoning {
@@ -138,7 +221,16 @@ pub(crate) fn build_request(model: &Model, context: &Context, options: &StreamOp
     body.insert("model".into(), Value::from(model.id.clone()));
     body.insert("stream".into(), Value::Bool(true));
 
-    if let Some(system) = context.system_prompt.as_deref().filter(|s| !s.is_empty()) {
+    let system = context.system_prompt.as_deref().filter(|s| !s.is_empty());
+    if oauth {
+        let mut blocks = vec![
+            json!({"type": "text", "text": CLAUDE_CODE_IDENTITY, "cache_control": cache_control}),
+        ];
+        if let Some(system) = system {
+            blocks.push(json!({"type": "text", "text": system, "cache_control": cache_control}));
+        }
+        body.insert("system".into(), Value::Array(blocks));
+    } else if let Some(system) = system {
         body.insert(
             "system".into(),
             json!([{"type": "text", "text": system, "cache_control": cache_control}]),
@@ -191,8 +283,13 @@ pub(crate) fn build_request(model: &Model, context: &Context, options: &StreamOp
             .iter()
             .enumerate()
             .map(|(index, tool)| {
+                let name = if oauth {
+                    to_claude_code_name(&tool.name)
+                } else {
+                    tool.name.clone()
+                };
                 let mut definition = json!({
-                    "name": tool.name,
+                    "name": name,
                     "description": tool.description,
                     "input_schema": object_schema(&tool.parameters),
                 });
@@ -209,7 +306,8 @@ pub(crate) fn build_request(model: &Model, context: &Context, options: &StreamOp
     }
 
     let messages = prepare_messages(&context.messages, model, normalize_tool_call_id);
-    let mut converted = convert_messages(&messages, compat.allow_empty_signature == Some(true));
+    let mut converted =
+        convert_messages(&messages, compat.allow_empty_signature == Some(true), oauth);
     add_cache_control_to_last_user_message(&mut converted, &cache_control);
     body.insert("messages".into(), Value::Array(converted));
 
@@ -250,7 +348,7 @@ fn tool_result_content(content: &[UserContent]) -> Value {
     Value::Array(blocks)
 }
 
-fn convert_messages(messages: &[Message], allow_empty_signature: bool) -> Vec<Value> {
+fn convert_messages(messages: &[Message], allow_empty_signature: bool, oauth: bool) -> Vec<Value> {
     let mut output: Vec<Value> = Vec::new();
     let mut index = 0;
     while index < messages.len() {
@@ -293,7 +391,7 @@ fn convert_messages(messages: &[Message], allow_empty_signature: bool) -> Vec<Va
                         AssistantContent::ToolCall(call) => blocks.push(json!({
                             "type": "tool_use",
                             "id": call.id,
-                            "name": call.name,
+                            "name": if oauth { to_claude_code_name(&call.name) } else { call.name.clone() },
                             "input": if call.arguments.is_object() { call.arguments.clone() } else { json!({}) },
                         })),
                     }
@@ -365,6 +463,8 @@ enum OpenBlock {
 /// Turns Anthropic SSE events into ZP events.
 pub(crate) struct Decoder<'a> {
     model: &'a Model,
+    /// Declared tool names, to undo Claude Code casing (Claude sign-in only).
+    tool_names: Vec<String>,
     blocks: HashMap<u64, OpenBlock>,
     stop_reason: Option<StopReason>,
     error: Option<String>,
@@ -376,6 +476,7 @@ impl<'a> Decoder<'a> {
     pub(crate) fn new(model: &'a Model) -> Self {
         Self {
             model,
+            tool_names: Vec::new(),
             blocks: HashMap::new(),
             stop_reason: None,
             error: None,
@@ -524,7 +625,12 @@ impl<'a> Decoder<'a> {
             }
             "tool_use" => {
                 let id = block["id"].as_str().unwrap_or_default().to_owned();
-                let name = block["name"].as_str().unwrap_or_default().to_owned();
+                let name = block["name"].as_str().unwrap_or_default();
+                let name = if self.tool_names.is_empty() {
+                    name.to_owned()
+                } else {
+                    from_claude_code_name(name, &self.tool_names)
+                };
                 sink.emit(AssistantMessageEvent::ToolCallStart {
                     index,
                     id: id.clone(),

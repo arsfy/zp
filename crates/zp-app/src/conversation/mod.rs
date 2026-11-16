@@ -1165,7 +1165,8 @@ impl ConversationView {
         cx.notify();
     }
 
-    /// Opens Settings → Providers with the key field of `provider`.
+    /// Opens Settings → Providers to sign in to `provider` or enter its key (or to add a
+    /// provider).
     pub(crate) fn add_api_key(&mut self, provider: Option<String>, cx: &mut Context<Self>) {
         let Some(window) =
             crate::settings::SettingsWindow::open_at(crate::settings::Page::Providers, cx)
@@ -1173,7 +1174,7 @@ impl ConversationView {
             return;
         };
         let _ = window.update(cx, |view, window, cx| match provider {
-            Some(provider) => view.edit_key(&provider, window, cx),
+            Some(provider) => view.choose_provider(&provider, window, cx),
             None => view.open_add_dialog(window, cx),
         });
     }

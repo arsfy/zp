@@ -5,6 +5,7 @@
 use std::sync::Arc;
 
 use crate::model::{Api, Model};
+use crate::oauth::builtin_flow;
 use crate::provider::{HttpProvider, Provider};
 
 struct BuiltinProvider {
@@ -16,91 +17,195 @@ struct BuiltinProvider {
     api: Api,
     base_url: &'static str,
     /// Matching provider on models.dev.
+    models_dev_id: Option<&'static str>,
+    /// Whether the endpoint lists models (`/models`).
+    lists_models: bool,
+    /// Signing in is supported (see [`crate::oauth::builtin_flow`]).
+    oauth: bool,
+    /// API keys are accepted (`false`: signing in only).
+    api_key: bool,
+    catalog: &'static str,
+}
+
+/// An API-key provider listed on models.dev.
+#[allow(clippy::too_many_arguments)]
+const fn keyed(
+    id: &'static str,
+    name: &'static str,
+    env_vars: &'static [&'static str],
+    default_model: &'static str,
+    api: Api,
+    base_url: &'static str,
     models_dev_id: &'static str,
     catalog: &'static str,
+) -> BuiltinProvider {
+    BuiltinProvider {
+        id,
+        name,
+        env_vars,
+        default_model,
+        api,
+        base_url,
+        models_dev_id: Some(models_dev_id),
+        lists_models: true,
+        oauth: false,
+        api_key: true,
+        catalog,
+    }
 }
 
 const BUILTIN_PROVIDERS: &[BuiltinProvider] = &[
     BuiltinProvider {
-        id: "anthropic",
-        name: "Anthropic",
-        env_vars: &["ANTHROPIC_API_KEY"],
-        default_model: "claude-sonnet-5-5",
-        api: Api::AnthropicMessages,
-        base_url: "https://api.anthropic.com",
-        models_dev_id: "anthropic",
-        catalog: include_str!("../catalog/anthropic.json"),
+        oauth: true,
+        ..keyed(
+            "anthropic",
+            "Anthropic",
+            &["ANTHROPIC_API_KEY"],
+            "claude-sonnet-5-5",
+            Api::AnthropicMessages,
+            "https://api.anthropic.com",
+            "anthropic",
+            include_str!("../catalog/anthropic.json"),
+        )
     },
     BuiltinProvider {
-        id: "openrouter",
-        name: "OpenRouter",
-        env_vars: &["OPENROUTER_API_KEY"],
-        default_model: "anthropic/claude-sonnet-5.5",
-        api: Api::OpenAiCompletions,
-        base_url: "https://openrouter.ai/api/v1",
-        models_dev_id: "openrouter",
-        catalog: include_str!("../catalog/openrouter.json"),
+        oauth: true,
+        ..keyed(
+            "openai",
+            "OpenAI",
+            &["OPENAI_API_KEY"],
+            "gpt-6.1-sol",
+            Api::OpenAiResponses,
+            "https://api.openai.com/v1",
+            "openai",
+            include_str!("../catalog/openai.json"),
+        )
     },
     BuiltinProvider {
-        id: "deepseek",
-        name: "DeepSeek",
-        env_vars: &["DEEPSEEK_API_KEY"],
-        default_model: "deepseek-v4-pro",
-        api: Api::OpenAiCompletions,
-        base_url: "https://api.deepseek.com",
-        models_dev_id: "deepseek",
-        catalog: include_str!("../catalog/deepseek.json"),
+        id: "openai-codex",
+        name: "OpenAI Codex (ChatGPT Plus/Pro)",
+        env_vars: &[],
+        default_model: "gpt-6.1-sol",
+        api: Api::OpenAiCodexResponses,
+        base_url: "https://chatgpt.com/backend-api",
+        models_dev_id: None,
+        lists_models: false,
+        oauth: true,
+        api_key: false,
+        catalog: include_str!("../catalog/openai-codex.json"),
     },
     BuiltinProvider {
-        id: "moonshotai",
-        name: "Moonshot AI",
-        env_vars: &["MOONSHOT_API_KEY"],
-        default_model: "kimi-k3",
+        id: "github-copilot",
+        name: "GitHub Copilot",
+        env_vars: &["COPILOT_GITHUB_TOKEN"],
+        default_model: "gpt-6.1-sol",
         api: Api::OpenAiCompletions,
-        base_url: "https://api.moonshot.ai/v1",
-        models_dev_id: "moonshotai",
-        catalog: include_str!("../catalog/moonshotai.json"),
+        base_url: "https://api.individual.githubcopilot.com",
+        models_dev_id: None,
+        lists_models: false,
+        oauth: true,
+        api_key: false,
+        catalog: include_str!("../catalog/github-copilot.json"),
     },
     BuiltinProvider {
-        id: "moonshotai-cn",
-        name: "Moonshot AI (China)",
-        env_vars: &["MOONSHOT_API_KEY"],
-        default_model: "kimi-k3",
-        api: Api::OpenAiCompletions,
-        base_url: "https://api.moonshot.cn/v1",
-        models_dev_id: "moonshotai-cn",
-        catalog: include_str!("../catalog/moonshotai-cn.json"),
+        oauth: true,
+        ..keyed(
+            "openrouter",
+            "OpenRouter",
+            &["OPENROUTER_API_KEY"],
+            "anthropic/claude-sonnet-5.5",
+            Api::OpenAiCompletions,
+            "https://openrouter.ai/api/v1",
+            "openrouter",
+            include_str!("../catalog/openrouter.json"),
+        )
     },
+    keyed(
+        "deepseek",
+        "DeepSeek",
+        &["DEEPSEEK_API_KEY"],
+        "deepseek-v4-pro",
+        Api::OpenAiCompletions,
+        "https://api.deepseek.com",
+        "deepseek",
+        include_str!("../catalog/deepseek.json"),
+    ),
+    keyed(
+        "moonshotai",
+        "Moonshot AI",
+        &["MOONSHOT_API_KEY"],
+        "kimi-k3",
+        Api::OpenAiCompletions,
+        "https://api.moonshot.ai/v1",
+        "moonshotai",
+        include_str!("../catalog/moonshotai.json"),
+    ),
+    keyed(
+        "moonshotai-cn",
+        "Moonshot AI (China)",
+        &["MOONSHOT_API_KEY"],
+        "kimi-k3",
+        Api::OpenAiCompletions,
+        "https://api.moonshot.cn/v1",
+        "moonshotai-cn",
+        include_str!("../catalog/moonshotai-cn.json"),
+    ),
     BuiltinProvider {
-        id: "zai",
-        name: "Z.ai Coding Plan",
-        env_vars: &["ZAI_API_KEY"],
-        default_model: "glm-5.3",
+        id: "kimi-coding",
+        name: "Kimi For Coding",
+        env_vars: &["KIMI_API_KEY"],
+        default_model: "kimi-for-coding",
         api: Api::OpenAiCompletions,
-        base_url: "https://api.z.ai/api/coding/paas/v4",
-        models_dev_id: "zai-coding-plan",
-        catalog: include_str!("../catalog/zai.json"),
+        base_url: "https://api.kimi.com/coding/v1",
+        models_dev_id: None,
+        lists_models: false,
+        oauth: true,
+        api_key: true,
+        catalog: include_str!("../catalog/kimi-coding.json"),
     },
+    keyed(
+        "zai",
+        "Z.ai Coding Plan",
+        &["ZAI_API_KEY"],
+        "glm-5.3",
+        Api::OpenAiCompletions,
+        "https://api.z.ai/api/coding/paas/v4",
+        "zai-coding-plan",
+        include_str!("../catalog/zai.json"),
+    ),
+    keyed(
+        "zai-coding-cn",
+        "Zhipu Coding Plan (China)",
+        &["ZAI_CODING_CN_API_KEY"],
+        "glm-5.3",
+        Api::OpenAiCompletions,
+        "https://open.bigmodel.cn/api/coding/paas/v4",
+        "zhipuai-coding-plan",
+        include_str!("../catalog/zai-coding-cn.json"),
+    ),
     BuiltinProvider {
-        id: "zai-coding-cn",
-        name: "Zhipu Coding Plan (China)",
-        env_vars: &["ZAI_CODING_CN_API_KEY"],
-        default_model: "glm-5.3",
-        api: Api::OpenAiCompletions,
-        base_url: "https://open.bigmodel.cn/api/coding/paas/v4",
-        models_dev_id: "zhipuai-coding-plan",
-        catalog: include_str!("../catalog/zai-coding-cn.json"),
+        oauth: true,
+        ..keyed(
+            "xai",
+            "xAI",
+            &["XAI_API_KEY"],
+            "grok-4.7",
+            Api::OpenAiResponses,
+            "https://api.x.ai/v1",
+            "xai",
+            include_str!("../catalog/xai.json"),
+        )
     },
-    BuiltinProvider {
-        id: "groq",
-        name: "Groq",
-        env_vars: &["GROQ_API_KEY"],
-        default_model: "openai/gpt-oss-120b",
-        api: Api::OpenAiCompletions,
-        base_url: "https://api.groq.com/openai/v1",
-        models_dev_id: "groq",
-        catalog: include_str!("../catalog/groq.json"),
-    },
+    keyed(
+        "groq",
+        "Groq",
+        &["GROQ_API_KEY"],
+        "openai/gpt-oss-120b",
+        Api::OpenAiCompletions,
+        "https://api.groq.com/openai/v1",
+        "groq",
+        include_str!("../catalog/groq.json"),
+    ),
 ];
 
 /// Instantiates every built-in provider.
@@ -113,12 +218,24 @@ pub fn builtin_providers() -> Vec<Arc<dyn Provider>> {
                 tracing::error!(provider = spec.id, %error, "invalid built-in catalog");
                 Vec::new()
             });
-            Arc::new(
+            let mut provider =
                 HttpProvider::new(spec.id, spec.name, spec.env_vars.iter().copied(), models)
-                    .with_default_model(spec.default_model)
-                    .with_api_endpoint(spec.api, spec.base_url)
-                    .with_models_dev_id(spec.models_dev_id),
-            ) as Arc<dyn Provider>
+                    .with_default_model(spec.default_model);
+            if spec.lists_models {
+                provider = provider.with_api_endpoint(spec.api, spec.base_url);
+            }
+            if let Some(id) = spec.models_dev_id {
+                provider = provider.with_models_dev_id(id);
+            }
+            if spec.oauth
+                && let Some(flow) = builtin_flow(spec.id)
+            {
+                provider = provider.with_oauth(flow);
+            }
+            if !spec.api_key {
+                provider = provider.oauth_only();
+            }
+            Arc::new(provider) as Arc<dyn Provider>
         })
         .collect()
 }
@@ -140,18 +257,19 @@ mod tests {
                 spec.default_model
             );
             assert!(
-                models
-                    .iter()
-                    .any(|model| model.api == spec.api && model.base_url == spec.base_url),
+                models.iter().any(|model| model.base_url == spec.base_url),
                 "{}: no catalog model uses the provider endpoint",
+                spec.id
+            );
+            assert_eq!(spec.oauth, builtin_flow(spec.id).is_some(), "{}", spec.id);
+            assert!(
+                spec.oauth || spec.api_key,
+                "{}: no way to authenticate",
                 spec.id
             );
             for model in &models {
                 assert_eq!(model.provider, spec.id);
-                assert!(matches!(
-                    model.api,
-                    Api::AnthropicMessages | Api::OpenAiCompletions
-                ));
+                assert_ne!(model.api, Api::Faux);
                 assert!(model.base_url.starts_with("https://"), "{}", model.id);
             }
         }

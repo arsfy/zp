@@ -3,14 +3,17 @@
 use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, PoisonError, RwLock};
 
+use futures::StreamExt as _;
 use tokio_util::sync::CancellationToken;
 
 use crate::auth::{
-    AuthSource, CredentialStore, EnvLookup, MemoryCredentialStore, ResolvedAuth, process_env,
+    AuthSource, Credential, CredentialStore, EnvLookup, MemoryCredentialStore, OAuthCredential,
+    RequestAuth, ResolvedAuth, process_env,
 };
 use crate::catalog::builtin_providers;
 use crate::event::{AssistantMessageStream, collect_message, error_stream};
 use crate::model::Model;
+use crate::oauth::{LoginInteraction, OAuthFlow};
 use crate::options::StreamOptions;
 use crate::provider::Provider;
 use crate::sync::{
@@ -51,6 +54,8 @@ pub struct Models {
     credentials: Arc<dyn CredentialStore>,
     env: EnvLookup,
     layers: Arc<RwLock<Layers>>,
+    /// One lock per provider so concurrent requests refresh an OAuth token only once.
+    refresh_locks: Arc<std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
 }
 
 /// Runtime catalog layers and the per-provider lists resolved from them.
@@ -84,6 +89,7 @@ impl Models {
             credentials: Arc::new(MemoryCredentialStore::new()),
             env: process_env(),
             layers: Arc::default(),
+            refresh_locks: Arc::default(),
         }
     }
 
@@ -259,9 +265,13 @@ impl Models {
         let registered = self
             .provider(provider)
             .ok_or_else(|| SyncError::Failed(format!("unknown provider {provider}")))?;
+        if self.resolve_auth(provider).is_none() {
+            return Err(SyncError::NoCredentials);
+        }
         let auth = self
-            .resolve_auth(provider)
-            .ok_or(SyncError::NoCredentials)?;
+            .request_auth(provider, cancel)
+            .await
+            .map_err(SyncError::Failed)?;
         let models = registered.list_models(auth.api_key, cancel.clone()).await?;
         Ok(UpstreamModels::new(models))
     }
@@ -284,12 +294,21 @@ impl Models {
             .cloned()
     }
 
-    /// All models, optionally limited to one provider.
+    /// All models, optionally limited to one provider. A provider signed in with an
+    /// account lists only the models the account can use.
     pub fn models(&self, provider: Option<&str>) -> Vec<Model> {
         self.providers()
             .iter()
             .filter(|p| provider.is_none_or(|id| p.id() == id))
-            .flat_map(|p| self.provider_models(p).to_vec())
+            .flat_map(|p| {
+                let models = self.provider_models(p).to_vec();
+                match (p.oauth(), self.credentials.credential(p.id())) {
+                    (Some(flow), Some(Credential::OAuth(credential))) => {
+                        flow.filter_models(&credential, models)
+                    }
+                    _ => models,
+                }
+            })
             .collect()
     }
 
@@ -327,14 +346,25 @@ impl Models {
             .cloned()
     }
 
-    /// Resolves credentials for `provider` without making a request.
+    /// Resolves credentials for `provider` without making a request. A sign-in resolves
+    /// to its current access token, which may have expired ([`Self::request_auth`]
+    /// refreshes it).
     pub fn resolve_auth(&self, provider: &str) -> Option<ResolvedAuth> {
         let registered = self.provider(provider)?;
-        if let Some(key) = self.credentials.api_key(provider) {
-            return Some(ResolvedAuth {
-                api_key: Some(key),
-                source: AuthSource::Stored,
-            });
+        match self.credentials.credential(provider) {
+            Some(Credential::ApiKey(key)) => {
+                return Some(ResolvedAuth {
+                    api_key: Some(key),
+                    source: AuthSource::Stored,
+                });
+            }
+            Some(Credential::OAuth(credential)) if registered.oauth().is_some() => {
+                return Some(ResolvedAuth {
+                    api_key: Some(credential.access),
+                    source: AuthSource::OAuth,
+                });
+            }
+            _ => {}
         }
         for name in registered.api_key_env_vars() {
             if let Some(key) = (self.env)(name) {
@@ -348,6 +378,105 @@ impl Models {
             api_key: None,
             source: AuthSource::NotRequired,
         })
+    }
+
+    /// The OAuth flow of `provider`, if it supports signing in.
+    pub fn oauth_flow(&self, provider: &str) -> Option<Arc<dyn OAuthFlow>> {
+        self.provider(provider)?.oauth()
+    }
+
+    /// Whether `provider` is signed in (rather than using an API key).
+    pub fn is_signed_in(&self, provider: &str) -> bool {
+        self.resolve_auth(provider)
+            .is_some_and(|auth| auth.source == AuthSource::OAuth)
+    }
+
+    /// Signs in to `provider` and stores the tokens.
+    pub async fn login(&self, provider: &str, interaction: LoginInteraction) -> Result<(), String> {
+        let flow = self
+            .oauth_flow(provider)
+            .ok_or_else(|| format!("{provider} does not support signing in"))?;
+        let credential = flow.login(interaction).await?;
+        self.credentials
+            .store(provider, &Credential::OAuth(credential))
+            .map_err(|error| format!("could not save the sign-in: {error}"))
+    }
+
+    fn refresh_lock(&self, provider: &str) -> Arc<tokio::sync::Mutex<()>> {
+        self.refresh_locks
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .entry(provider.to_owned())
+            .or_default()
+            .clone()
+    }
+
+    /// What a request to `provider` authenticates with, refreshing an expired sign-in
+    /// first (and storing the new tokens).
+    pub async fn request_auth(
+        &self,
+        provider: &str,
+        cancel: &CancellationToken,
+    ) -> Result<RequestAuth, String> {
+        let registered = self
+            .provider(provider)
+            .ok_or_else(|| format!("Unknown provider: {provider}"))?;
+        if let Some(flow) = registered.oauth()
+            && let Some(Credential::OAuth(credential)) = self.credentials.credential(provider)
+        {
+            let credential = if credential.is_expired() {
+                self.refresh(provider, flow.as_ref(), cancel).await?
+            } else {
+                credential
+            };
+            return Ok(flow.request_auth(&credential));
+        }
+        let auth = self.resolve_auth(provider).ok_or_else(|| {
+            let hint = match registered.api_key_env_vars() {
+                [] => String::new(),
+                vars => format!(". Set {}", vars.join(" or ")),
+            };
+            let sign_in = if registered.oauth().is_some() {
+                " or sign in"
+            } else {
+                ""
+            };
+            format!("No API key for provider {provider}{hint}{sign_in}")
+        })?;
+        Ok(RequestAuth {
+            api_key: auth.api_key,
+            ..RequestAuth::default()
+        })
+    }
+
+    /// Refreshes the sign-in of `provider` unless another request already did.
+    async fn refresh(
+        &self,
+        provider: &str,
+        flow: &dyn OAuthFlow,
+        cancel: &CancellationToken,
+    ) -> Result<OAuthCredential, String> {
+        let lock = self.refresh_lock(provider);
+        let _guard = lock.lock().await;
+        let Some(Credential::OAuth(current)) = self.credentials.credential(provider) else {
+            return Err(format!("{provider} is no longer signed in"));
+        };
+        if !current.is_expired() {
+            return Ok(current);
+        }
+        let refreshed = flow
+            .refresh(current, cancel.clone())
+            .await
+            .map_err(|error| {
+                format!("Could not refresh the {provider} sign-in ({error}); sign in again")
+            })?;
+        if let Err(error) = self
+            .credentials
+            .store(provider, &Credential::OAuth(refreshed.clone()))
+        {
+            tracing::warn!(provider, %error, "could not save refreshed tokens");
+        }
+        Ok(refreshed)
     }
 
     /// Providers whose credentials resolve.
@@ -369,22 +498,31 @@ impl Models {
         let Some(provider) = self.provider(&model.provider) else {
             return error_stream(skeleton(), format!("Unknown provider: {}", model.provider));
         };
-        if options.api_key.is_none() {
-            match self.resolve_auth(&model.provider) {
-                Some(auth) => options.api_key = auth.api_key,
-                None => {
-                    let hint = match provider.api_key_env_vars() {
-                        [] => String::new(),
-                        vars => format!(". Set {}", vars.join(" or ")),
-                    };
-                    return error_stream(
-                        skeleton(),
-                        format!("No API key for provider {}{hint}", model.provider),
-                    );
-                }
-            }
+        if options.api_key.is_some() {
+            return provider.stream(model, context, options);
         }
-        provider.stream(model, context, options)
+        // Resolve (and maybe refresh) credentials first, then stream.
+        let models = self.clone();
+        let mut model = model.clone();
+        let context = context.clone();
+        let skeleton = skeleton();
+        let resolve = async move {
+            match models.request_auth(&model.provider, &options.cancel).await {
+                Ok(auth) => {
+                    options.api_key = auth.api_key;
+                    for (name, value) in auth.headers {
+                        options.headers.entry(name).or_insert(value);
+                    }
+                    if let Some(base_url) = auth.base_url {
+                        model.base_url = base_url;
+                    }
+                    provider.stream(&model, &context, options)
+                }
+                Err(_) if options.cancel.is_cancelled() => crate::event::aborted_stream(skeleton),
+                Err(error) => error_stream(skeleton, error),
+            }
+        };
+        Box::pin(futures::stream::once(resolve).flatten())
     }
 
     /// Streams a response and returns the final message.
@@ -507,7 +645,7 @@ mod tests {
         // Other providers are untouched.
         assert_eq!(
             models.models(Some("deepseek")).len(),
-            crate::catalog::builtin_providers()[2].models().len()
+            models.provider("deepseek").unwrap().models().len()
         );
 
         models.set_upstream("anthropic", None);
@@ -544,7 +682,7 @@ mod tests {
         assert_eq!(message.stop_reason, StopReason::Error);
         assert_eq!(
             message.error_message.as_deref(),
-            Some("No API key for provider anthropic. Set ANTHROPIC_API_KEY")
+            Some("No API key for provider anthropic. Set ANTHROPIC_API_KEY or sign in")
         );
     }
 

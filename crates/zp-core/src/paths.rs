@@ -61,6 +61,21 @@ pub fn models_cache_dir(data_dir: &Path) -> PathBuf {
     cache_dir(data_dir).join("models")
 }
 
+/// This installation's stable id (a UUID kept in `device-id`), created on first use.
+/// Sign in with ChatGPT identifies the app by it.
+pub fn device_id(data_dir: &Path) -> Result<String> {
+    let path = data_dir.join("device-id");
+    if let Ok(text) = std::fs::read_to_string(&path)
+        && let Ok(id) = uuid::Uuid::parse_str(text.trim())
+    {
+        return Ok(id.to_string());
+    }
+    let id = uuid::Uuid::new_v4().to_string();
+    std::fs::create_dir_all(data_dir)?;
+    std::fs::write(&path, &id)?;
+    Ok(id)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -91,5 +106,13 @@ mod tests {
         assert_eq!(checkpoints_dir(root), root.join("checkpoints"));
         assert_eq!(logs_dir(root), root.join("logs"));
         assert_eq!(models_cache_dir(root), root.join("cache").join("models"));
+    }
+
+    #[test]
+    fn device_id_is_created_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = device_id(dir.path()).unwrap();
+        assert!(uuid::Uuid::parse_str(&id).is_ok());
+        assert_eq!(device_id(dir.path()).unwrap(), id);
     }
 }

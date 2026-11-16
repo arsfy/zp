@@ -333,6 +333,15 @@ fn apply_base_url_overrides(models: &mut Models) {
         if let Some((api, _)) = provider.api_endpoint() {
             replacement = replacement.with_api_endpoint(api, url.clone());
         }
+        if let Some(id) = provider.models_dev_id() {
+            replacement = replacement.with_models_dev_id(id);
+        }
+        if let Some(flow) = provider.oauth() {
+            replacement = replacement.with_oauth(flow);
+        }
+        if !provider.accepts_api_key() {
+            replacement = replacement.oauth_only();
+        }
         models.set_provider(Arc::new(replacement));
     }
 }

@@ -2,10 +2,18 @@
 
 pub(crate) mod anthropic;
 pub(crate) mod openai_completions;
+pub(crate) mod openai_responses;
 
 use serde_json::{Map, Value};
 
 use crate::model::{Model, ThinkingLevel};
+
+/// Per-request headers GitHub Copilot expects (who initiated the request, images).
+pub(crate) fn github_copilot_headers(
+    context: &crate::types::Context,
+) -> Vec<(&'static str, &'static str)> {
+    crate::oauth::copilot_dynamic_headers(context)
+}
 
 /// The provider value for a (supported) thinking level: the model's mapping or the level
 /// name itself.

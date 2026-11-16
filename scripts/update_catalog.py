@@ -14,6 +14,9 @@ from pathlib import Path
 
 PROVIDERS = [
     "anthropic",
+    "openai",
+    "openai-codex",
+    "github-copilot",
     "openrouter",
     "deepseek",
     "moonshotai",
@@ -21,8 +24,15 @@ PROVIDERS = [
     "zai",
     "zai-coding-cn",
     "groq",
+    "kimi-coding",
+    "xai",
 ]
-SUPPORTED_APIS = {"anthropic-messages", "openai-completions"}
+SUPPORTED_APIS = {
+    "anthropic-messages",
+    "openai-completions",
+    "openai-responses",
+    "openai-codex-responses",
+}
 MODEL_FIELDS = [
     "id",
     "name",

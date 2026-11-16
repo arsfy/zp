@@ -301,6 +301,13 @@ pub fn error_stream(
     })
 }
 
+/// A stream that immediately ends as aborted.
+pub(crate) fn aborted_stream(skeleton: AssistantMessage) -> AssistantMessageStream {
+    event_stream(skeleton, move |sink| async move {
+        sink.fail(StopReason::Aborted, "Request was aborted");
+    })
+}
+
 /// Drains a stream and returns its final message. A stream that ends without a terminal
 /// event yields an error message.
 pub async fn collect_message(mut stream: AssistantMessageStream) -> AssistantMessage {

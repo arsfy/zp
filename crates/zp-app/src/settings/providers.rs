@@ -1,13 +1,15 @@
-//! The Providers page: the configured providers (keys in the keychain, model list
-//! refreshes), and a dialog to add one — a built-in provider's API key or a custom
-//! OpenAI-compatible endpoint.
+//! The Providers page: the configured providers (keys or sign-ins in the keychain, model
+//! list refreshes), and a dialog to add one — signing in with an account, a built-in
+//! provider's API key, or a custom OpenAI-compatible endpoint.
 
+use futures::StreamExt as _;
 use gpui::{
-    AnyElement, App, ClickEvent, Context, Entity, Focusable as _, FontWeight, IntoElement,
-    MouseButton, Window, div, prelude::*, px,
+    AnyElement, App, ClickEvent, ClipboardItem, Context, Entity, Focusable as _, FontWeight,
+    IntoElement, MouseButton, Task, Window, div, prelude::*, px,
 };
 use gpui_elements::editable_text::EditableTextState;
-use zp_ai::AuthSource;
+use zp_ai::oauth::{LoginEvent, LoginInteraction, LoginOptions, ManualInput};
+use zp_ai::{AuthSource, CancellationToken};
 use zp_core::model_catalog::SyncOutcome;
 use zp_core::settings::CustomProvider;
 
@@ -77,10 +79,30 @@ impl ProviderForm {
     }
 }
 
+/// A running sign-in.
+pub struct LoginDialog {
+    provider: String,
+    /// The page to open (and what to do there).
+    url: Option<(String, String)>,
+    /// The code to enter at a verification page.
+    device: Option<(String, String)>,
+    progress: Option<String>,
+    /// A pasted redirect URL or code, for when the browser cannot reach ZP.
+    code: Entity<EditableTextState>,
+    manual: ManualInput,
+    cancel: CancellationToken,
+    error: Option<String>,
+    _task: Task<()>,
+}
+
 /// The add / change provider dialog.
 pub enum ProviderDialog {
     /// Pick a provider to add.
     Choose { filter: Entity<EditableTextState> },
+    /// Sign in or enter an API key for `provider`.
+    Method { provider: String },
+    /// Signing in to a provider.
+    Login(Box<LoginDialog>),
     /// Enter the API key of `provider`.
     Key {
         provider: String,
@@ -95,6 +117,7 @@ pub enum ProviderDialog {
 fn key_status(source: Option<AuthSource>) -> (String, bool) {
     match source {
         Some(AuthSource::Stored) => ("Key stored in the keychain".into(), true),
+        Some(AuthSource::OAuth) => ("Signed in".into(), true),
         Some(AuthSource::Env(var)) => (format!("Key from ${var}"), true),
         Some(AuthSource::NotRequired) => ("No key needed".into(), true),
         Some(AuthSource::Explicit) => ("Key set".into(), true),
@@ -117,6 +140,9 @@ impl SettingsWindow {
     }
 
     pub fn close_dialog(&mut self, cx: &mut Context<Self>) {
+        if let Some(ProviderDialog::Login(login)) = &self.dialog {
+            login.cancel.cancel();
+        }
         self.dialog = None;
         self.dialog_subscription = None;
         cx.notify();
@@ -163,6 +189,183 @@ impl SettingsWindow {
         providers
     }
 
+    /// Continues with `provider`: offers signing in and an API key when both work,
+    /// otherwise goes to the one that does.
+    pub fn choose_provider(&mut self, provider: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let registered = cx.global::<AppModels>().models.provider(provider);
+        let (oauth, keys) = registered.as_ref().map_or((false, true), |p| {
+            (p.oauth().is_some(), p.accepts_api_key())
+        });
+        match (oauth, keys) {
+            (true, true) => {
+                self.dialog_subscription = None;
+                self.dialog = Some(ProviderDialog::Method {
+                    provider: provider.to_owned(),
+                });
+                cx.notify();
+            }
+            (true, false) => self.start_login(provider, window, cx),
+            _ => self.edit_key(provider, window, cx),
+        }
+    }
+
+    /// Signs in to `provider`: the dialog shows the page to open (it is opened in the
+    /// browser) or the code to enter, and accepts a pasted redirect URL.
+    pub fn start_login(&mut self, provider: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(ProviderDialog::Login(login)) = &self.dialog {
+            login.cancel.cancel();
+        }
+        let models = cx.global::<AppModels>().models.clone();
+        let options = LoginOptions {
+            device_id: cx
+                .try_global::<crate::store::AppPaths>()
+                .and_then(|paths| paths.data_dir.clone())
+                .and_then(|dir| zp_core::paths::device_id(&dir).ok()),
+            agent_name: None,
+        };
+        let cancel = CancellationToken::new();
+        let (events, mut received) = futures::channel::mpsc::unbounded();
+        let (interaction, manual) = LoginInteraction::new(
+            cancel.clone(),
+            move |event| {
+                let _ = events.unbounded_send(event);
+            },
+            options,
+        );
+        let id = provider.to_owned();
+        let login =
+            gpui_tokio::Tokio::spawn(cx, async move { models.login(&id, interaction).await });
+        let id = provider.to_owned();
+        let task = cx.spawn(async move |this, cx| {
+            let pump = async {
+                while let Some(event) = received.next().await {
+                    if this
+                        .update(cx, |this, cx| this.login_event(event, cx))
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            };
+            // Events stop once the login is over (its sender is dropped).
+            let (result, ()) = futures::join!(login, pump);
+            let result = result.unwrap_or_else(|error| Err(error.to_string()));
+            let _ = this.update(cx, |this, cx| this.login_finished(&id, result, cx));
+        });
+        let code = input("", cx);
+        code.read(cx).focus_handle(cx).focus(window, cx);
+        self.dialog_subscription = None;
+        self.dialog = Some(ProviderDialog::Login(Box::new(LoginDialog {
+            provider: provider.to_owned(),
+            url: None,
+            device: None,
+            progress: Some("Starting…".into()),
+            code,
+            manual,
+            cancel,
+            error: None,
+            _task: task,
+        })));
+        cx.notify();
+    }
+
+    fn login_event(&mut self, event: LoginEvent, cx: &mut Context<Self>) {
+        let Some(ProviderDialog::Login(login)) = &mut self.dialog else {
+            return;
+        };
+        match event {
+            LoginEvent::AuthUrl { url, instructions } => {
+                cx.open_url(&url);
+                login.url = Some((url, instructions));
+                login.progress = None;
+            }
+            LoginEvent::DeviceCode {
+                user_code,
+                verification_uri,
+            } => {
+                cx.write_to_clipboard(ClipboardItem::new_string(user_code.clone()));
+                cx.open_url(&verification_uri);
+                login.device = Some((user_code, verification_uri));
+                login.progress = None;
+            }
+            LoginEvent::Progress(message) => login.progress = Some(message),
+        }
+        cx.notify();
+    }
+
+    fn login_finished(
+        &mut self,
+        provider: &str,
+        result: Result<(), String>,
+        cx: &mut Context<Self>,
+    ) {
+        let current = matches!(&self.dialog, Some(ProviderDialog::Login(login)) if login.provider == provider);
+        match result {
+            Ok(()) => {
+                AppModels::credential_changed(cx, provider);
+                if current {
+                    self.close_dialog(cx);
+                }
+                let name = cx
+                    .global::<AppModels>()
+                    .models
+                    .provider(provider)
+                    .map_or_else(|| provider.to_owned(), |p| p.name().to_owned());
+                self.report(
+                    Ok(format!("Signed in to {name}; refreshing its models")),
+                    cx,
+                );
+            }
+            Err(error) => {
+                if let Some(ProviderDialog::Login(login)) = &mut self.dialog
+                    && current
+                    && !login.cancel.is_cancelled()
+                {
+                    login.error = Some(error);
+                    login.progress = None;
+                    cx.notify();
+                }
+            }
+        }
+    }
+
+    /// The running sign-in's page to open and error (tests).
+    #[cfg(test)]
+    pub fn login_state(&self) -> Option<(Option<String>, Option<String>)> {
+        match &self.dialog {
+            Some(ProviderDialog::Login(login)) => Some((
+                login.url.as_ref().map(|(url, _)| url.clone()),
+                login.error.clone(),
+            )),
+            _ => None,
+        }
+    }
+
+    /// Hands the pasted redirect URL or code to the running sign-in.
+    pub fn submit_login_code(&mut self, cx: &mut Context<Self>) {
+        let Some(ProviderDialog::Login(login)) = &mut self.dialog else {
+            return;
+        };
+        let text = login.code.read(cx).as_str().trim().to_owned();
+        if text.is_empty() {
+            return;
+        }
+        login.manual.submit(text);
+        login.error = None;
+        login.progress = Some("Checking the code…".into());
+        cx.notify();
+    }
+
+    /// Signs out of `provider` (deletes the stored tokens).
+    pub fn sign_out(&mut self, provider: &str, cx: &mut Context<Self>) {
+        let credentials = cx.global::<AppModels>().credentials.clone();
+        let result = credentials.remove(provider).map(|()| {
+            AppModels::credential_changed(cx, provider);
+            format!("Signed out of {provider}")
+        });
+        self.report(result, cx);
+    }
+
     /// Starts entering a key for `provider` (in the dialog).
     pub fn edit_key(&mut self, provider: &str, window: &mut Window, cx: &mut Context<Self>) {
         let field = input("", cx);
@@ -187,6 +390,9 @@ impl SettingsWindow {
 
     /// Stores the entered key, then refreshes the provider's model list.
     pub fn save_key(&mut self, cx: &mut Context<Self>) {
+        if matches!(self.dialog, Some(ProviderDialog::Login(_))) {
+            return self.submit_login_code(cx);
+        }
         let Some(ProviderDialog::Key {
             provider, input, ..
         }) = &self.dialog
@@ -382,7 +588,7 @@ impl SettingsWindow {
                             div()
                                 .text_size(px(12.))
                                 .text_color(colors.text_muted)
-                                .child("Keys live in the system keychain; variables like OPENAI_API_KEY work too."),
+                                .child("Sign in with your account, or use an API key. Both live in the system keychain; variables like OPENAI_API_KEY work too."),
                         ),
                 )
                 .child(
@@ -399,7 +605,7 @@ impl SettingsWindow {
                     .border_1()
                     .border_color(colors.border)
                     .text_color(colors.text_muted)
-                    .child("No provider is configured yet. Click Add Provider… to add an API key or a custom endpoint."),
+                    .child("No provider is configured yet. Click Add Provider… to sign in, add an API key or a custom endpoint."),
             );
         }
         for (index, id) in configured.iter().enumerate() {
@@ -426,63 +632,97 @@ impl SettingsWindow {
 
             let (set_id, remove_id, refresh_id, edit_id, delete_id) =
                 (id.clone(), id.clone(), id.clone(), id.clone(), id.clone());
-            let needs_key = provider.requires_api_key() || is_custom;
-            let actions =
-                div()
-                    .flex()
-                    .gap_1p5()
-                    .when(needs_key, |this| {
-                        this.child(
-                            button(
-                                ("set-key", index),
-                                if stored { "Replace Key" } else { "Set Key" },
-                                ButtonKind::Normal,
-                                cx,
-                            )
-                            .on_click(cx.listener(
-                                move |this, _, window, cx| this.edit_key(&set_id, window, cx),
-                            )),
+            let (login_id, logout_id) = (id.clone(), id.clone());
+            let signed_in = models.is_signed_in(&id);
+            let can_sign_in = provider.oauth().is_some();
+            let needs_key =
+                (provider.requires_api_key() && provider.accepts_api_key()) || is_custom;
+            let actions = div()
+                .flex()
+                .gap_1p5()
+                .when(can_sign_in, |this| {
+                    this.child(
+                        button(
+                            ("sign-in", index),
+                            if signed_in {
+                                "Sign In Again"
+                            } else {
+                                "Sign In"
+                            },
+                            ButtonKind::Normal,
+                            cx,
                         )
-                    })
-                    .when(stored, |this| {
-                        this.child(
-                            button(("remove-key", index), "Remove Key", ButtonKind::Danger, cx)
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.remove_key(&remove_id, cx)
-                                })),
+                        .on_click(cx.listener(
+                            move |this, _, window, cx| this.start_login(&login_id, window, cx),
+                        )),
+                    )
+                })
+                .when(signed_in, |this| {
+                    this.child(
+                        button(("sign-out", index), "Sign Out", ButtonKind::Danger, cx).on_click(
+                            cx.listener(move |this, _, _, cx| this.sign_out(&logout_id, cx)),
+                        ),
+                    )
+                })
+                .when(needs_key, |this| {
+                    this.child(
+                        button(
+                            ("set-key", index),
+                            if stored && !signed_in {
+                                "Replace Key"
+                            } else {
+                                "Set Key"
+                            },
+                            ButtonKind::Normal,
+                            cx,
                         )
-                    })
-                    .when(provider.api_endpoint().is_some() && has_key, |this| {
-                        this.child(
-                            button(
-                                ("refresh-models", index),
-                                if running {
-                                    "Refreshing…"
-                                } else {
-                                    "Refresh Models"
-                                },
-                                ButtonKind::Normal,
-                                cx,
-                            )
-                            .on_click(cx.listener(
-                                move |this, _, _, cx| this.refresh_provider(&refresh_id, cx),
-                            )),
+                        .on_click(cx.listener(
+                            move |this, _, window, cx| this.edit_key(&set_id, window, cx),
+                        )),
+                    )
+                })
+                .when(stored && !signed_in, |this| {
+                    this.child(
+                        button(("remove-key", index), "Remove Key", ButtonKind::Danger, cx)
+                            .on_click(
+                                cx.listener(move |this, _, _, cx| this.remove_key(&remove_id, cx)),
+                            ),
+                    )
+                })
+                .when(provider.api_endpoint().is_some() && has_key, |this| {
+                    this.child(
+                        button(
+                            ("refresh-models", index),
+                            if running {
+                                "Refreshing…"
+                            } else {
+                                "Refresh Models"
+                            },
+                            ButtonKind::Normal,
+                            cx,
                         )
-                    })
-                    .when(is_custom, |this| {
-                        this.child(
-                            button(("edit-provider", index), "Edit", ButtonKind::Normal, cx)
-                                .on_click(cx.listener(move |this, _, window, cx| {
-                                    this.open_provider_form(Some(&edit_id), window, cx)
-                                })),
-                        )
-                        .child(
-                            button(("delete-provider", index), "Delete", ButtonKind::Danger, cx)
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.delete_provider(&delete_id, cx)
-                                })),
-                        )
-                    });
+                        .on_click(
+                            cx.listener(move |this, _, _, cx| {
+                                this.refresh_provider(&refresh_id, cx)
+                            }),
+                        ),
+                    )
+                })
+                .when(is_custom, |this| {
+                    this.child(
+                        button(("edit-provider", index), "Edit", ButtonKind::Normal, cx).on_click(
+                            cx.listener(move |this, _, window, cx| {
+                                this.open_provider_form(Some(&edit_id), window, cx)
+                            }),
+                        ),
+                    )
+                    .child(
+                        button(("delete-provider", index), "Delete", ButtonKind::Danger, cx)
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.delete_provider(&delete_id, cx)
+                            })),
+                    )
+                });
 
             body = body.child(
                 div()
@@ -564,6 +804,8 @@ impl SettingsWindow {
                 error,
             } => self.render_key_step(provider, input, error.clone(), cx),
             ProviderDialog::Custom(form) => self.render_provider_form(form, cx),
+            ProviderDialog::Method { provider } => self.render_method(provider, cx),
+            ProviderDialog::Login(login) => self.render_login(login, cx),
         };
         Some(
             div()
@@ -659,7 +901,7 @@ impl SettingsWindow {
             .gap_2()
             .child(Self::dialog_title(
                 "Add a provider".into(),
-                "Choose a provider to add its API key, or add your own endpoint.",
+                "Choose a provider to sign in or add its API key, or add your own endpoint.",
                 cx,
             ))
             .child(text_field(filter, "Search providers…", cx))
@@ -676,7 +918,7 @@ impl SettingsWindow {
                             };
                             row(("choose-provider", index).into(), name, detail).on_click(
                                 cx.listener(move |this, _: &ClickEvent, window, cx| {
-                                    this.edit_key(&id, window, cx)
+                                    this.choose_provider(&id, window, cx)
                                 }),
                             )
                         },
@@ -764,6 +1006,202 @@ impl SettingsWindow {
                     ),
             )
             .into_any_element()
+    }
+
+    fn render_method(&self, provider: &str, cx: &mut Context<Self>) -> AnyElement {
+        let colors = cx.theme().colors.clone();
+        let registered = cx.global::<AppModels>().models.provider(provider);
+        let name = registered
+            .as_ref()
+            .map_or(provider.to_owned(), |p| p.name().to_owned());
+        let flow = registered.as_ref().and_then(|p| p.oauth());
+        let option = |id: &'static str, title: String, detail: String| {
+            div()
+                .id(id)
+                .flex()
+                .flex_col()
+                .gap_0p5()
+                .px_3()
+                .py_2()
+                .rounded(px(6.))
+                .border_1()
+                .border_color(colors.border)
+                .cursor_pointer()
+                .hover_style(|s| s.bg(colors.surface_hover))
+                .child(div().font_weight(FontWeight::SEMIBOLD).child(title))
+                .child(
+                    div()
+                        .text_size(px(12.))
+                        .text_color(colors.text_muted)
+                        .child(detail),
+                )
+        };
+        let (sign_in, id) = (provider.to_owned(), provider.to_owned());
+        div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(Self::dialog_title(
+                format!("Connect {name}"),
+                "Sign in with your account, or paste an API key.",
+                cx,
+            ))
+            .when_some(flow, |this, flow| {
+                this.child(
+                    option(
+                        "method-sign-in",
+                        flow.login_label().to_owned(),
+                        format!("Use your {} in your browser.", flow.name()),
+                    )
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.start_login(&sign_in, window, cx)
+                    })),
+                )
+            })
+            .child(
+                option(
+                    "method-api-key",
+                    "Use an API key".into(),
+                    "Paste a key from the provider's console.".into(),
+                )
+                .on_click(cx.listener(move |this, _, window, cx| this.edit_key(&id, window, cx))),
+            )
+            .child(
+                div()
+                    .flex()
+                    .gap_1p5()
+                    .justify_end()
+                    .child(
+                        button("dialog-back", "Back", ButtonKind::Normal, cx).on_click(
+                            cx.listener(|this, _, window, cx| this.open_add_dialog(window, cx)),
+                        ),
+                    )
+                    .child(
+                        button("dialog-cancel", "Cancel", ButtonKind::Normal, cx)
+                            .on_click(cx.listener(|this, _, _, cx| this.close_dialog(cx))),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    fn render_login(&self, login: &LoginDialog, cx: &mut Context<Self>) -> AnyElement {
+        let colors = cx.theme().colors.clone();
+        let mono = cx.theme().metrics.mono_font.clone();
+        let registered = cx.global::<AppModels>().models.provider(&login.provider);
+        let name = registered
+            .as_ref()
+            .map_or(login.provider.clone(), |p| p.name().to_owned());
+        let title = registered.as_ref().and_then(|p| p.oauth()).map_or_else(
+            || format!("Sign in to {name}"),
+            |f| f.login_label().to_owned(),
+        );
+        let muted = |text: String| {
+            div()
+                .text_size(px(12.))
+                .text_color(colors.text_muted)
+                .whitespace_normal()
+                .child(text)
+        };
+        let mut body = div().flex().flex_col().gap_2().child(Self::dialog_title(
+            title,
+            &format!("Connecting {name} to ZP."),
+            cx,
+        ));
+        if let Some((code, uri)) = &login.device {
+            let (copy, open) = (code.clone(), uri.clone());
+            body = body
+                .child(muted(format!(
+                    "Enter this code at {uri} (it is copied to the clipboard):"
+                )))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(
+                            div()
+                                .px_3()
+                                .py_1()
+                                .rounded(px(5.))
+                                .bg(colors.code_background)
+                                .font_family(mono.clone())
+                                .text_size(px(18.))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .child(code.clone()),
+                        )
+                        .child(
+                            button("login-copy", "Copy", ButtonKind::Normal, cx).on_click(
+                                move |_, _, cx| {
+                                    cx.write_to_clipboard(ClipboardItem::new_string(copy.clone()))
+                                },
+                            ),
+                        )
+                        .child(
+                            button("login-open", "Open Page", ButtonKind::Normal, cx)
+                                .on_click(move |_, _, cx| cx.open_url(&open)),
+                        ),
+                );
+        }
+        if let Some((url, instructions)) = &login.url {
+            let open = url.clone();
+            body = body
+                .child(muted(instructions.clone()))
+                .child(
+                    div().flex().gap_1p5().child(
+                        button("login-open", "Open Browser Again", ButtonKind::Normal, cx)
+                            .on_click(move |_, _, cx| cx.open_url(&open)),
+                    ),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .gap_1p5()
+                        .items_center()
+                        .child(div().flex_1().key_context("ApiKeyInput").child(text_field(
+                            &login.code,
+                            "Paste the redirect URL or code",
+                            cx,
+                        )))
+                        .child(
+                            button("login-submit", "Submit", ButtonKind::Normal, cx)
+                                .on_click(cx.listener(|this, _, _, cx| this.submit_login_code(cx))),
+                        ),
+                );
+        }
+        if let Some(progress) = &login.progress {
+            body = body.child(muted(progress.clone()));
+        }
+        let failed = login.error.is_some();
+        let retry = login.provider.clone();
+        body.when_some(login.error.clone(), |this, error| {
+            this.child(
+                div()
+                    .text_size(px(12.))
+                    .text_color(colors.error)
+                    .whitespace_normal()
+                    .child(error),
+            )
+        })
+        .child(
+            div()
+                .flex()
+                .gap_1p5()
+                .justify_end()
+                .when(failed, |this| {
+                    this.child(
+                        button("login-retry", "Try Again", ButtonKind::Primary, cx).on_click(
+                            cx.listener(move |this, _, window, cx| {
+                                this.start_login(&retry, window, cx)
+                            }),
+                        ),
+                    )
+                })
+                .child(
+                    button("dialog-cancel", "Cancel", ButtonKind::Normal, cx)
+                        .on_click(cx.listener(|this, _, _, cx| this.close_dialog(cx))),
+                ),
+        )
+        .into_any_element()
     }
 
     fn render_provider_form(&self, form: &ProviderForm, cx: &mut Context<Self>) -> AnyElement {

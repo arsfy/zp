@@ -17,6 +17,13 @@ pub enum Api {
     /// OpenAI Chat Completions and compatible APIs (`/chat/completions`).
     #[serde(rename = "openai-completions")]
     OpenAiCompletions,
+    /// OpenAI Responses API (`/responses`).
+    #[serde(rename = "openai-responses")]
+    OpenAiResponses,
+    /// The Responses API of ChatGPT's Codex backend (`/codex/responses`), used with a
+    /// ChatGPT sign-in.
+    #[serde(rename = "openai-codex-responses")]
+    OpenAiCodexResponses,
     /// Scripted in-process provider for tests.
     #[serde(rename = "faux")]
     Faux,
@@ -28,6 +35,8 @@ impl Api {
         match self {
             Self::AnthropicMessages => "anthropic-messages",
             Self::OpenAiCompletions => "openai-completions",
+            Self::OpenAiResponses => "openai-responses",
+            Self::OpenAiCodexResponses => "openai-codex-responses",
             Self::Faux => "faux",
         }
     }

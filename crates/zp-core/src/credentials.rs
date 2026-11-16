@@ -1,5 +1,6 @@
-//! API keys in the system keychain (macOS Keychain, Windows Credential Manager, Secret
-//! Service on Linux).
+//! Credentials in the system keychain (macOS Keychain, Windows Credential Manager, Secret
+//! Service on Linux): API keys as they are, and tokens from signing in to a provider as
+//! JSON (see [`zp_ai::Credential::encode`]).
 //!
 //! The keychain is only queried for providers listed in a small index file
 //! (`~/.zp/credentials.json`, ids only — never secrets), so providers without a stored key
@@ -10,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
 
 use anyhow::Context as _;
-use zp_ai::CredentialStore;
+use zp_ai::{Credential, CredentialStore};
 
 /// Keychain service name of ZP's API keys.
 pub const KEYCHAIN_SERVICE: &str = "zp.api-keys";
@@ -142,18 +143,30 @@ impl Credentials {
         Self::new(Arc::new(MemoryBackend::default()), None)
     }
 
-    /// Stores `key` for `provider`.
+    /// Stores API key `key` for `provider` (replacing a sign-in).
     pub fn set(&self, provider: &str, key: &str) -> anyhow::Result<()> {
         let key = key.trim();
         anyhow::ensure!(!key.is_empty(), "the key is empty");
-        self.backend.set(provider, key)?;
+        self.set_secret(provider, key)
+    }
+
+    /// Stores `credential` for `provider`.
+    pub fn set_credential(&self, provider: &str, credential: &Credential) -> anyhow::Result<()> {
+        if let Credential::ApiKey(key) = credential {
+            return self.set(provider, key);
+        }
+        self.set_secret(provider, &credential.encode())
+    }
+
+    fn set_secret(&self, provider: &str, secret: &str) -> anyhow::Result<()> {
+        self.backend.set(provider, secret)?;
         let mut state = self.state.write().unwrap_or_else(PoisonError::into_inner);
-        state.cache.insert(provider.to_owned(), key.to_owned());
+        state.cache.insert(provider.to_owned(), secret.to_owned());
         state.stored.insert(provider.to_owned());
         self.save_index(&state.stored)
     }
 
-    /// Deletes the stored key of `provider`.
+    /// Deletes the stored key or sign-in of `provider`.
     pub fn remove(&self, provider: &str) -> anyhow::Result<()> {
         self.backend.delete(provider)?;
         let mut state = self.state.write().unwrap_or_else(PoisonError::into_inner);
@@ -184,7 +197,20 @@ impl Credentials {
 }
 
 impl CredentialStore for Credentials {
-    fn api_key(&self, provider: &str) -> Option<String> {
+    fn credential(&self, provider: &str) -> Option<Credential> {
+        self.secret(provider)
+            .map(|secret| Credential::decode(&secret))
+    }
+
+    fn store(&self, provider: &str, credential: &Credential) -> Result<(), String> {
+        self.set_credential(provider, credential)
+            .map_err(|error| format!("{error:#}"))
+    }
+}
+
+impl Credentials {
+    /// The stored secret of `provider`, read from the keychain once.
+    fn secret(&self, provider: &str) -> Option<String> {
         {
             let state = self.state.read().unwrap_or_else(PoisonError::into_inner);
             if !state.stored.contains(provider) {
@@ -205,7 +231,7 @@ impl CredentialStore for Credentials {
             }
             Ok(None) => None,
             Err(error) => {
-                tracing::warn!(provider, error = %format!("{error:#}"), "could not read an API key");
+                tracing::warn!(provider, error = %format!("{error:#}"), "could not read a credential");
                 None
             }
         }

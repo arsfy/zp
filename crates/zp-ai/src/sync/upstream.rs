@@ -121,8 +121,10 @@ pub async fn list_upstream_models(
     let base_url = base_url.trim_end_matches('/');
     let models = match api {
         Api::AnthropicMessages => list_anthropic(base_url, api_key, cancel).await?,
-        Api::OpenAiCompletions => list_openai(base_url, api_key, cancel).await?,
-        Api::Faux => return Err(SyncError::Unsupported),
+        Api::OpenAiCompletions | Api::OpenAiResponses => {
+            list_openai(base_url, api_key, cancel).await?
+        }
+        Api::OpenAiCodexResponses | Api::Faux => return Err(SyncError::Unsupported),
     };
     let mut seen = HashSet::new();
     Ok(models
@@ -137,8 +139,16 @@ async fn list_anthropic(
     cancel: &CancellationToken,
 ) -> Result<Vec<UpstreamModel>, SyncError> {
     let mut headers = vec![("anthropic-version", crate::api::anthropic::API_VERSION)];
-    if let Some(key) = api_key {
-        headers.push(("x-api-key", key));
+    let bearer = api_key
+        .filter(|key| crate::api::anthropic::is_oauth_token(key))
+        .map(|key| format!("Bearer {key}"));
+    match (&bearer, api_key) {
+        (Some(bearer), _) => {
+            headers.push(("authorization", bearer.as_str()));
+            headers.push(("anthropic-beta", crate::api::anthropic::OAUTH_BETAS));
+        }
+        (None, Some(key)) => headers.push(("x-api-key", key)),
+        (None, None) => {}
     }
     let headers = http::header_map(headers);
     let mut models = Vec::new();

@@ -24,6 +24,7 @@ tokio.workspace = true
 tokio-util.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+uuid.workspace = true
 zp-agent.workspace = true
 zp-ai.workspace = true
 zp-session.workspace = true
