@@ -42,7 +42,7 @@ type Pending = Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value, String>>>>>;
 enum Connection {
     Stdio {
         stdin: Arc<tokio::sync::Mutex<tokio::process::ChildStdin>>,
-        child: Mutex<Option<tokio::process::Child>>,
+        child: Box<Mutex<Option<tokio::process::Child>>>,
         stderr: Arc<Mutex<VecDeque<String>>>,
     },
     Http {
@@ -190,7 +190,7 @@ impl Client {
                 }
                 Connection::Stdio {
                     stdin,
-                    child: Mutex::new(Some(child)),
+                    child: Box::new(Mutex::new(Some(child))),
                     stderr,
                 }
             }
