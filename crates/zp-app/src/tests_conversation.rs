@@ -660,35 +660,51 @@ fn conversations_open_without_any_api_key(cx: &mut TestAppContext) {
     let window = open(cx, &project);
     let conversation = active(window, cx);
 
-    // The conversation opens with a model, but the picker offers none: no provider can
-    // be used yet.
-    let model = conversation
-        .read_with(cx, |view, _| view.status().model)
-        .expect("a model even without keys");
-    let choices = conversation.read_with(cx, |view, cx| view.model_choices_for_test(cx).len());
-    assert_eq!(choices, 0);
+    // Without a usable provider the conversation opens with no model at all, and the
+    // session records none.
+    let (model, choices) = conversation.read_with(cx, |view, cx| {
+        (view.status().model, view.model_choices_for_test(cx).len())
+    });
+    assert_eq!((model, choices), (None, 0));
 
-    // Sending keeps the draft and asks for the provider's key; no request is made.
+    // Sending keeps the draft and asks for a model; no request is made.
     conversation.update(cx, |view, cx| view.set_draft("hello", cx));
     cx.dispatch_action(window.into(), SendMessage);
     cx.run_until_parked();
-    let (needs, draft, running) = conversation.read_with(cx, |view, cx| {
-        (view.needs_key(cx), view.draft(cx), view.is_running())
+    let (needs_model, needs_key, draft, running) = conversation.read_with(cx, |view, cx| {
+        (
+            view.needs_model(),
+            view.needs_key(cx),
+            view.draft(cx),
+            view.is_running(),
+        )
     });
-    assert_eq!(needs.as_deref(), Some(model.provider.as_str()));
-    assert_eq!((draft.as_str(), running), ("hello", false));
+    assert!(needs_model);
+    assert_eq!((needs_key, draft.as_str(), running), (None, "hello", false));
 
-    // Once a key is stored, the notice goes away.
+    // Once a key is stored, its models can be picked and the notice goes away.
     cx.update(|cx| {
         cx.global::<AppModels>()
             .credentials
-            .set(&model.provider, "sk-test")
+            .set("anthropic", "sk-test")
             .unwrap()
     });
-    assert_eq!(
-        conversation.read_with(cx, |view, cx| view.needs_key(cx)),
-        None
-    );
+    let choice = conversation.read_with(cx, |view, cx| {
+        view.model_choices_for_test(cx)
+            .into_iter()
+            .next()
+            .expect("anthropic models")
+            .model
+    });
+    window
+        .update(cx, |_, window, cx| {
+            conversation.update(cx, |view, cx| view.select_model(choice.clone(), window, cx))
+        })
+        .unwrap();
+    let (model, needs_model) =
+        conversation.read_with(cx, |view, _| (view.status().model, view.needs_model()));
+    assert_eq!(model.map(|m| m.qualified_id()), Some(choice.qualified_id()));
+    assert!(!needs_model);
 }
 
 #[gpui::test]

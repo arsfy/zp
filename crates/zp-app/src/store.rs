@@ -223,27 +223,6 @@ impl AppModels {
         })
     }
 
-    /// The model a new conversation starts with, even when no provider has a key yet
-    /// (the user picks a model and adds its key later): the configured default, else the
-    /// settings' model, else the first built-in provider's default.
-    pub fn fallback_model(cx: &App) -> Option<Model> {
-        if let Some(model) = Self::default_model(cx) {
-            return Some(model);
-        }
-        let models = &cx.try_global::<Self>()?.models;
-        AppSettings::get(cx)
-            .default_model
-            .as_deref()
-            .and_then(|spec| models.find(spec))
-            .or_else(|| {
-                models
-                    .providers()
-                    .iter()
-                    .find_map(|provider| models.default_model(provider.id()))
-            })
-            .or_else(|| models.models(None).into_iter().next())
-    }
-
     /// Whether `provider` can be used (has a key, or needs none).
     pub fn has_credentials(provider: &str, cx: &App) -> bool {
         cx.try_global::<Self>()

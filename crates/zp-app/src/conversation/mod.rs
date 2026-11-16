@@ -152,6 +152,8 @@ pub struct ConversationView {
     info: Option<String>,
     /// The provider a message could not be sent to for lack of an API key.
     needs_key: Option<String>,
+    /// The last attempt to send found no model selected.
+    needs_model: bool,
     compacting: bool,
     /// The current request was already retried after a context overflow.
     overflow_retried: bool,
@@ -219,6 +221,7 @@ impl ConversationView {
             attachments: Vec::new(),
             info: None,
             needs_key: None,
+            needs_model: false,
             compacting: false,
             overflow_retried: false,
             tree_open: false,
@@ -243,16 +246,12 @@ impl ConversationView {
             .try_global::<AppModels>()
             .map(|m| m.models.clone())
             .ok_or_else(|| anyhow::anyhow!("models are not initialized"))?;
-        let model = match session_model(&models, &session) {
-            Some(_) => None,
-            // Without any key yet, still open the conversation; sending asks for one.
-            None => Some(
-                AppModels::fallback_model(cx)
-                    .ok_or_else(|| anyhow::anyhow!("no model providers are registered"))?,
-            ),
-        };
+        // A new conversation starts with the default model of a usable provider; without
+        // any, it has no model until the user picks one (sending asks for it).
+        let new = session_model(&models, &session).is_none();
+        let model = new.then(|| AppModels::default_model(cx)).flatten();
         let mut options = CodingSessionOptions::new(models, &self.root, session);
-        if model.is_some() {
+        if new {
             // A new conversation: start at the default reasoning level.
             options.thinking_level = crate::store::AppSettings::get(cx).default_thinking;
         }
@@ -508,6 +507,11 @@ impl ConversationView {
             .filter(|provider| !AppModels::has_credentials(provider, cx))
     }
 
+    /// Whether the last attempt to send found no model, while there still is none.
+    pub fn needs_model(&self) -> bool {
+        self.needs_model && self.model().is_none()
+    }
+
     /// Re-reads the project's prompt templates and skills, and its tools (MCP servers
     /// connected or gone).
     pub fn refresh_resources(&mut self, cx: &mut Context<Self>) {
@@ -738,12 +742,35 @@ impl ConversationView {
     pub fn status(&self) -> ConversationStatus {
         let agent = self.coding.as_ref().map(|coding| coding.agent());
         ConversationStatus {
-            model: agent.map(|agent| agent.model()),
+            model: agent.and_then(|agent| agent.model()),
             thinking: agent.map_or(ThinkingLevel::Off, |agent| agent.thinking_level()),
             usage: self.transcript.usage().clone(),
             running: self.running,
             tokens_per_second: self.tokens_per_second,
         }
+    }
+
+    /// The selected model; `None` until the user picks one when no provider was usable.
+    pub fn model(&self) -> Option<Model> {
+        self.coding.as_ref()?.agent().model()
+    }
+
+    /// The reasoning levels offered: the model's, or all of them without a model.
+    pub(crate) fn thinking_levels(&self) -> Vec<ThinkingLevel> {
+        self.model().map_or_else(
+            || ThinkingLevel::ALL.to_vec(),
+            |model| model.supported_thinking_levels(),
+        )
+    }
+
+    /// The requested reasoning level, clamped to the model.
+    pub(crate) fn effective_thinking(&self) -> ThinkingLevel {
+        let level = self
+            .coding
+            .as_ref()
+            .map_or(ThinkingLevel::Off, |coding| coding.agent().thinking_level());
+        self.model()
+            .map_or(level, |model| model.clamp_thinking_level(level))
     }
 
     /// The focus target for this conversation: the composer, or the view itself when
@@ -857,6 +884,7 @@ impl ConversationView {
         };
         self.info = None;
         self.needs_key = None;
+        self.needs_model = false;
         // `/model`, `/thinking` and `/permissions` without an argument list their
         // choices in the completion menu.
         if !self.running && self.open_command_options(&text, window, cx) {
@@ -867,17 +895,21 @@ impl ConversationView {
                 .update(cx, |composer, cx| composer.emplace("", cx));
             return;
         }
-        // No key for the chosen model's provider: keep the draft and ask for one.
-        let provider = coding.agent().model().provider;
-        if !AppModels::has_credentials(&provider, cx) {
-            self.needs_key = Some(provider);
+        // No model yet, or no key for its provider: keep the draft and ask for one.
+        let Some(model) = coding.agent().model() else {
+            self.needs_model = true;
+            cx.notify();
+            return;
+        };
+        if !AppModels::has_credentials(&model.provider, cx) {
+            self.needs_key = Some(model.provider);
             cx.notify();
             return;
         }
-        if !self.attachments.is_empty() && !coding.agent().model().supports_images() {
+        if !self.attachments.is_empty() && !model.supports_images() {
             self.run_error = Some(format!(
                 "{} does not accept images; remove them or pick another model",
-                coding.agent().model().qualified_id()
+                model.qualified_id()
             ));
             cx.notify();
             return;
@@ -1004,7 +1036,10 @@ impl ConversationView {
         let Some(first) = first else { return };
         self.title_requested = true;
         let models = app_models.models.clone();
-        let model = zp_core::title::title_model(&models, &coding.agent().model());
+        let Some(model) = coding.agent().model() else {
+            return;
+        };
+        let model = zp_core::title::title_model(&models, &model);
         let task = gpui_tokio::Tokio::spawn(cx, async move {
             zp_core::title::generate_title(&models, &model, &first).await
         });

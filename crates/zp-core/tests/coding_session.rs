@@ -318,3 +318,30 @@ async fn titles_and_branch_navigation() {
     assert_eq!(messages.len(), 4);
     assert_eq!(messages[3].as_assistant().unwrap().text(), "a2");
 }
+
+#[tokio::test]
+async fn a_session_can_start_without_a_model() {
+    let project = tempfile::tempdir().unwrap();
+    let cwd = project.path().to_path_buf();
+    let faux = FauxProvider::default();
+    faux.push(FauxResponse::text("hi"));
+    let session = zp_session::Session::in_memory(&cwd);
+    let coding = CodingSession::new(CodingSessionOptions::new(models(&faux), &cwd, session))
+        .expect("no model is needed to open a session");
+
+    // No model is chosen or recorded on the user's behalf; runs fail until one is set.
+    assert!(coding.agent().model().is_none());
+    assert!(coding.session().context().model.is_none());
+    assert!(!coding.needs_compaction());
+    assert!(matches!(
+        coding.prompt("hello").await,
+        Err(zp_agent::AgentError::NoModel)
+    ));
+    assert!(coding.agent().messages().is_empty());
+    assert!(faux.requests().is_empty());
+
+    coding.set_model(faux.model()).unwrap();
+    assert_eq!(coding.session().context().model.unwrap().model_id, "faux-1");
+    coding.prompt("hello").await.unwrap();
+    assert_eq!(faux.requests().len(), 1);
+}

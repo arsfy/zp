@@ -231,14 +231,13 @@ impl ConversationView {
 
     /// The choices of option command `name` matching `query`.
     fn option_items(&self, name: &str, query: &str, cx: &App) -> Vec<CompletionItem> {
-        let Some(coding) = &self.coding else {
+        if self.coding.is_none() {
             return Vec::new();
-        };
+        }
         let query = query.to_lowercase();
-        let model = coding.agent().model();
         match name {
             "model" => {
-                let current = model.qualified_id();
+                let current = self.model().map(|model| model.qualified_id());
                 self.models_matching(&query, cx)
                     .into_iter()
                     .take(MENU_ITEMS)
@@ -246,7 +245,7 @@ impl ConversationView {
                         let id = choice.model.qualified_id();
                         let context = choice.model.context_window;
                         CompletionItem {
-                            current: id == current,
+                            current: current.as_ref() == Some(&id),
                             label: id.clone(),
                             detail: if context >= 1000 {
                                 format!("{} · {}k", choice.provider_name, context / 1000)
@@ -259,9 +258,8 @@ impl ConversationView {
                     .collect()
             }
             "thinking" => {
-                let current = model.clamp_thinking_level(coding.agent().thinking_level());
-                model
-                    .supported_thinking_levels()
+                let current = self.effective_thinking();
+                self.thinking_levels()
                     .into_iter()
                     .filter(|level| level.as_str().contains(&query))
                     .map(|level| CompletionItem {
@@ -529,8 +527,10 @@ impl ConversationView {
 
     /// `/thinking <level>`.
     fn run_thinking_command(&mut self, arg: &str, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(coding) = &self.coding else { return };
-        let supported = coding.agent().model().supported_thinking_levels();
+        if self.coding.is_none() {
+            return;
+        }
+        let supported = self.thinking_levels();
         match arg.to_lowercase().parse::<ThinkingLevel>() {
             Ok(level) if supported.contains(&level) => self.select_thinking(level, window, cx),
             _ => {

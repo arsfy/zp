@@ -592,10 +592,7 @@ impl ConversationView {
 
     fn render_model_picker(&self, cx: &mut Context<Self>) -> AnyElement {
         let colors = cx.theme().colors.clone();
-        let current = self
-            .coding
-            .as_ref()
-            .map(|c| c.agent().model().qualified_id());
+        let current = self.model().map(|model| model.qualified_id());
         let choices = self.filtered_models(cx);
         let total = choices.len();
         let items = choices
@@ -710,13 +707,12 @@ impl ConversationView {
 
     fn render_thinking_picker(&self, cx: &mut Context<Self>) -> AnyElement {
         let colors = cx.theme().colors.clone();
-        let Some(coding) = &self.coding else {
+        if self.coding.is_none() {
             return div().into_any_element();
-        };
-        let model = coding.agent().model();
-        let current = model.clamp_thinking_level(coding.agent().thinking_level());
-        let items = model
-            .supported_thinking_levels()
+        }
+        let current = self.effective_thinking();
+        let items = self
+            .thinking_levels()
             .into_iter()
             .enumerate()
             .map(|(index, level)| {
@@ -774,16 +770,18 @@ impl ConversationView {
         let Some(coding) = &self.coding else {
             return div().into_any_element();
         };
-        let model = coding.agent().model();
-        let thinking = model.clamp_thinking_level(coding.agent().thinking_level());
+        let model = self.model();
+        let thinking = self.effective_thinking();
         let queued = coding.agent().steering_queue().len();
+        let none_available = self.model_choices(cx).is_empty();
         // The session's model may belong to a provider without a key.
-        let model_label = if crate::store::AppModels::has_credentials(&model.provider, cx) {
-            model.qualified_id()
-        } else if self.model_choices(cx).is_empty() {
-            "No available models".to_owned()
-        } else {
-            format!("{} · no key", model.qualified_id())
+        let model_label = match &model {
+            Some(model) if crate::store::AppModels::has_credentials(&model.provider, cx) => {
+                model.qualified_id()
+            }
+            _ if none_available => "No available models".to_owned(),
+            Some(model) => format!("{} · no key", model.qualified_id()),
+            None => "Choose a model".to_owned(),
         };
 
         let picker_button = |picker: Picker, label: String, cx: &mut Context<Self>| {
@@ -877,6 +875,40 @@ impl ConversationView {
                                     .text_color(colors.accent)
                                     .on_click(cx.listener(move |this, _, _, cx| {
                                         this.add_api_key(Some(provider.clone()), cx)
+                                    })),
+                            ),
+                    )
+                })
+                .when(self.needs_model(), |this| {
+                    let (message, button) = if none_available {
+                        (
+                            "No model is available yet. Add a provider to start the conversation.",
+                            "Add a Provider…",
+                        )
+                    } else {
+                        ("Choose a model before ZP can send this message.", "Choose a Model…")
+                    };
+                    this.child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .px_3()
+                            .py_1p5()
+                            .rounded(px(6.))
+                            .border_1()
+                            .border_color(colors.warning)
+                            .text_size(px(12.))
+                            .child(div().flex_1().child(message))
+                            .child(
+                                ghost_button("choose-model", button, cx)
+                                    .text_color(colors.accent)
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        if none_available {
+                                            this.add_api_key(None, cx);
+                                        } else {
+                                            this.toggle_picker(Picker::Model, window, cx);
+                                        }
                                     })),
                             ),
                     )
@@ -998,7 +1030,7 @@ impl ConversationView {
                                 .px_2()
                                 .pb_1p5()
                                 .child(picker_button(Picker::Model, model_label, cx))
-                                .when(model.reasoning, |this| {
+                                .when(model.as_ref().is_some_and(|m| m.reasoning), |this| {
                                     this.child(picker_button(
                                         Picker::Thinking,
                                         format!("thinking {thinking}"),

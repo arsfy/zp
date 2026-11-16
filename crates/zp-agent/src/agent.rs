@@ -51,6 +51,8 @@ pub enum AgentError {
     NothingToContinue,
     /// `continue_run` was called after an assistant message with nothing queued.
     CannotContinueFromAssistant,
+    /// No model is selected.
+    NoModel,
 }
 
 impl fmt::Display for AgentError {
@@ -62,6 +64,7 @@ impl fmt::Display for AgentError {
             Self::CannotContinueFromAssistant => {
                 "cannot continue after an assistant message without queued messages"
             }
+            Self::NoModel => "no model is selected",
         })
     }
 }
@@ -118,8 +121,8 @@ impl From<Vec<AgentMessage>> for PromptInput {
 pub struct AgentOptions {
     /// Produces model responses.
     pub stream: StreamFn,
-    /// Model for future runs.
-    pub model: Model,
+    /// Model for future runs; runs fail with [`AgentError::NoModel`] until one is set.
+    pub model: Option<Model>,
     /// Requested reasoning level (clamped per model by the provider layer).
     pub thinking_level: ThinkingLevel,
     /// System prompt.
@@ -143,10 +146,10 @@ pub struct AgentOptions {
 
 impl AgentOptions {
     /// Options with defaults: no tools, no hooks, parallel tools, one-at-a-time queues.
-    pub fn new(stream: StreamFn, model: Model) -> Self {
+    pub fn new(stream: StreamFn, model: impl Into<Option<Model>>) -> Self {
         Self {
             stream,
-            model,
+            model: model.into(),
             thinking_level: ThinkingLevel::Off,
             system_prompt: None,
             tools: Vec::new(),
@@ -160,7 +163,7 @@ impl AgentOptions {
     }
 
     /// Options streaming through `models`.
-    pub fn with_models(models: Models, model: Model) -> Self {
+    pub fn with_models(models: Models, model: impl Into<Option<Model>>) -> Self {
         Self::new(stream_fn(models), model)
     }
 }
@@ -170,8 +173,8 @@ impl AgentOptions {
 pub struct AgentState {
     /// System prompt.
     pub system_prompt: Option<String>,
-    /// Model for future runs.
-    pub model: Model,
+    /// Model for future runs, if one is selected.
+    pub model: Option<Model>,
     /// Requested reasoning level.
     pub thinking_level: ThinkingLevel,
     /// Executable tools.
@@ -192,7 +195,7 @@ impl fmt::Debug for AgentState {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let tools: Vec<&str> = self.tools.iter().map(|tool| tool.name()).collect();
         f.debug_struct("AgentState")
-            .field("model", &self.model.qualified_id())
+            .field("model", &self.model.as_ref().map(Model::qualified_id))
             .field("thinking_level", &self.thinking_level)
             .field("tools", &tools)
             .field("messages", &self.messages.len())
@@ -207,7 +210,7 @@ type Listener = Arc<dyn Fn(&AgentEvent) + Send + Sync>;
 
 struct State {
     system_prompt: Option<String>,
-    model: Model,
+    model: Option<Model>,
     thinking_level: ThinkingLevel,
     tools: Vec<Arc<dyn AgentTool>>,
     messages: Vec<AgentMessage>,
@@ -420,14 +423,14 @@ impl Agent {
         lock(&self.shared.state).messages = messages;
     }
 
-    /// The model for future runs.
-    pub fn model(&self) -> Model {
+    /// The model for future runs, if one is selected.
+    pub fn model(&self) -> Option<Model> {
         lock(&self.shared.state).model.clone()
     }
 
     /// Sets the model for future runs.
     pub fn set_model(&self, model: Model) {
-        lock(&self.shared.state).model = model;
+        lock(&self.shared.state).model = Some(model);
     }
 
     /// The requested reasoning level.
@@ -685,6 +688,9 @@ impl Agent {
             if state.run.is_some() {
                 return Err(AgentError::Busy);
             }
+            if state.model.is_none() {
+                return Err(AgentError::NoModel);
+            }
             state.run = Some(cancel.clone());
             state.streaming = None;
             state.error_message = None;
@@ -706,7 +712,8 @@ impl Agent {
             let state = lock(&self.shared.state);
             let settings = lock(&self.shared.settings);
             let config = LoopConfig {
-                model: state.model.clone(),
+                // Checked by `begin_run`; a model cannot be unset.
+                model: state.model.clone().expect("a run has a model"),
                 thinking_level: state.thinking_level,
                 system_prompt: state.system_prompt.clone(),
                 tools: state.tools.clone(),

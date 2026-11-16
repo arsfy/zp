@@ -122,7 +122,8 @@ pub struct CodingSessionOptions {
     pub cwd: PathBuf,
     /// The session to continue (new or opened).
     pub session: Session,
-    /// Model to use; `None` uses the session's last model.
+    /// Model to use; `None` uses the session's last model, if it has one (else the
+    /// session starts without a model and runs fail until one is set).
     pub model: Option<Model>,
     /// Reasoning level; `None` uses the session's last level (or off).
     pub thinking_level: Option<ThinkingLevel>,
@@ -274,14 +275,12 @@ impl CodingSession {
         } = options;
         let blobs = blobs.unwrap_or_else(BlobStore::in_memory);
         let context = session.context();
-        let model = match model {
-            Some(model) => model,
-            None => session_model(&models, &session)
-                .context("no model selected and the session has no usable model")?,
-        };
-        let recorded = context.model.as_ref();
-        if recorded.is_none_or(|r| r.provider != model.provider || r.model_id != model.id) {
-            session.append_model_change(&model.provider, &model.id)?;
+        let model = model.or_else(|| session_model(&models, &session));
+        if let Some(model) = &model {
+            let recorded = context.model.as_ref();
+            if recorded.is_none_or(|r| r.provider != model.provider || r.model_id != model.id) {
+                session.append_model_change(&model.provider, &model.id)?;
+            }
         }
         let thinking = thinking_level
             .or(context.thinking_level)
@@ -503,7 +502,9 @@ impl CodingSession {
     /// Switches the model for future runs and records it.
     pub fn set_model(&self, model: Model) -> anyhow::Result<()> {
         let current = self.agent.model();
-        if current.provider != model.provider || current.id != model.id {
+        if current
+            .is_none_or(|current| current.provider != model.provider || current.id != model.id)
+        {
             self.session()
                 .append_model_change(&model.provider, &model.id)?;
         }
@@ -617,11 +618,13 @@ impl CodingSession {
     /// Whether the context is close enough to the window to compact before the next
     /// request.
     pub fn needs_compaction(&self) -> bool {
-        crate::compaction::should_compact(
-            self.context_tokens(),
-            self.agent.model().context_window,
-            &self.compaction,
-        )
+        self.agent.model().is_some_and(|model| {
+            crate::compaction::should_compact(
+                self.context_tokens(),
+                model.context_window,
+                &self.compaction,
+            )
+        })
     }
 
     /// Whether the last response failed because the context was too large.
@@ -646,6 +649,7 @@ impl CodingSession {
         if self.agent.is_streaming() {
             bail!("cannot compact while the agent is running");
         }
+        let model = self.agent.model().context("no model is selected")?;
         // A failed attempt (e.g. a context overflow) is dropped from the context first.
         let failed = self
             .agent
@@ -664,7 +668,6 @@ impl CodingSession {
             return Ok(None);
         };
         let before = self.context_tokens();
-        let model = self.agent.model();
         let result =
             crate::compaction::summarize(&self.models, &model, preparation, instructions).await?;
         let messages = {

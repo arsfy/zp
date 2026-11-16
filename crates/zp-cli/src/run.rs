@@ -304,17 +304,18 @@ pub(crate) async fn run(models: &Models, args: RunArgs) -> Result<()> {
 fn print_header(coding: &CodingSession, style: Style) {
     let agent = coding.agent();
     let session = coding.session();
-    let model = agent.model();
+    let (model, thinking) = match agent.model() {
+        Some(model) => (
+            model.qualified_id(),
+            model.clamp_thinking_level(agent.thinking_level()),
+        ),
+        None => ("no model".to_owned(), agent.thinking_level()),
+    };
     eprintln!(
         "{}",
         style.paint(
             "2",
-            &format!(
-                "{} · thinking {} · {}",
-                model.qualified_id(),
-                model.clamp_thinking_level(agent.thinking_level()),
-                coding.cwd().display()
-            )
+            &format!("{model} · thinking {thinking} · {}", coding.cwd().display())
         )
     );
     let saved = match session.file() {
@@ -332,11 +333,14 @@ fn print_header(coding: &CodingSession, style: Style) {
 
 fn print_usage(coding: &CodingSession, style: Style) {
     let usage = coding.usage();
-    let model = coding.agent().model();
-    let context = if model.context_window > 0 && usage.last_context_tokens > 0 {
+    let window = coding
+        .agent()
+        .model()
+        .map_or(0, |model| model.context_window);
+    let context = if window > 0 && usage.last_context_tokens > 0 {
         format!(
             " · context {:.0}%",
-            usage.last_context_tokens as f64 * 100.0 / model.context_window as f64
+            usage.last_context_tokens as f64 * 100.0 / window as f64
         )
     } else {
         String::new()
@@ -536,7 +540,13 @@ fn command_line(
              /<template> [args]     run a prompt template; /skill:<name> loads a skill\n\
              /exit                  quit"
         ),
-        "model" if argument.is_empty() => eprintln!("{}", coding.agent().model().qualified_id()),
+        "model" if argument.is_empty() => eprintln!(
+            "{}",
+            coding
+                .agent()
+                .model()
+                .map_or_else(|| "no model".to_owned(), |model| model.qualified_id())
+        ),
         "model" => {
             let model = crate::select_model(models, Some(argument))?;
             eprintln!(
@@ -549,7 +559,10 @@ fn command_line(
         "thinking" => {
             let level: ThinkingLevel = argument.parse().map_err(anyhow::Error::msg)?;
             coding.set_thinking_level(level)?;
-            let effective = coding.agent().model().clamp_thinking_level(level);
+            let effective = coding
+                .agent()
+                .model()
+                .map_or(level, |model| model.clamp_thinking_level(level));
             eprintln!("{}", style.paint("2", &format!("thinking: {effective}")));
         }
         "name" if !argument.is_empty() => coding.set_name(Some(argument.to_owned()))?,
