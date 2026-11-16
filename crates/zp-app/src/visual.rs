@@ -110,6 +110,11 @@ pub fn run(out: PathBuf) {
         models.set_provider(Arc::new(faux.clone()));
         AppModels::set(models, false, cx);
     });
+    if std::env::var("ZP_VISUAL_SCENE").as_deref() == Ok("terminal") {
+        terminal_interactions(&mut cx, &root, &out);
+        println!("terminal screenshots written to {}", out.display());
+        return;
+    }
     if std::env::var("ZP_VISUAL_SCENE").as_deref() == Ok("review-model") {
         review_model_dialogs(&mut cx, &root, &out);
         println!("review model screenshots written to {}", out.display());
@@ -269,6 +274,74 @@ pub fn run(out: PathBuf) {
 
 fn data_dir_of(data: &tempfile::TempDir) -> PathBuf {
     data.path().to_path_buf()
+}
+
+fn terminal_interactions(
+    cx: &mut VisualTestAppContext,
+    root: &std::path::Path,
+    out: &std::path::Path,
+) {
+    for (width, name, search_name) in [
+        (1000., "38-terminal-links.png", "39-terminal-search.png"),
+        (
+            700.,
+            "40-terminal-links-narrow.png",
+            "41-terminal-search-narrow.png",
+        ),
+    ] {
+        let project_root = root.join(format!("terminal-{}", width as u32));
+        std::fs::create_dir_all(&project_root).unwrap();
+        let root = project_root.as_path();
+        let window = cx
+            .open_offscreen_window(size(px(width), px(650.)), |window, cx| {
+                let session = zp_session::Session::in_memory(root);
+                cx.new(|cx| ProjectWindow::new_with_session(root.to_owned(), session, window, cx))
+            })
+            .unwrap();
+        window
+            .update(cx, |view, window, cx| {
+                view.toggle_terminal(window, cx);
+                view.toggle_terminal_maximized(cx);
+            })
+            .unwrap();
+        pump(cx, Duration::from_millis(500));
+        let terminal = cx.update(|cx| window.read(cx).unwrap().terminal_for_screenshot().unwrap());
+        cx.update(|cx| terminal.update(cx, |view, _| view.write(
+            b"printf '%b' '\\033[3J\\033[2J\\033[H\\033[1;32mServer ready\\033[0m\\nhttp://localhost:3000/project/development/preview?theme=dark&view=terminal\\n\\033]8;;https://example.com/docs\\033\\\\Documentation\\033]8;;\\033\\\\\\n\\nBUILD complete: 12 modules\\nbuild cache: 12 hits, 0 misses\\n'; sleep 30\r".to_vec()
+        )));
+        pump(cx, Duration::from_millis(600));
+        let target = cx.update(|cx| terminal.read(cx).cell_position(1, 12));
+        let modifiers = if cfg!(target_os = "macos") {
+            Modifiers {
+                platform: true,
+                ..Modifiers::none()
+            }
+        } else {
+            Modifiers {
+                control: true,
+                ..Modifiers::none()
+            }
+        };
+        cx.simulate_mouse_move(window.into(), target, None, modifiers);
+        cx.capture_screenshot(window.into())
+            .unwrap()
+            .save(out.join(name))
+            .unwrap();
+        cx.simulate_keystrokes(
+            window.into(),
+            if cfg!(target_os = "macos") {
+                "cmd-f"
+            } else {
+                "ctrl-shift-f"
+            },
+        );
+        cx.simulate_input(window.into(), "build");
+        pump(cx, Duration::from_millis(100));
+        cx.capture_screenshot(window.into())
+            .unwrap()
+            .save(out.join(search_name))
+            .unwrap();
+    }
 }
 
 fn review_model_dialogs(

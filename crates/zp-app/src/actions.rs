@@ -51,7 +51,10 @@ actions!(
         SubmitEdit,
         CancelEdit,
         ToggleTerminal,
-        NewTerminal
+        NewTerminal,
+        TerminalFindNext,
+        TerminalFindPrevious,
+        TerminalCloseSearch
     ]
 );
 
@@ -232,6 +235,41 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("escape", StopRun, Some(COMPOSER_INPUT)),
         KeyBinding::new("enter", PickFirstModel, Some(MODEL_FILTER_INPUT)),
         KeyBinding::new("escape", ClosePicker, Some(MODEL_FILTER_INPUT)),
+        KeyBinding::new(
+            "enter",
+            TerminalFindNext,
+            Some("TerminalSearch > EditableText"),
+        ),
+        KeyBinding::new(
+            "shift-enter",
+            TerminalFindPrevious,
+            Some("TerminalSearch > EditableText"),
+        ),
+        KeyBinding::new(
+            "f3",
+            TerminalFindNext,
+            Some("TerminalSearch > EditableText"),
+        ),
+        KeyBinding::new(
+            "shift-f3",
+            TerminalFindPrevious,
+            Some("TerminalSearch > EditableText"),
+        ),
+        KeyBinding::new(
+            "escape",
+            TerminalCloseSearch,
+            Some("TerminalSearch > EditableText"),
+        ),
+        KeyBinding::new(
+            "secondary-g",
+            TerminalFindNext,
+            Some("TerminalSearch > EditableText"),
+        ),
+        KeyBinding::new(
+            "secondary-shift-g",
+            TerminalFindPrevious,
+            Some("TerminalSearch > EditableText"),
+        ),
         KeyBinding::new(
             "down",
             CompletionNext,

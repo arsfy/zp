@@ -23,6 +23,7 @@ gpui_elements.workspace = true
 gpui_platform.workspace = true
 gpui_tokio.workspace = true
 pulldown-cmark.workspace = true
+regex.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
 trash.workspace = true

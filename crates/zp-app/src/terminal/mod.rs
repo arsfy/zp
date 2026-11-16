@@ -7,7 +7,11 @@
 
 mod colors;
 pub mod keys;
+mod links;
 mod process;
+mod search;
+#[cfg(test)]
+mod tests;
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -28,14 +32,17 @@ use alacritty_terminal::tty;
 use alacritty_terminal::vte::ansi::{Color, CursorShape, NamedColor, Rgb};
 use futures::StreamExt as _;
 use gpui::{
-    App, Bounds, ClipboardItem, Context, ElementInputHandler, EntityInputHandler, EventEmitter,
-    FocusHandle, Focusable, Font, FontStyle, FontWeight, Hsla, KeyDownEvent, MouseButton,
-    MouseDownEvent, MouseMoveEvent, Pixels, Point, Render, ScrollWheelEvent, StrikethroughStyle,
+    App, AppContext as _, Bounds, ClipboardItem, ColorExt as _, Context, DispatchPhase,
+    ElementInputHandler, Entity, EntityInputHandler, EventEmitter, FocusHandle, Focusable, Font,
+    FontStyle, FontWeight, Hsla, KeyDownEvent, Modifiers, MouseButton, MouseDownEvent,
+    MouseMoveEvent, Pixels, Point, Render, ScrollWheelEvent, StrikethroughStyle, Subscription,
     Task, TextAlign, TextRun, UTF16Selection, UnderlineStyle, Window, canvas, div, font, point,
-    prelude::*, px, size,
+    prelude::*, px, rgb_to_hsla, size,
 };
+use gpui_elements::editable_text::{EditableTextState, StringStorage, TextChanged};
 
 use self::colors::{Palette, to_hsla};
+use crate::context_menu::ContextMenu;
 use crate::theme::ActiveTheme;
 
 /// Lines kept above the screen.
@@ -88,6 +95,7 @@ pub enum TerminalEvent {
     Exited,
     /// The program set the title.
     TitleChanged,
+    ContextMenu(Entity<ContextMenu>, Point<Pixels>),
 }
 
 pub struct TerminalView {
@@ -104,6 +112,15 @@ pub struct TerminalView {
     selecting: bool,
     /// Fractional lines of scrolling not applied yet.
     scroll_remainder: f32,
+    link_detector: links::Detector,
+    hovered_link: Option<links::Link>,
+    pending_link: Option<links::Link>,
+    reported_button: Option<MouseButton>,
+    last_mouse_report: Option<(GridPoint, u8)>,
+    reported_focus: bool,
+    search_input: Entity<EditableTextState>,
+    search: Option<search::Search>,
+    _subscriptions: Vec<Subscription>,
     /// Finds the program in the foreground.
     process: process::Watch,
     /// Its name (`zsh`, `vim`, `cargo`…), once known.
@@ -162,7 +179,7 @@ impl Shell {
 
 impl TerminalView {
     /// A view of `shell`.
-    pub fn new(shell: Shell, cx: &mut Context<Self>) -> Self {
+    pub fn new(shell: Shell, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let Shell {
             term,
             sender,
@@ -187,8 +204,12 @@ impl TerminalView {
                     batch.push(event);
                 }
                 let updated = this.update(cx, |this, cx| {
+                    let changed = batch.iter().any(|event| matches!(event, TermEvent::Wakeup));
                     for event in batch {
                         this.handle_event(event, cx);
+                    }
+                    if changed {
+                        this.refresh_search(false, cx);
                     }
                 });
                 if updated.is_err() {
@@ -196,10 +217,24 @@ impl TerminalView {
                 }
             }
         });
+        let focus_handle = cx.focus_handle();
+        let search_input = cx.new(|cx| EditableTextState::new(StringStorage::default(), cx));
+        let subscriptions = vec![
+            cx.subscribe(&search_input, |this, _, _: &TextChanged, cx| {
+                this.refresh_search(true, cx);
+            }),
+            cx.on_focus(&focus_handle, window, |this, window, cx| {
+                this.report_focus(window, cx)
+            }),
+            cx.on_blur(&focus_handle, window, |this, window, cx| {
+                this.report_focus(window, cx)
+            }),
+            cx.observe_window_activation(window, |this, window, cx| this.report_focus(window, cx)),
+        ];
         Self {
             term,
             sender,
-            focus_handle: cx.focus_handle(),
+            focus_handle,
             metrics: Rc::default(),
             title: None,
             exited: None,
@@ -207,6 +242,15 @@ impl TerminalView {
             selection_anchor: None,
             selecting: false,
             scroll_remainder: 0.0,
+            link_detector: links::Detector::default(),
+            hovered_link: None,
+            pending_link: None,
+            reported_button: None,
+            last_mouse_report: None,
+            reported_focus: false,
+            search_input,
+            search: None,
+            _subscriptions: subscriptions,
             process,
             process_name: None,
             _events: task,
@@ -240,6 +284,16 @@ impl TerminalView {
     /// The title the program set, if any.
     pub fn title(&self) -> Option<&str> {
         self.title.as_deref()
+    }
+
+    #[cfg(feature = "visual-tests")]
+    pub(crate) fn cell_position(&self, line: usize, column: usize) -> Point<Pixels> {
+        let metrics = *self.metrics.borrow();
+        metrics.origin
+            + point(
+                metrics.cell.width * (column as f32 + 0.5),
+                metrics.cell.height * (line as f32 + 0.5),
+            )
     }
 
     /// The visible text (tests).
@@ -276,6 +330,7 @@ impl TerminalView {
         match event {
             TermEvent::Wakeup => {
                 self.poll_process(cx);
+                self.hovered_link = None;
                 cx.notify()
             }
             TermEvent::MouseCursorDirty | TermEvent::CursorBlinkingChange => cx.notify(),
@@ -345,24 +400,92 @@ impl TerminalView {
         term.scroll_display(Scroll::Bottom);
         term.selection = None;
         drop(term);
+        self.hovered_link = None;
         cx.notify();
     }
 
-    fn key_down(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
+    fn key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.focus_handle.is_focused(window) {
+            return;
+        }
         let keystroke = &event.keystroke;
-        if keystroke.modifiers.platform {
-            match keystroke.key.as_str() {
-                "c" if self.copy(cx) => cx.stop_propagation(),
+        let modifiers = keystroke.modifiers;
+        let shortcut = if cfg!(target_os = "macos") {
+            modifiers.platform
+        } else {
+            modifiers.control && modifiers.shift
+        };
+        if shortcut {
+            let handled = match keystroke.key.as_str() {
+                "c" => {
+                    self.copy(cx);
+                    true
+                }
                 "v" => {
                     self.paste(cx);
-                    cx.stop_propagation();
+                    true
                 }
                 "k" => {
                     self.clear(cx);
-                    cx.stop_propagation();
+                    true
                 }
-                _ => {}
+                "a" => {
+                    self.select_all(cx);
+                    true
+                }
+                "f" => {
+                    self.open_search(window, cx);
+                    true
+                }
+                "g" if self.search.is_some() => {
+                    self.next_match(modifiers.shift, cx);
+                    true
+                }
+                "up" | "home" => {
+                    self.scroll_display(Scroll::Top, cx);
+                    true
+                }
+                "down" | "end" => {
+                    self.scroll_display(Scroll::Bottom, cx);
+                    true
+                }
+                _ => false,
+            };
+            if handled {
+                cx.stop_propagation();
+                return;
             }
+            if modifiers.platform {
+                return;
+            }
+        }
+        if modifiers.shift && !modifiers.control && !modifiers.alt {
+            let scroll = match keystroke.key.as_str() {
+                "pageup" => Some(Scroll::PageUp),
+                "pagedown" => Some(Scroll::PageDown),
+                "home" => Some(Scroll::Top),
+                "end" => Some(Scroll::Bottom),
+                "insert" => {
+                    self.paste(cx);
+                    cx.stop_propagation();
+                    return;
+                }
+                _ => None,
+            };
+            if let Some(scroll) = scroll {
+                self.scroll_display(scroll, cx);
+                cx.stop_propagation();
+                return;
+            }
+        }
+        if keystroke.key == "escape" && self.search.is_some() {
+            self.close_search(window, cx);
+            cx.stop_propagation();
+            return;
+        }
+        if keystroke.key == "f3" && self.search.is_some() {
+            self.next_match(modifiers.shift, cx);
+            cx.stop_propagation();
             return;
         }
         let mode = *self.term.lock().mode();
@@ -380,6 +503,45 @@ impl TerminalView {
         };
         cx.write_to_clipboard(ClipboardItem::new_string(text));
         true
+    }
+
+    fn select_all(&mut self, cx: &mut Context<Self>) {
+        let mut term = self.term.lock();
+        let mut selection = Selection::new(
+            SelectionType::Simple,
+            GridPoint::new(term.topmost_line(), Column(0)),
+            Side::Left,
+        );
+        selection.update(
+            GridPoint::new(term.bottommost_line(), term.last_column()),
+            Side::Right,
+        );
+        term.selection = Some(selection);
+        drop(term);
+        cx.notify();
+    }
+
+    fn scroll_display(&mut self, scroll: Scroll, cx: &mut Context<Self>) {
+        self.term.lock().scroll_display(scroll);
+        self.hovered_link = None;
+        self.last_mouse_report = None;
+        cx.notify();
+    }
+
+    fn report_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let focused = self.focus_handle.is_focused(window) && window.is_window_active();
+        if focused != self.reported_focus {
+            if self.term.lock().mode().contains(TermMode::FOCUS_IN_OUT) {
+                self.write_str(if focused { "\x1b[I" } else { "\x1b[O" });
+            }
+            self.reported_focus = focused;
+        }
+        if !focused {
+            self.selecting = false;
+            self.selection_anchor = None;
+            self.pending_link = None;
+        }
+        cx.notify();
     }
 
     fn paste(&mut self, cx: &mut Context<Self>) {
@@ -425,21 +587,55 @@ impl TerminalView {
     }
 
     fn mouse_down(&mut self, event: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        cx.stop_propagation();
         self.focus_handle.focus(window, cx);
         let Some((point, side)) = self.grid_point(event.position) else {
             return;
         };
-        let kind = match event.click_count {
-            2 => SelectionType::Semantic,
-            3.. => SelectionType::Lines,
-            _ => SelectionType::Simple,
+        if link_modifier(event.modifiers)
+            && event.button == MouseButton::Left
+            && self.inside_grid(event.position)
+        {
+            self.pending_link = self.link_detector.at(&self.term.lock(), point);
+            if self.pending_link.is_some() {
+                return;
+            }
+        }
+        let mode = *self.term.lock().mode();
+        if mode.intersects(TermMode::MOUSE_MODE) && !event.modifiers.shift {
+            if let Some(code) = mouse_button_code(event.button) {
+                self.reported_button = Some(event.button);
+                self.send_mouse(code, point, false, event.modifiers);
+            }
+            return;
+        }
+        if event.button == MouseButton::Right {
+            self.open_context_menu(event.position, point, window, cx);
+            return;
+        }
+        if event.button == MouseButton::Middle {
+            self.paste(cx);
+            return;
+        }
+        if event.button != MouseButton::Left {
+            return;
+        }
+        let kind = if event.modifiers.alt {
+            SelectionType::Block
+        } else {
+            match event.click_count {
+                2 => SelectionType::Semantic,
+                3.. => SelectionType::Lines,
+                _ => SelectionType::Simple,
+            }
         };
         let mut term = self.term.lock();
         if event.modifiers.shift
+            && !event.modifiers.alt
             && let Some(selection) = term.selection.as_mut()
         {
             selection.update(point, side);
-        } else if kind == SelectionType::Simple {
+        } else if matches!(kind, SelectionType::Simple | SelectionType::Block) {
             term.selection = None;
             self.selection_anchor = Some((point, side, kind));
         } else {
@@ -452,8 +648,60 @@ impl TerminalView {
     }
 
     fn mouse_move(&mut self, event: &MouseMoveEvent, _: &mut Window, cx: &mut Context<Self>) {
-        if !self.selecting || event.pressed_button != Some(MouseButton::Left) {
+        let previous_hover = self.hovered_link.clone();
+        self.update_hover(event.position, event.modifiers);
+        let hover_changed = self.hovered_link != previous_hover;
+        if self
+            .pending_link
+            .as_ref()
+            .is_some_and(|link| self.hovered_link.as_ref() != Some(link))
+        {
+            self.pending_link = None;
+        }
+        if self.pending_link.is_some() {
+            if hover_changed {
+                cx.notify();
+            }
             return;
+        }
+        let mode = *self.term.lock().mode();
+        if !self.selecting
+            && self.inside_grid(event.position)
+            && !event.modifiers.shift
+            && !link_modifier(event.modifiers)
+        {
+            let report = mode.contains(TermMode::MOUSE_MOTION)
+                || (mode.contains(TermMode::MOUSE_DRAG) && self.reported_button.is_some());
+            if report && let Some((point, _)) = self.grid_point(event.position) {
+                let code = self
+                    .reported_button
+                    .and_then(mouse_button_code)
+                    .unwrap_or(3)
+                    + 32;
+                if self.last_mouse_report != Some((point, code)) {
+                    self.send_mouse(code, point, false, event.modifiers);
+                }
+            }
+        }
+        if !self.selecting || event.pressed_button != Some(MouseButton::Left) {
+            if hover_changed {
+                cx.notify();
+            }
+            return;
+        }
+        let metrics = *self.metrics.borrow();
+        if let Some(grid) = metrics.grid {
+            let delta = if event.position.y < metrics.origin.y {
+                1
+            } else if event.position.y > metrics.origin.y + metrics.cell.height * grid.lines as f32
+            {
+                -1
+            } else {
+                0
+            };
+            if delta != 0 {
+                self.term.lock().scroll_display(Scroll::Delta(delta));
+            }
         }
         let Some((point, side)) = self.grid_point(event.position) else {
             return;
@@ -469,9 +717,121 @@ impl TerminalView {
         cx.notify();
     }
 
-    fn mouse_up(&mut self, _: &gpui::MouseUpEvent, _: &mut Window, _: &mut Context<Self>) {
+    fn mouse_up(&mut self, event: &gpui::MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+        if self.reported_button == Some(event.button) {
+            if let Some((point, _)) = self.grid_point(event.position)
+                && let Some(code) = mouse_button_code(event.button)
+            {
+                self.send_mouse(code, point, true, event.modifiers);
+            }
+            self.reported_button = None;
+        }
+        if event.button != MouseButton::Left {
+            return;
+        }
+        if let Some(link) = self.pending_link.take()
+            && link_modifier(event.modifiers)
+            && self.inside_grid(event.position)
+            && let Some((point, _)) = self.grid_point(event.position)
+            && self.link_detector.at(&self.term.lock(), point).as_ref() == Some(&link)
+        {
+            cx.open_url(&link.url);
+        }
         self.selecting = false;
         self.selection_anchor = None;
+        cx.notify();
+    }
+
+    fn inside_grid(&self, position: Point<Pixels>) -> bool {
+        let metrics = *self.metrics.borrow();
+        metrics.grid.is_some_and(|grid| {
+            Bounds::new(
+                metrics.origin,
+                size(
+                    metrics.cell.width * grid.columns as f32,
+                    metrics.cell.height * grid.lines as f32,
+                ),
+            )
+            .contains(&position)
+        })
+    }
+
+    fn update_hover(&mut self, position: Point<Pixels>, modifiers: Modifiers) {
+        self.hovered_link =
+            if link_modifier(modifiers) && !self.selecting && self.inside_grid(position) {
+                self.grid_point(position)
+                    .and_then(|(point, _)| self.link_detector.at(&self.term.lock(), point))
+            } else {
+                None
+            };
+    }
+
+    fn send_mouse(&mut self, code: u8, point: GridPoint, release: bool, modifiers: Modifiers) {
+        let term = self.term.lock();
+        let line = (point.line.0 + term.grid().display_offset() as i32).max(0) as usize;
+        if let Some(bytes) =
+            keys::mouse_report(code, point.column.0, line, release, modifiers, *term.mode())
+        {
+            self.write(bytes);
+        }
+        self.last_mouse_report = if release { None } else { Some((point, code)) };
+    }
+
+    fn open_context_menu(
+        &mut self,
+        position: Point<Pixels>,
+        point: GridPoint,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let link = self.link_detector.at(&self.term.lock(), point);
+        let selected = self.term.lock().selection_to_string().is_some();
+        let this = cx.entity().downgrade();
+        let menu = ContextMenu::new(window, cx, |mut menu| {
+            if let Some(link) = link {
+                let url = link.url.clone();
+                menu = menu.item("Open Link", move |_, cx| cx.open_url(&url));
+                menu = menu
+                    .item("Copy Link", move |_, cx| {
+                        cx.write_to_clipboard(ClipboardItem::new_string(link.url.clone()))
+                    })
+                    .separator();
+            }
+            if selected {
+                let view = this.clone();
+                menu = menu.item("Copy", move |_, cx| {
+                    let _ = view.update(cx, |view, cx| {
+                        view.copy(cx);
+                    });
+                });
+            }
+            let paste = this.clone();
+            let select = this.clone();
+            let find = this.clone();
+            menu.item("Paste", move |window, cx| {
+                let _ = paste.update(cx, |view, cx| {
+                    view.focus_handle.focus(window, cx);
+                    view.paste(cx);
+                });
+            })
+            .item("Select All", move |window, cx| {
+                let _ = select.update(cx, |view, cx| {
+                    view.focus_handle.focus(window, cx);
+                    view.select_all(cx);
+                });
+            })
+            .item("Find", move |window, cx| {
+                let _ = find.update(cx, |view, cx| view.open_search(window, cx));
+            })
+            .separator()
+            .item("Clear Terminal", move |window, cx| {
+                let _ = this.update(cx, |view, cx| {
+                    view.focus_handle.focus(window, cx);
+                    view.clear(cx);
+                });
+            })
+        });
+        cx.emit(TerminalEvent::ContextMenu(menu, position));
     }
 
     fn scroll(&mut self, event: &ScrollWheelEvent, _: &mut Window, cx: &mut Context<Self>) {
@@ -488,7 +848,19 @@ impl TerminalView {
             return;
         }
         let mode = *self.term.lock().mode();
-        if mode.contains(TermMode::ALT_SCREEN | TermMode::ALTERNATE_SCROLL)
+        let whole = whole.clamp(-1000, 1000);
+        if mode.intersects(TermMode::MOUSE_MODE) && !event.modifiers.shift {
+            if let Some((point, _)) = self.grid_point(event.position) {
+                for _ in 0..whole.unsigned_abs() {
+                    self.send_mouse(
+                        if whole > 0 { 64 } else { 65 },
+                        point,
+                        false,
+                        event.modifiers,
+                    );
+                }
+            }
+        } else if mode.contains(TermMode::ALT_SCREEN | TermMode::ALTERNATE_SCROLL)
             && !event.modifiers.shift
         {
             // Full-screen programs (less, vim) scroll with the arrow keys.
@@ -500,7 +872,7 @@ impl TerminalView {
             };
             self.write_str(&key.repeat(whole.unsigned_abs() as usize));
         } else {
-            self.term.lock().scroll_display(Scroll::Delta(whole));
+            self.scroll_display(Scroll::Delta(whole), cx);
         }
         cx.notify();
     }
@@ -513,11 +885,22 @@ impl TerminalView {
         let theme = cx.theme().clone();
         let focus = self.focus_handle.clone();
         let view = cx.entity();
+        let resize_view = cx.entity().downgrade();
         let marked = self.marked.clone();
+        let hovered = self.hovered_link.clone();
+        let matches = self
+            .search
+            .as_ref()
+            .map(|search| search.matches.clone())
+            .unwrap_or_default();
+        let active_match = self
+            .search
+            .as_ref()
+            .and_then(|search| search.active().cloned());
         let font_family = theme.metrics.mono_font.clone();
         let font_size = theme.metrics.font_size - px(1.);
         canvas(
-            move |bounds, window, _cx| {
+            move |bounds, window, cx| {
                 let base = font(font_family);
                 let text_system = window.text_system();
                 let font_id = text_system.resolve_font(&base);
@@ -533,6 +916,10 @@ impl TerminalView {
                 if stored.grid != Some(grid) {
                     term.lock().resize(grid);
                     let _ = sender.send(Msg::Resize(window_size(grid, cell)));
+                    let view = resize_view.clone();
+                    cx.defer(move |cx| {
+                        let _ = view.update(cx, |view, cx| view.refresh_search(false, cx));
+                    });
                 }
                 stored.grid = Some(grid);
                 stored.cell = cell;
@@ -597,6 +984,16 @@ impl TerminalView {
                         .is_some_and(|range| range.contains(indexed.point));
                     let background = if selected {
                         Some(selection_background)
+                    } else if active_match
+                        .as_ref()
+                        .is_some_and(|range| range.contains(&indexed.point))
+                    {
+                        Some(rgb_to_hsla(theme.colors.accent).opacity(0.45))
+                    } else if matches
+                        .get(matches.partition_point(|range| *range.end() < indexed.point))
+                        .is_some_and(|range| range.contains(&indexed.point))
+                    {
+                        Some(rgb_to_hsla(theme.colors.warning).opacity(0.25))
                     } else {
                         (bg != default_background).then(|| to_hsla(bg))
                     };
@@ -622,10 +1019,20 @@ impl TerminalView {
                         continue;
                     }
                     let style = Style {
-                        color: to_hsla(fg),
+                        color: if hovered
+                            .as_ref()
+                            .is_some_and(|link| link.range.contains(&indexed.point))
+                        {
+                            rgb_to_hsla(theme.colors.accent)
+                        } else {
+                            to_hsla(fg)
+                        },
                         bold: flags.contains(Flags::BOLD),
                         italic: flags.contains(Flags::ITALIC),
-                        underline: flags.intersects(Flags::ALL_UNDERLINES),
+                        underline: flags.intersects(Flags::ALL_UNDERLINES)
+                            || hovered
+                                .as_ref()
+                                .is_some_and(|link| link.range.contains(&indexed.point)),
                         strike: flags.contains(Flags::STRIKEOUT),
                     };
                     match segments.last_mut() {
@@ -771,6 +1178,23 @@ struct Style {
     strike: bool,
 }
 
+fn link_modifier(modifiers: Modifiers) -> bool {
+    if cfg!(target_os = "macos") {
+        modifiers.platform
+    } else {
+        modifiers.control
+    }
+}
+
+fn mouse_button_code(button: MouseButton) -> Option<u8> {
+    match button {
+        MouseButton::Left => Some(0),
+        MouseButton::Middle => Some(1),
+        MouseButton::Right => Some(2),
+        _ => None,
+    }
+}
+
 /// Cells of one line with the same style, painted as one run.
 struct Segment {
     line: usize,
@@ -847,23 +1271,68 @@ impl Focusable for TerminalView {
 }
 
 impl Render for TerminalView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = cx.theme().colors.clone();
+        self.update_hover(window.mouse_position(), window.modifiers());
+        let movement = cx.entity().downgrade();
+        let release = cx.entity().downgrade();
         div()
             .id("terminal")
             .key_context("Terminal")
             .track_focus(&self.focus_handle)
             .on_key_down(cx.listener(Self::key_down))
-            .on_mouse_down(MouseButton::Left, cx.listener(Self::mouse_down))
-            .on_mouse_move(cx.listener(Self::mouse_move))
-            .on_mouse_up(MouseButton::Left, cx.listener(Self::mouse_up))
-            .on_scroll_wheel(cx.listener(Self::scroll))
-            .cursor_text()
+            .on_action(
+                cx.listener(|this, _: &crate::actions::TerminalFindNext, _, cx| {
+                    this.next_match(false, cx)
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &crate::actions::TerminalFindPrevious, _, cx| {
+                    this.next_match(true, cx)
+                }),
+            )
+            .on_action(cx.listener(
+                |this, _: &crate::actions::TerminalCloseSearch, window, cx| {
+                    this.close_search(window, cx)
+                },
+            ))
             .size_full()
+            .flex()
+            .flex_col()
             .bg(colors.background)
-            .px_3()
-            .py_1()
-            .child(self.render_grid(cx))
+            .children(self.render_search(cx))
+            .child(
+                div()
+                    .id("terminal-grid")
+                    .debug_selector(|| "terminal-grid".into())
+                    .on_mouse_down(MouseButton::Left, cx.listener(Self::mouse_down))
+                    .on_mouse_down(MouseButton::Right, cx.listener(Self::mouse_down))
+                    .on_mouse_down(MouseButton::Middle, cx.listener(Self::mouse_down))
+                    .on_mouse_move_all(move |event, phase, _, window, cx| {
+                        if phase == DispatchPhase::Bubble {
+                            let _ =
+                                movement.update(cx, |view, cx| view.mouse_move(event, window, cx));
+                        }
+                    })
+                    .on_mouse_up_all(move |event, phase, _, window, cx| {
+                        if phase == DispatchPhase::Bubble {
+                            let _ = release.update(cx, |view, cx| view.mouse_up(event, window, cx));
+                        }
+                    })
+                    .on_modifiers_changed(cx.listener(|_, _, _, cx| cx.notify()))
+                    .on_scroll_wheel(cx.listener(Self::scroll))
+                    .cursor_text()
+                    .when(self.hovered_link.is_some(), |this| this.cursor_pointer())
+                    .when_some(self.hovered_link.as_ref(), |this, link| {
+                        this.tooltip(crate::ui::tooltip(link.url.clone()))
+                    })
+                    .flex_1()
+                    .min_h_0()
+                    .w_full()
+                    .px_3()
+                    .py_1()
+                    .child(self.render_grid(cx)),
+            )
     }
 }
 

@@ -1,6 +1,58 @@
 //! Keystrokes to the bytes a terminal program expects (xterm conventions).
 
+use alacritty_terminal::term::TermMode;
 use gpui::Keystroke;
+use gpui::Modifiers;
+
+/// Xterm mouse reporting, including SGR and the older UTF-8/byte protocols.
+pub(super) fn mouse_report(
+    button: u8,
+    column: usize,
+    line: usize,
+    release: bool,
+    modifiers: Modifiers,
+    mode: TermMode,
+) -> Option<Vec<u8>> {
+    let modifiers = u8::from(modifiers.shift) * 4
+        + u8::from(modifiers.alt) * 8
+        + u8::from(modifiers.control) * 16;
+    let code = button + modifiers;
+    if mode.contains(TermMode::SGR_MOUSE) {
+        return Some(
+            format!(
+                "\x1b[<{code};{};{}{}",
+                column + 1,
+                line + 1,
+                if release { 'm' } else { 'M' }
+            )
+            .into_bytes(),
+        );
+    }
+    let limit = if mode.contains(TermMode::UTF8_MOUSE) {
+        2015
+    } else {
+        223
+    };
+    if column >= limit || line >= limit {
+        return None;
+    }
+    let code = if release { 3 + modifiers } else { code };
+    let mut report = b"\x1b[M".to_vec();
+    report.push(32 + code);
+    for value in [column + 33, line + 33] {
+        if mode.contains(TermMode::UTF8_MOUSE) {
+            let mut buffer = [0; 4];
+            report.extend_from_slice(
+                char::from_u32(value as u32)?
+                    .encode_utf8(&mut buffer)
+                    .as_bytes(),
+            );
+        } else {
+            report.push(value as u8);
+        }
+    }
+    Some(report)
+}
 
 /// xterm's modifier parameter: 1 + shift + 2·alt + 4·ctrl.
 fn modifier_code(keystroke: &Keystroke) -> u8 {
@@ -119,8 +171,8 @@ pub fn to_esc(keystroke: &Keystroke, app_cursor: bool) -> Option<String> {
 /// with line breaks as carriage returns.
 pub fn paste(text: &str, bracketed: bool) -> String {
     if bracketed {
-        // A pasted end marker would end the paste early.
-        let text = text.replace("\x1b[201~", "");
+        // Strip escape/control introducers so pasted text cannot end bracketed mode.
+        let text = text.replace(['\x1b', '\u{009b}'], "");
         format!("\x1b[200~{text}\x1b[201~")
     } else {
         text.replace("\r\n", "\r").replace('\n', "\r")
@@ -168,5 +220,34 @@ mod tests {
     fn pasting() {
         assert_eq!(paste("a\nb\r\nc", false), "a\rb\rc");
         assert_eq!(paste("x", true), "\x1b[200~x\x1b[201~");
+        assert_eq!(
+            paste("a\x1b[201~b\u{009b}201~", true),
+            "\x1b[200~a[201~b201~\x1b[201~"
+        );
+    }
+
+    #[test]
+    fn mouse_protocols() {
+        let mode = TermMode::SGR_MOUSE;
+        assert_eq!(
+            mouse_report(0, 5, 2, false, Modifiers::none(), mode).unwrap(),
+            b"\x1b[<0;6;3M"
+        );
+        assert_eq!(
+            mouse_report(0, 5, 2, true, Modifiers::none(), mode).unwrap(),
+            b"\x1b[<0;6;3m"
+        );
+        assert_eq!(
+            mouse_report(64, 0, 0, false, Modifiers::none(), mode).unwrap(),
+            b"\x1b[<64;1;1M"
+        );
+        assert_eq!(
+            mouse_report(0, 0, 0, true, Modifiers::none(), TermMode::empty()).unwrap(),
+            b"\x1b[M#!!"
+        );
+        assert!(mouse_report(0, 223, 0, false, Modifiers::none(), TermMode::empty()).is_none());
+        let report =
+            mouse_report(0, 250, 0, false, Modifiers::none(), TermMode::UTF8_MOUSE).unwrap();
+        assert_eq!(&report[4..], "\u{011b}!".as_bytes());
     }
 }

@@ -139,7 +139,7 @@ impl ProjectWindow {
     fn spawn_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         match Shell::spawn(&self.root) {
             Ok(shell) => {
-                let view = cx.new(|cx| TerminalView::new(shell, cx));
+                let view = cx.new(|cx| TerminalView::new(shell, window, cx));
                 let events = cx.subscribe_in(
                     &view,
                     window,
@@ -147,6 +147,9 @@ impl ProjectWindow {
                         // Like VS Code, a terminal whose shell exits goes away.
                         TerminalEvent::Exited => this.close_terminal(view.entity_id(), window, cx),
                         TerminalEvent::TitleChanged => cx.notify(),
+                        TerminalEvent::ContextMenu(menu, position) => {
+                            this.show_menu(menu.clone(), *position, cx)
+                        }
                     },
                 );
                 self.terminals.tabs.push(TerminalTab {
