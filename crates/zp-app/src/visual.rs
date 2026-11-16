@@ -185,6 +185,51 @@ pub fn run(out: PathBuf) {
             .save(out.join(name))
             .unwrap();
     }
+    // The terminal panel, with some colored output.
+    cx.update(|cx| {
+        window
+            .update(cx, |view, window, cx| view.toggle_terminal(window, cx))
+            .unwrap()
+    });
+    pump(&mut cx, Duration::from_millis(300));
+    let terminal = cx.update(|cx| window.read(cx).unwrap().terminal_for_screenshot());
+    if let Some(terminal) = terminal {
+        cx.update(|cx| {
+            terminal.update(cx, |view, _| {
+                view.write(
+                    b"clear; printf '\\033[32mok\\033[0m tests passed  \\033[1;31merror\\033[0m  \\033[44m blue \\033[0m\\n'; ls\r"
+                        .to_vec(),
+                )
+            })
+        });
+        pump(&mut cx, Duration::from_millis(1500));
+        cx.capture_screenshot(window.into())
+            .unwrap()
+            .save(out.join("31-terminal.png"))
+            .unwrap();
+        // A second terminal shows the list of terminals.
+        cx.update(|cx| {
+            window
+                .update(cx, |view, window, cx| view.new_terminal(window, cx))
+                .unwrap()
+        });
+        cx.update(|cx| {
+            window
+                .update(cx, |view, window, cx| {
+                    let tabs = view.terminal_tabs_for_screenshot();
+                    view.rename_terminal(tabs[0], Some("dev server".into()), window, cx);
+                })
+                .unwrap()
+        });
+        if let Some(second) = cx.update(|cx| window.read(cx).unwrap().terminal_for_screenshot()) {
+            cx.update(|cx| second.update(cx, |view, _| view.write(b"sleep 30\r".to_vec())));
+        }
+        pump(&mut cx, Duration::from_millis(1500));
+        cx.capture_screenshot(window.into())
+            .unwrap()
+            .save(out.join("32-terminal-tabs.png"))
+            .unwrap();
+    }
     tabs_and_history(&mut cx, &data_dir_of(&data), &root, &out);
     changes(&mut cx, &faux, &out);
     approvals(&mut cx, &faux, &out);

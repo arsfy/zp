@@ -49,7 +49,9 @@ actions!(
         CheckForUpdates,
         ReloadResources,
         SubmitEdit,
-        CancelEdit
+        CancelEdit,
+        ToggleTerminal,
+        NewTerminal
     ]
 );
 
@@ -119,6 +121,8 @@ pub fn shortcuts() -> Vec<Shortcut> {
             project
         ),
         shortcut!("Toggle Sidebar", ToggleSidebar, "secondary-b", project),
+        shortcut!("Toggle Terminal", ToggleTerminal, "ctrl-`", project),
+        shortcut!("New Terminal", NewTerminal, "ctrl-shift-`", project),
         shortcut!(
             "Toggle Changes Panel",
             ToggleRightPanel,

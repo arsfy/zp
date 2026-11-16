@@ -66,6 +66,14 @@ pub struct PanelLayout {
     pub right_panel_visible: bool,
     /// Right panel width in pixels.
     pub right_panel_width: f32,
+    /// Whether the terminal panel is shown.
+    pub terminal_visible: bool,
+    /// Terminal panel height in pixels.
+    pub terminal_height: f32,
+    /// Whether the terminal panel takes the whole height.
+    pub terminal_maximized: bool,
+    /// Width of the terminal list in pixels.
+    pub terminal_list_width: f32,
 }
 
 impl Default for PanelLayout {
@@ -75,6 +83,10 @@ impl Default for PanelLayout {
             sidebar_width: 240.0,
             right_panel_visible: false,
             right_panel_width: 320.0,
+            terminal_visible: false,
+            terminal_height: 260.0,
+            terminal_maximized: false,
+            terminal_list_width: 180.0,
         }
     }
 }

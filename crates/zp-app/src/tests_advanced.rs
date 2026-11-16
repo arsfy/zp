@@ -577,3 +577,123 @@ fn update_checks(cx: &mut TestAppContext) {
     assert_eq!(state(cx), crate::updates::UpdateState::UpToDate);
     drop(runtime);
 }
+
+#[gpui::test]
+fn terminal_panel_runs_a_shell(cx: &mut TestAppContext) {
+    let _data = setup_models(cx, &[&FauxProvider::default()], false);
+    let (_dir, project) = project_dir();
+    let window = open(cx, &project);
+    let visible = |cx: &mut TestAppContext| {
+        window
+            .update(cx, |view, _, _| view.layout().terminal_visible)
+            .unwrap()
+    };
+    assert!(!visible(cx));
+    cx.dispatch_action(window.into(), crate::actions::ToggleTerminal);
+    cx.run_until_parked();
+    assert!(visible(cx));
+    let terminal = window
+        .update(cx, |view, _, _| view.terminal())
+        .unwrap()
+        .expect("a shell started");
+
+    // The shell runs in the project and answers.
+    terminal.update(cx, |view, _| {
+        view.write(b"echo zp-term-$((40+2)); pwd\r".to_vec())
+    });
+    wait_until(cx, |cx| {
+        terminal.read_with(cx, |view, _| view.screen_text().contains("zp-term-42"))
+    });
+    let screen = terminal.read_with(cx, |view, _| view.screen_text());
+    let name = project.file_name().unwrap().to_string_lossy().into_owned();
+    assert!(screen.contains(&name), "{screen}");
+
+    // The label follows the program in the foreground; a name given by the user wins.
+    let labels = |cx: &mut TestAppContext| {
+        window
+            .update(cx, |view, _, cx| view.terminal_labels(cx))
+            .unwrap()
+    };
+    let shell = labels(cx)[0].clone();
+    terminal.update(cx, |view, _| view.write(b"sleep 30\r".to_vec()));
+    wait_until(cx, |cx| labels(cx) == ["sleep"]);
+    terminal.update(cx, |view, _| view.write(b"\x03".to_vec()));
+    wait_until(cx, |cx| labels(cx) == [shell.clone()]);
+    window
+        .update(cx, |view, window, cx| {
+            view.rename_terminal(terminal.entity_id(), Some("build".into()), window, cx)
+        })
+        .unwrap();
+    assert_eq!(labels(cx), ["build"]);
+    window
+        .update(cx, |view, window, cx| {
+            view.rename_terminal(terminal.entity_id(), None, window, cx)
+        })
+        .unwrap();
+    assert_eq!(labels(cx), std::slice::from_ref(&shell));
+
+    // Maximizing hides the conversation; restoring brings it back.
+    window
+        .update(cx, |view, _, cx| view.toggle_terminal_maximized(cx))
+        .unwrap();
+    assert!(
+        window
+            .update(cx, |view, _, _| view.layout().terminal_maximized)
+            .unwrap()
+    );
+    window
+        .update(cx, |view, _, cx| view.toggle_terminal_maximized(cx))
+        .unwrap();
+
+    // Hiding keeps the shell; showing it again reuses it.
+    cx.dispatch_action(window.into(), crate::actions::ToggleTerminal);
+    cx.run_until_parked();
+    assert!(!visible(cx));
+    cx.dispatch_action(window.into(), crate::actions::ToggleTerminal);
+    cx.run_until_parked();
+    let again = window
+        .update(cx, |view, _, _| view.terminal())
+        .unwrap()
+        .unwrap();
+    assert_eq!(again.entity_id(), terminal.entity_id());
+
+    // More terminals: each starts in the list and becomes active; the list switches.
+    cx.dispatch_action(window.into(), crate::actions::NewTerminal);
+    cx.run_until_parked();
+    let (tabs, active) = window
+        .update(cx, |view, _, _| view.terminal_tabs())
+        .unwrap();
+    assert_eq!((tabs.len(), active), (2, 1));
+    let second = tabs[1].clone();
+    assert_ne!(second.entity_id(), terminal.entity_id());
+    second.update(cx, |view, _| view.write(b"echo second-$((1+1))\r".to_vec()));
+    wait_until(cx, |cx| {
+        second.read_with(cx, |view, _| view.screen_text().contains("second-2"))
+    });
+    assert!(!terminal.read_with(cx, |view, _| view.screen_text().contains("second-2")));
+
+    // A shell that exits closes its terminal; the panel hides with the last one.
+    second.update(cx, |view, _| view.write(b"exit\r".to_vec()));
+    wait_until(cx, |cx| {
+        window
+            .update(cx, |view, _, _| view.terminal_tabs().0.len() == 1)
+            .unwrap()
+    });
+    let active = window
+        .update(cx, |view, _, _| view.terminal())
+        .unwrap()
+        .unwrap();
+    assert_eq!(active.entity_id(), terminal.entity_id());
+    window
+        .update(cx, |view, window, cx| {
+            view.close_terminal(terminal.entity_id(), window, cx)
+        })
+        .unwrap();
+    assert!(!visible(cx));
+    assert!(
+        window
+            .update(cx, |view, _, _| view.terminal())
+            .unwrap()
+            .is_none()
+    );
+}

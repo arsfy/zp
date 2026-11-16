@@ -3,6 +3,7 @@
 
 mod sidebar;
 mod tabs;
+mod terminal_panel;
 
 use std::path::{Path, PathBuf};
 
@@ -64,6 +65,8 @@ pub enum RenameTarget {
     Tab(gpui::EntityId),
     /// A session file not open in any tab.
     Session(PathBuf),
+    /// A terminal of the terminal panel.
+    Terminal(gpui::EntityId),
 }
 
 struct Rename {
@@ -110,6 +113,8 @@ pub struct ProjectWindow {
     /// Follows the project's MCP servers.
     mcp_task: gpui::Task<()>,
     palette: Option<OpenPalette>,
+    /// The terminal panel's terminals.
+    terminals: terminal_panel::Terminals,
     focus_handle: FocusHandle,
     _subscriptions: Vec<Subscription>,
 }
@@ -352,9 +357,13 @@ impl ProjectWindow {
             trust_prompt_open: false,
             trusted_mcp,
             palette: None,
+            terminals: Default::default(),
             focus_handle,
             _subscriptions: subscriptions,
         };
+        if this.layout.terminal_visible {
+            this.ensure_terminal(window, cx);
+        }
         this.refresh(window, cx);
         this
     }
@@ -542,7 +551,12 @@ impl ProjectWindow {
         };
         let name = rename.input.read(cx).as_str().trim().to_owned();
         let name = (!name.is_empty()).then_some(name);
+        if let RenameTarget::Terminal(id) = rename.target {
+            self.rename_terminal(id, name, window, cx);
+            return;
+        }
         let result = match rename.target {
+            RenameTarget::Terminal(_) => Ok(()),
             RenameTarget::Tab(id) => {
                 match self.tabs.iter().find(|t| t.conversation.entity_id() == id) {
                     Some(tab) => tab
@@ -569,8 +583,12 @@ impl ProjectWindow {
     }
 
     fn cancel_rename(&mut self, _: &CancelRename, window: &mut Window, cx: &mut Context<Self>) {
-        self.rename = None;
-        self.focus_active(window, cx);
+        let target = self.rename.take().map(|rename| rename.target);
+        if matches!(target, Some(RenameTarget::Terminal(_))) {
+            self.focus_terminal(window, cx);
+        } else {
+            self.focus_active(window, cx);
+        }
         cx.notify();
     }
 
@@ -619,14 +637,19 @@ impl ProjectWindow {
             .h_full()
             .flex()
             .flex_col()
+            .on_drag_move(cx.listener(Self::on_terminal_resize))
+            .on_drag_move(cx.listener(Self::on_terminal_list_resize))
             .child(self.render_tab_bar(cx))
-            .child(match &self.diff {
-                Some(diff) => div().flex_1().min_h_0().child(diff.view.clone()),
-                None => div()
-                    .flex_1()
-                    .min_h_0()
-                    .children(self.active_conversation().cloned()),
+            .when(!self.terminal_maximized(), |this| {
+                this.child(match &self.diff {
+                    Some(diff) => div().flex_1().min_h_0().child(diff.view.clone()),
+                    None => div()
+                        .flex_1()
+                        .min_h_0()
+                        .children(self.active_conversation().cloned()),
+                })
             })
+            .children(self.render_terminal_panel(cx))
     }
 
     fn render_right_panel(&self, cx: &App) -> impl IntoElement {
@@ -771,7 +794,8 @@ impl ProjectWindow {
             .flex()
             .items_center()
             .justify_between()
-            .px_3()
+            .pl_1()
+            .pr_3()
             .text_size(px(12.))
             .text_color(colors.text_muted)
             .bg(colors.surface)
@@ -780,7 +804,9 @@ impl ProjectWindow {
             .child(
                 div()
                     .flex()
+                    .items_center()
                     .gap_3()
+                    .child(self.render_terminal_button(cx))
                     .child(
                         self.branch
                             .as_ref()
@@ -1002,6 +1028,16 @@ impl Render for ProjectWindow {
             )
             .on_action(cx.listener(Self::cancel_rename))
             .on_drag_move(cx.listener(Self::on_resize_drag))
+            .on_action(
+                cx.listener(|this, _: &crate::actions::ToggleTerminal, window, cx| {
+                    this.toggle_terminal(window, cx)
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &crate::actions::NewTerminal, window, cx| {
+                    this.new_terminal(window, cx)
+                }),
+            )
             .size_full()
             .flex()
             .flex_col()

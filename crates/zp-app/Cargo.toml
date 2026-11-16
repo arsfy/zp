@@ -14,6 +14,7 @@ name = "zp"
 path = "src/main.rs"
 
 [dependencies]
+alacritty_terminal.workspace = true
 anyhow.workspace = true
 chrono.workspace = true
 futures.workspace = true
@@ -32,6 +33,9 @@ zp-mcp.workspace = true
 zp-session.workspace = true
 zp-tools.workspace = true
 tempfile = { workspace = true, optional = true }
+
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1", features = ["termios"] }
 
 [features]
 # `zp --visual-tests DIR`: render scripted scenarios off-screen and save screenshots.

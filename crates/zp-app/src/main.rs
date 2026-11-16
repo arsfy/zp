@@ -16,6 +16,7 @@ mod notifications;
 mod project;
 mod settings;
 mod store;
+mod terminal;
 mod theme;
 mod ui;
 mod updates;
