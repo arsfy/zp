@@ -8,8 +8,8 @@ use std::path::{Path, PathBuf};
 
 use gpui::{
     AnyElement, App, Context, DismissEvent, DragMoveEvent, Entity, FocusHandle, Focusable,
-    FontWeight, IntoElement, Pixels, Point, Render, Subscription, Window, anchored, deferred, div,
-    prelude::*, px, rgb_to_hsla,
+    FontWeight, IntoElement, MouseButton, Pixels, Point, Render, Subscription, Window, anchored,
+    deferred, div, prelude::*, px, rgb_to_hsla, svg,
 };
 use gpui_elements::editable_text::{EditableTextState, StringStorage, TextChanged, text_input};
 use zp_core::app_state::PanelLayout;
@@ -651,16 +651,49 @@ impl ProjectWindow {
             .border_color(colors.border)
             .child(
                 div()
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .child(self.name.clone()),
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .truncate()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(self.name.clone()),
+                    )
+                    .when_some(self.branch.clone(), |this, branch| {
+                        this.child(
+                            div()
+                                .truncate()
+                                .text_color(colors.text_muted)
+                                .child(format!("⎇ {branch}")),
+                        )
+                    }),
             )
-            .when_some(self.branch.clone(), |this, branch| {
-                this.child(
-                    div()
-                        .text_color(colors.text_muted)
-                        .child(format!("⎇ {branch}")),
-                )
-            })
+            .child(
+                div()
+                    .id("open-settings")
+                    .size(px(28.))
+                    .flex_shrink_0()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(4.))
+                    .cursor_pointer()
+                    .tooltip(crate::ui::tooltip("Settings"))
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .on_click(|_, _, cx| {
+                        cx.stop_propagation();
+                        crate::settings::SettingsWindow::open(cx);
+                    })
+                    .child(
+                        svg()
+                            .data(include_bytes!("../../../../assets/icons/settings.svg"))
+                            .text_color(colors.text_muted)
+                            .size(px(16.)),
+                    ),
+            )
     }
 
     fn render_status_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
