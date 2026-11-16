@@ -563,17 +563,24 @@ fn message_actions_and_session_tree(cx: &mut TestAppContext) {
     send(window, "u2", cx);
     idle(&conversation, 4, cx);
 
-    // Edit & Resend the second question: the text returns to the composer and the next
-    // send starts a sibling branch.
+    // Edit & Resend the second question in place: the conversation stays until the
+    // edit is sent, which starts a sibling branch.
     window
         .update(cx, |_, window, cx| {
             conversation.update(cx, |view, cx| view.edit_and_resend(2, window, cx))
         })
         .unwrap();
-    let (rows, draft) =
-        conversation.read_with(cx, |view, cx| (view.transcript().len(), view.draft(cx)));
-    assert_eq!((rows, draft.as_str()), (2, "u2"));
-    send(window, "u2 edited", cx);
+    let rows = conversation.read_with(cx, |view, _| view.transcript().len());
+    assert_eq!(rows, 4);
+    window
+        .update(cx, |_, window, cx| {
+            conversation.update(cx, |view, cx| {
+                let input = view.editing().unwrap().input.clone();
+                input.update(cx, |input, cx| input.emplace("u2 edited", cx));
+                view.submit_edit(window, cx)
+            })
+        })
+        .unwrap();
     idle(&conversation, 4, cx);
     let texts = |cx: &mut TestAppContext| -> Vec<String> {
         conversation.read_with(cx, |view, _| {

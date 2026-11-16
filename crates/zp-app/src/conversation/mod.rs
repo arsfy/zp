@@ -322,8 +322,7 @@ impl ConversationView {
 
         self.transcript = Transcript::from_messages(&coding.agent().messages());
         // One more item at the end: room for the floating composer.
-        self.list_state =
-            ListState::new(self.transcript.len() + 1, ListAlignment::Top, px(1000.));
+        self.list_state = ListState::new(self.transcript.len() + 1, ListAlignment::Top, px(1000.));
         self.list_state.set_follow_mode(gpui::FollowMode::Tail);
         self.coding = Some(coding);
         self._agent_events = Some(subscription);

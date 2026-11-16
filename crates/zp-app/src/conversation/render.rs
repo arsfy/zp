@@ -4,9 +4,9 @@ use std::time::Duration;
 
 use gpui::{
     Anchor, Animation, AnimationExt as _, AnyElement, App, ClipboardItem, ColorExt as _, Context,
-    ElementId, FontWeight, IntoElement, Render, SharedString, Window, anchored, deferred, div,
-    canvas, linear_color_stop, linear_gradient, list, point, prelude::*, px, relative,
-    rgb_to_hsla, svg,
+    ElementId, FontWeight, IntoElement, Render, SharedString, Window, anchored, canvas, deferred,
+    div, linear_color_stop, linear_gradient, list, point, prelude::*, px, relative, rgb_to_hsla,
+    svg,
 };
 use gpui_elements::editable_text::{text_area, text_input};
 use zp_ai::{AssistantContent, StopReason, ToolCall};
@@ -1140,120 +1140,116 @@ impl ConversationView {
                 })
 ;
         let input = div()
-                        .key_context(if self.completion.is_some() {
-                            "Composer CompletionMenu"
-                        } else {
-                            "Composer"
-                        })
-                        .capture_action(cx.listener(
-                            |this, _: &gpui_elements::editable_text::actions::Paste, _, cx| {
-                                if this.paste_attachments(cx) {
-                                    cx.stop_propagation();
-                                }
-                            },
+            .key_context(if self.completion.is_some() {
+                "Composer CompletionMenu"
+            } else {
+                "Composer"
+            })
+            .capture_action(cx.listener(
+                |this, _: &gpui_elements::editable_text::actions::Paste, _, cx| {
+                    if this.paste_attachments(cx) {
+                        cx.stop_propagation();
+                    }
+                },
+            ))
+            .flex()
+            .flex_col()
+            .rounded(px(8.))
+            .border_1()
+            .border_color(colors.border)
+            .bg(colors.surface)
+            .when(!self.attachments.is_empty(), |this| {
+                this.child(div().flex().flex_wrap().gap_1p5().px_3().pt_2().children(
+                    self.attachments.iter().enumerate().map(|(index, image)| {
+                        div()
+                            .id(("attachment", index))
+                            .flex()
+                            .items_center()
+                            .gap_1p5()
+                            .px_2()
+                            .py_0p5()
+                            .rounded(px(4.))
+                            .bg(colors.code_background)
+                            .text_size(px(12.))
+                            .child(div().text_color(colors.text_muted).child("Image"))
+                            .child(image.name.clone())
+                            .child(
+                                div()
+                                    .id(("remove-attachment", index))
+                                    .cursor_pointer()
+                                    .text_color(colors.text_muted)
+                                    .hover_style(|s| s.text_color(colors.error))
+                                    .child("×")
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.remove_attachment(index, cx)
+                                    })),
+                            )
+                    }),
+                ))
+            })
+            .child(
+                text_area("composer-input")
+                    .state(self.composer.downgrade())
+                    .placeholder(if self.running {
+                        "Steer the agent… (sent after the current step)"
+                    } else {
+                        "Message ZP… (/ for commands, @ to attach files)"
+                    })
+                    .placeholder_color(rgb_to_hsla(colors.text_muted))
+                    .caret_color(rgb_to_hsla(colors.text))
+                    .selection_color(rgb_to_hsla(colors.accent).opacity(0.35))
+                    .caret_blink_interval_500ms()
+                    .w_full()
+                    .min_h(px(44.))
+                    .max_h(px(220.))
+                    .overflow_y_scroll()
+                    .px_3()
+                    .pt_2()
+                    .pb_1(),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .px_2()
+                    .pb_1p5()
+                    .child(picker_button(Picker::Model, model_label, cx))
+                    .when(model.as_ref().is_some_and(|m| m.reasoning), |this| {
+                        this.child(picker_button(
+                            Picker::Thinking,
+                            format!("thinking {thinking}"),
+                            cx,
                         ))
-                        .flex()
-                        .flex_col()
-                        .rounded(px(8.))
-                        .border_1()
-                        .border_color(colors.border)
-                        .bg(colors.surface)
-                        .when(!self.attachments.is_empty(), |this| {
-                            this.child(div().flex().flex_wrap().gap_1p5().px_3().pt_2().children(
-                                self.attachments.iter().enumerate().map(|(index, image)| {
-                                    div()
-                                        .id(("attachment", index))
-                                        .flex()
-                                        .items_center()
-                                        .gap_1p5()
-                                        .px_2()
-                                        .py_0p5()
-                                        .rounded(px(4.))
-                                        .bg(colors.code_background)
-                                        .text_size(px(12.))
-                                        .child(div().text_color(colors.text_muted).child("Image"))
-                                        .child(image.name.clone())
-                                        .child(
-                                            div()
-                                                .id(("remove-attachment", index))
-                                                .cursor_pointer()
-                                                .text_color(colors.text_muted)
-                                                .hover_style(|s| s.text_color(colors.error))
-                                                .child("×")
-                                                .on_click(cx.listener(move |this, _, _, cx| {
-                                                    this.remove_attachment(index, cx)
-                                                })),
-                                        )
-                                }),
-                            ))
-                        })
-                        .child(
-                            text_area("composer-input")
-                                .state(self.composer.downgrade())
-                                .placeholder(if self.running {
-                                    "Steer the agent… (sent after the current step)"
-                                } else {
-                                    "Message ZP… (/ for commands, @ to attach files)"
-                                })
-                                .placeholder_color(rgb_to_hsla(colors.text_muted))
-                                .caret_color(rgb_to_hsla(colors.text))
-                                .selection_color(rgb_to_hsla(colors.accent).opacity(0.35))
-                                .caret_blink_interval_500ms()
-                                .w_full()
-                                .min_h(px(44.))
-                                .max_h(px(220.))
-                                .overflow_y_scroll()
-                                .px_3()
-                                .pt_2()
-                                .pb_1(),
-                        )
-                        .child(
-                            div()
-                                .flex()
-                                .items_center()
-                                .gap_1()
-                                .px_2()
-                                .pb_1p5()
-                                .child(picker_button(Picker::Model, model_label, cx))
-                                .when(model.as_ref().is_some_and(|m| m.reasoning), |this| {
-                                    this.child(picker_button(
-                                        Picker::Thinking,
-                                        format!("thinking {thinking}"),
-                                        cx,
-                                    ))
-                                })
-                                .child(picker_button(
-                                    Picker::Permissions,
-                                    self.permission_mode().label().to_owned(),
-                                    cx,
-                                ))
-                                .child(div().flex_1())
-                                .child(
-                                    div()
-                                        .mr_2()
-                                        .text_size(px(11.))
-                                        .text_color(colors.text_muted)
-                                        .child(if self.running {
-                                            "Esc to stop".to_owned()
-                                        } else {
-                                            match crate::actions::shortcut_keys(
-                                                "zp::SendMessage",
-                                                cx,
-                                            ) {
-                                                Some(keys) if keys == KEY_SEND => format!(
-                                                    "Shift+{} for newline",
-                                                    crate::ui::shortcut_label(&keys)
-                                                ),
-                                                Some(keys) => format!(
-                                                    "{} to send",
-                                                    crate::ui::shortcut_label(&keys)
-                                                ),
-                                                None => String::new(),
-                                            }
-                                        }),
-                                )
-                                .child(action),
-                        );
+                    })
+                    .child(picker_button(
+                        Picker::Permissions,
+                        self.permission_mode().label().to_owned(),
+                        cx,
+                    ))
+                    .child(div().flex_1())
+                    .child(
+                        div()
+                            .mr_2()
+                            .text_size(px(11.))
+                            .text_color(colors.text_muted)
+                            .child(if self.running {
+                                "Esc to stop".to_owned()
+                            } else {
+                                match crate::actions::shortcut_keys("zp::SendMessage", cx) {
+                                    Some(keys) if keys == KEY_SEND => format!(
+                                        "Shift+{} for newline",
+                                        crate::ui::shortcut_label(&keys)
+                                    ),
+                                    Some(keys) => {
+                                        format!("{} to send", crate::ui::shortcut_label(&keys))
+                                    }
+                                    None => String::new(),
+                                }
+                            }),
+                    )
+                    .child(action),
+            );
         self.floating_composer(notes, input, cx)
     }
 
@@ -1540,7 +1536,9 @@ impl ConversationView {
                     )),
             )
             .child(measure)
-            .child(centered(div().flex().flex_col().gap_1().child(notes).child(input)))
+            .child(centered(
+                div().flex().flex_col().gap_1().child(notes).child(input),
+            ))
             .when_some(self.render_completion(cx), |this, menu| {
                 this.child(
                     div()

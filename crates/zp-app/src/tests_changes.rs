@@ -318,20 +318,61 @@ fn moving_between_branches_offers_to_restore_files(cx: &mut TestAppContext) {
     idle(&conversation, 6, cx);
     assert_eq!(read(&project, "a.txt").as_deref(), Some("ONE\nTWO\n"));
 
-    // Edit & Resend the second message, restoring the files to that point.
+    // Edit & Resend the second message: editing changes nothing until it is sent.
+    conversation.update(cx, |view, cx| view.set_draft("my draft", cx));
     with_window(window, cx, |_, window, cx| {
         conversation.update(cx, |view, cx| view.edit_and_resend(3, window, cx))
+    });
+    cx.run_until_parked();
+    assert!(!cx.has_pending_prompt());
+    let (rows, edited) = conversation.read_with(cx, |view, cx| {
+        (
+            view.transcript().len(),
+            view.editing()
+                .map(|edit| edit.input.read(cx).as_str().to_owned()),
+        )
+    });
+    assert_eq!((rows, edited.as_deref()), (6, Some("u2")));
+    // Cancelling leaves the conversation as it was.
+    with_window(window, cx, |_, window, cx| {
+        conversation.update(cx, |view, cx| view.cancel_edit(window, cx))
+    });
+    assert!(conversation.read_with(cx, |view, _| view.editing().is_none()));
+    assert_eq!(
+        conversation.read_with(cx, |view, _| view.transcript().len()),
+        6
+    );
+
+    // Sending the edit restores the files to that point and continues from there.
+    with_window(window, cx, |_, window, cx| {
+        conversation.update(cx, |view, cx| {
+            view.edit_and_resend(3, window, cx);
+            let input = view.editing().unwrap().input.clone();
+            input.update(cx, |input, cx| input.emplace("u2 again", cx));
+            view.submit_edit(window, cx);
+        })
     });
     cx.run_until_parked();
     assert!(cx.has_pending_prompt());
     cx.simulate_prompt_answer("Restore Files");
     cx.run_until_parked();
-    assert_eq!(read(&project, "a.txt").as_deref(), Some("ONE\ntwo\n"));
-    let (rows, draft) =
-        conversation.read_with(cx, |view, cx| (view.transcript().len(), view.draft(cx)));
-    assert_eq!((rows, draft.as_str()), (3, "u2"));
-    send(window, "u2 again", cx);
     idle(&conversation, 5, cx);
+    assert_eq!(read(&project, "a.txt").as_deref(), Some("ONE\ntwo\n"));
+    let (draft, last_user) = conversation.read_with(cx, |view, cx| {
+        let last_user = view
+            .transcript()
+            .rows()
+            .iter()
+            .rev()
+            .find_map(|row| match row {
+                crate::conversation::transcript::Row::User { text, .. } => Some(text.clone()),
+                _ => None,
+            });
+        (view.draft(cx), last_user)
+    });
+    assert_eq!(draft, "my draft", "the composer's draft is kept");
+    assert_eq!(last_user.as_deref(), Some("u2 again"));
+    conversation.update(cx, |view, cx| view.set_draft("", cx));
 
     // Back to the old branch through the tree, keeping the files: no change on disk.
     let old = conversation.read_with(cx, |view, _| {
@@ -367,18 +408,19 @@ fn moving_between_branches_offers_to_restore_files(cx: &mut TestAppContext) {
     // The disk does not match this branch (files were kept); going to the start of
     // the conversation restores what the session knows.
     with_window(window, cx, |_, window, cx| {
-        conversation.update(cx, |view, cx| view.edit_and_resend(0, window, cx))
+        conversation.update(cx, |view, cx| {
+            view.edit_and_resend(0, window, cx);
+            view.submit_edit(window, cx);
+        })
     });
     cx.run_until_parked();
     cx.simulate_prompt_answer("Restore Files");
     cx.run_until_parked();
+    // The resent first message finds no scripted answer; only the files matter here.
+    idle(&conversation, 2, cx);
     // a.txt was "ONE\ntwo\n" on disk while this branch expects "ONE\nTWO\n": the
     // restore merges and produces the original.
     assert_eq!(read(&project, "a.txt").as_deref(), Some("one\ntwo\n"));
-    assert_eq!(
-        conversation.read_with(cx, |view, _| view.transcript().len()),
-        0
-    );
 }
 
 #[gpui::test]
