@@ -929,6 +929,20 @@ fn advanced(
         .save(out.join("26-slash-commands.png"))
         .unwrap();
 
+    // A draft longer than one line wraps the same way in every frame.
+    cx.update(|cx| conversation.update(cx, |c, cx| c.set_draft("", cx)));
+    cx.simulate_input(
+        any,
+        "Please refactor the parser so that every grammar rule gets its own function, keep the error positions, and add tests for nested parentheses and unary minus, then run the whole test suite.",
+    );
+    for frame in 0..3 {
+        pump(cx, Duration::from_millis(250));
+        cx.capture_screenshot(any)
+            .unwrap()
+            .save(out.join(format!("33-long-draft-{frame}.png")))
+            .unwrap();
+    }
+
     cx.update(|cx| conversation.update(cx, |c, cx| c.set_draft("", cx)));
     cx.update_window(any, |_, window, cx| {
         conversation.update(cx, |c, cx| {
