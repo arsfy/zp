@@ -752,8 +752,14 @@ impl ProjectWindow {
             }
             right.push(format!("${:.4}", usage.cost));
             if model.context_window > 0 {
+                let context_tokens = |tokens| match tokens {
+                    1_000..1_000_000 => format!("{:.0}k", tokens as f64 / 1_000.0),
+                    _ => format_tokens(tokens),
+                };
                 right.push(format!(
-                    "context {:.0}%",
+                    "context {}/{} ({:.1}%)",
+                    context_tokens(usage.last_context_tokens),
+                    context_tokens(model.context_window),
                     usage.last_context_tokens as f64 * 100.0 / model.context_window as f64
                 ));
             }
