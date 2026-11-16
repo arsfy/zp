@@ -29,6 +29,17 @@ const INLINE_DIFF_ROWS: usize = 40;
 /// Models listed at once in the picker.
 const PICKER_LIMIT: usize = 200;
 
+/// Hides the provider prefix when the model name already has a namespace.
+fn model_display_name(qualified_id: &str) -> &str {
+    if let Some((_, model)) = qualified_id.split_once('/')
+        && model.matches('/').count() == 1
+    {
+        model
+    } else {
+        qualified_id
+    }
+}
+
 pub(super) fn id(name: impl Into<SharedString>, index: usize) -> ElementId {
     ElementId::NamedInteger(name.into(), index as u64)
 }
@@ -789,7 +800,8 @@ impl ConversationView {
             .take(PICKER_LIMIT)
             .enumerate()
             .map(|(index, choice)| {
-                let selected = current.as_deref() == Some(choice.model.qualified_id().as_str());
+                let qualified_id = choice.model.qualified_id();
+                let selected = current.as_deref() == Some(qualified_id.as_str());
                 let model = choice.model.clone();
                 let context = if model.context_window >= 1000 {
                     format!("{}k", model.context_window / 1000)
@@ -812,7 +824,7 @@ impl ConversationView {
                             .flex_1()
                             .min_w_0()
                             .truncate()
-                            .child(choice.model.qualified_id()),
+                            .child(model_display_name(&qualified_id).to_owned()),
                     )
                     .child(
                         div()
@@ -966,10 +978,10 @@ impl ConversationView {
         // The session's model may belong to a provider without a key.
         let model_label = match &model {
             Some(model) if crate::store::AppModels::has_credentials(&model.provider, cx) => {
-                model.qualified_id()
+                model_display_name(&model.qualified_id()).to_owned()
             }
             _ if none_available => "No available models".to_owned(),
-            Some(model) => format!("{} · no key", model.qualified_id()),
+            Some(model) => format!("{} · no key", model_display_name(&model.qualified_id())),
             None => "Choose a model".to_owned(),
         };
 
@@ -1157,7 +1169,28 @@ impl ConversationView {
                     )
                 })
 ;
+        let input_width = self.composer_input_width.clone();
+        let view = cx.entity().downgrade();
+        let measure_input = canvas(
+            move |bounds, _, cx| {
+                // Inside the 1px border.
+                let width = (f32::from(bounds.size.width) - 2.0).max(0.0);
+                if (input_width.get() - width).abs() >= 0.5 {
+                    input_width.set(width);
+                    cx.defer(move |cx| {
+                        let _ = view.update(cx, |_, cx| cx.notify());
+                    });
+                }
+            },
+            |_, _, _, _| {},
+        )
+        .absolute()
+        .top_0()
+        .left_0()
+        .size_full();
         let input = div()
+            .relative()
+            .child(measure_input)
             .key_context(if self.completion.is_some() {
                 "Composer CompletionMenu"
             } else {
@@ -1231,7 +1264,13 @@ impl ConversationView {
                     .caret_color(rgb_to_hsla(colors.text))
                     .selection_color(rgb_to_hsla(colors.accent).opacity(0.35))
                     .caret_blink_interval_500ms()
-                    .w_full()
+                    // A fixed width: with `w_full`, layout measured the text at several
+                    // widths per frame, and the field kept the wrapping of whichever came
+                    // last — flipping between wrapped and not every frame.
+                    .map(|this| match self.composer_input_width.get() {
+                        width if width > 0.0 => this.w(px(width)),
+                        _ => this.w_full(),
+                    })
                     .min_h(px(44.))
                     .max_h(px(220.))
                     .overflow_y_scroll()
@@ -1506,14 +1545,25 @@ impl Render for ConversationView {
             )
             .size_full()
             .relative()
-            .child(div().size_full().pt_2().child(transcript))
+            .flex()
+            .flex_col()
+            .justify_end()
+            .child(
+                div()
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .size_full()
+                    .pt_2()
+                    .child(transcript),
+            )
             .child(self.render_composer(cx))
             .when(self.tree_open, |this| this.child(self.render_tree(cx)))
     }
 }
 
 impl ConversationView {
-    /// The composer floats over the bottom of the transcript on an opaque backdrop (with
+    /// The composer sits over the bottom of the transcript on an opaque backdrop (with
     /// a fade above it). Its height is measured so the transcript can end with a spacer
     /// of the same height: nothing is hidden behind it, and the transcript keeps its size
     /// when the composer grows. The completion menu floats above it without taking space.
@@ -1548,10 +1598,9 @@ impl ConversationView {
         .left_0()
         .size_full();
         div()
-            .absolute()
-            .bottom_0()
-            .left_0()
-            .right_0()
+            .relative()
+            .w_full()
+            .flex_shrink_0()
             .pb_3()
             .bg(colors.background)
             .child(

@@ -148,6 +148,8 @@ pub struct ConversationView {
     editing: Option<MessageEdit>,
     /// Measured height of the floating composer.
     composer_height: Rc<std::cell::Cell<f32>>,
+    /// Measured width of the composer's text field.
+    composer_input_width: Rc<std::cell::Cell<f32>>,
     /// The row whose text was just copied (shows a check mark briefly).
     copied_row: Option<usize>,
     /// Times the streaming response.
@@ -240,6 +242,7 @@ impl ConversationView {
             approvals: Vec::new(),
             editing: None,
             composer_height: Rc::default(),
+            composer_input_width: Rc::default(),
             copied_row: None,
             response_timer: ResponseTimer::default(),
             tokens_per_second: None,
