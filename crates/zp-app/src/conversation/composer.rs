@@ -6,9 +6,11 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use gpui::{App, ClipboardEntry, Context, ExternalPaths, Window};
+use zp_ai::ThinkingLevel;
 use zp_core::attachments::{ImageAttachment, fuzzy_filter, image_mime};
+use zp_core::permissions::PermissionMode;
 
-use super::{ConversationEvent, ConversationView, Picker};
+use super::{ConversationEvent, ConversationView};
 
 /// Items shown in a completion menu.
 const MENU_ITEMS: usize = 50;
@@ -35,17 +37,17 @@ pub const BUILTIN_COMMANDS: [BuiltinCommand; 10] = [
     },
     BuiltinCommand {
         name: "model",
-        args: "",
+        args: "[model]",
         description: "Choose the model",
     },
     BuiltinCommand {
         name: "thinking",
-        args: "",
+        args: "[level]",
         description: "Choose the reasoning level",
     },
     BuiltinCommand {
         name: "permissions",
-        args: "",
+        args: "[mode]",
         description: "Choose the permission mode",
     },
     BuiltinCommand {
@@ -75,19 +77,47 @@ pub const BUILTIN_COMMANDS: [BuiltinCommand; 10] = [
     },
 ];
 
-/// What a completion inserts.
+/// Built-in commands whose argument is chosen from a list in the completion menu.
+const OPTION_COMMANDS: [&str; 3] = ["model", "thinking", "permissions"];
+
+/// What accepting a completion does.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CompletionAction {
+    /// Replaces the whole draft.
+    Insert(String),
+    /// Switches to the model with this qualified id.
+    Model(String),
+    Thinking(ThinkingLevel),
+    Permissions(PermissionMode),
+}
+
+/// One completion menu entry.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CompletionItem {
     pub label: String,
     pub detail: String,
-    /// The whole draft after accepting.
-    pub replacement: String,
+    pub action: CompletionAction,
+    /// The current choice (marked in the menu).
+    pub current: bool,
+}
+
+impl CompletionItem {
+    fn insert(label: String, detail: String, replacement: String) -> Self {
+        Self {
+            label,
+            detail,
+            action: CompletionAction::Insert(replacement),
+            current: false,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CompletionKind {
     Command,
     File,
+    /// The choices of `/model`, `/thinking` or `/permissions`.
+    Option,
 }
 
 pub struct Completion {
@@ -116,25 +146,33 @@ impl ConversationView {
     pub(super) fn update_completion(&mut self, cx: &mut Context<Self>) {
         let draft = self.composer.read(cx).as_str().to_owned();
         let next = self.completion_for(&draft, cx);
-        let selected = match (&self.completion, &next) {
-            (Some(old), Some((kind, items))) if old.kind == *kind => {
-                old.selected.min(items.len().saturating_sub(1))
-            }
-            _ => 0,
-        };
         let changed = match (&self.completion, &next) {
             (None, None) => false,
             (Some(old), Some((kind, items))) => old.kind != *kind || old.items != *items,
             _ => true,
         };
+        if !changed {
+            return;
+        }
+        // A newly opened list starts at the current choice (if any); a refined one at
+        // the best match.
+        let reopened = match (&self.completion, &next) {
+            (Some(old), Some((kind, _))) => old.kind != *kind,
+            _ => true,
+        };
+        let selected = next.as_ref().map_or(0, |(_, items)| {
+            reopened
+                .then(|| items.iter().position(|item| item.current))
+                .flatten()
+                .unwrap_or(0)
+        });
         self.completion = next.map(|(kind, items)| Completion {
             kind,
             items,
             selected,
         });
-        if changed {
-            cx.notify();
-        }
+        self.completion_scroll.scroll_to_item(selected);
+        cx.notify();
     }
 
     fn completion_for(
@@ -152,17 +190,24 @@ impl ConversationView {
                     name.starts_with(query) || (query.len() >= 3 && name.contains(query))
                 })
                 .take(MENU_ITEMS)
-                .map(|(name, args, detail)| CompletionItem {
-                    label: if args.is_empty() {
+                .map(|(name, args, detail)| {
+                    let label = if args.is_empty() {
                         format!("/{name}")
                     } else {
                         format!("/{name} {args}")
-                    },
-                    detail,
-                    replacement: format!("/{name} "),
+                    };
+                    CompletionItem::insert(label, detail, format!("/{name} "))
                 })
                 .collect();
             return (!items.is_empty()).then_some((CompletionKind::Command, items));
+        }
+        if let Some((name, query)) = draft
+            .strip_prefix('/')
+            .and_then(|command| command.split_once(char::is_whitespace))
+            && OPTION_COMMANDS.contains(&name)
+        {
+            let items = self.option_items(name, query.trim(), cx);
+            return (!items.is_empty()).then_some((CompletionKind::Option, items));
         }
         if draft.ends_with(char::is_whitespace) {
             return None;
@@ -173,13 +218,107 @@ impl ConversationView {
         let files = self.project_files(cx)?;
         let items: Vec<CompletionItem> = fuzzy_filter(&files, query, MENU_ITEMS)
             .into_iter()
-            .map(|file| CompletionItem {
-                label: file.to_owned(),
-                detail: String::new(),
-                replacement: format!("{}@{file} ", &draft[..start]),
+            .map(|file| {
+                CompletionItem::insert(
+                    file.to_owned(),
+                    String::new(),
+                    format!("{}@{file} ", &draft[..start]),
+                )
             })
             .collect();
         (!items.is_empty()).then_some((CompletionKind::File, items))
+    }
+
+    /// The choices of option command `name` matching `query`.
+    fn option_items(&self, name: &str, query: &str, cx: &App) -> Vec<CompletionItem> {
+        let Some(coding) = &self.coding else {
+            return Vec::new();
+        };
+        let query = query.to_lowercase();
+        let model = coding.agent().model();
+        match name {
+            "model" => {
+                let current = model.qualified_id();
+                self.models_matching(&query, cx)
+                    .into_iter()
+                    .take(MENU_ITEMS)
+                    .map(|choice| {
+                        let id = choice.model.qualified_id();
+                        let context = choice.model.context_window;
+                        CompletionItem {
+                            current: id == current,
+                            label: id.clone(),
+                            detail: if context >= 1000 {
+                                format!("{} · {}k", choice.provider_name, context / 1000)
+                            } else {
+                                choice.provider_name
+                            },
+                            action: CompletionAction::Model(id),
+                        }
+                    })
+                    .collect()
+            }
+            "thinking" => {
+                let current = model.clamp_thinking_level(coding.agent().thinking_level());
+                model
+                    .supported_thinking_levels()
+                    .into_iter()
+                    .filter(|level| level.as_str().contains(&query))
+                    .map(|level| CompletionItem {
+                        label: level.as_str().to_owned(),
+                        detail: String::new(),
+                        action: CompletionAction::Thinking(level),
+                        current: level == current,
+                    })
+                    .collect()
+            }
+            "permissions" => {
+                let current = self.permission_mode();
+                PermissionMode::ALL
+                    .into_iter()
+                    .filter(|mode| {
+                        mode.cli_name().contains(&query)
+                            || mode.label().to_lowercase().contains(&query)
+                    })
+                    .map(|mode| CompletionItem {
+                        label: mode.cli_name().to_owned(),
+                        detail: format!("{} — {}", mode.label(), mode.description()),
+                        action: CompletionAction::Permissions(mode),
+                        current: mode == current,
+                    })
+                    .collect()
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    /// For `/model`, `/thinking` or `/permissions` without an argument: lists the
+    /// choices in the completion menu. Returns whether `input` was such a command.
+    pub(super) fn open_command_options(
+        &mut self,
+        input: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(name) = input
+            .strip_prefix('/')
+            .filter(|name| OPTION_COMMANDS.contains(name))
+        else {
+            return false;
+        };
+        let text = format!("/{name} ");
+        self.suppress_completion = None;
+        self.composer.update(cx, |composer, cx| {
+            composer.emplace(&text, cx);
+            composer.move_to(text.len(), cx);
+        });
+        self.focus_composer(window, cx);
+        self.update_completion(cx);
+        if self.completion.is_none() && name == "model" {
+            self.info = Some("No available models; add a provider in Settings".into());
+        }
+        cx.notify();
+        true
     }
 
     /// Built-in commands, prompt templates and skills: (name, argument hint, description).
@@ -249,6 +388,7 @@ impl ConversationView {
         if let Some(completion) = &mut self.completion {
             let count = completion.items.len() as isize;
             completion.selected = (completion.selected as isize + delta).rem_euclid(count) as usize;
+            self.completion_scroll.scroll_to_item(completion.selected);
             cx.notify();
         }
     }
@@ -266,7 +406,23 @@ impl ConversationView {
         let Some(item) = completion.items.get(index.unwrap_or(completion.selected)) else {
             return false;
         };
-        let text = item.replacement.clone();
+        let text = match item.action.clone() {
+            CompletionAction::Insert(text) => text,
+            action => {
+                self.composer
+                    .update(cx, |composer, cx| composer.emplace("", cx));
+                self.info = None;
+                match action {
+                    CompletionAction::Model(id) => self.select_model_id(&id, window, cx),
+                    CompletionAction::Thinking(level) => self.select_thinking(level, window, cx),
+                    CompletionAction::Permissions(mode) => {
+                        self.select_permission_mode(mode, window, cx)
+                    }
+                    CompletionAction::Insert(_) => unreachable!(),
+                }
+                return true;
+            }
+        };
         self.composer.update(cx, |composer, cx| {
             composer.emplace(&text, cx);
             composer.move_to(text.len(), cx);
@@ -275,6 +431,21 @@ impl ConversationView {
         self.update_completion(cx);
         cx.notify();
         true
+    }
+
+    /// Switches to the available model with qualified id `id`.
+    fn select_model_id(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        match self
+            .model_choices(cx)
+            .into_iter()
+            .find(|choice| choice.model.qualified_id() == id)
+        {
+            Some(choice) => self.select_model(choice.model, window, cx),
+            None => {
+                self.info = Some(format!("Model {id} is not available"));
+                cx.notify();
+            }
+        }
     }
 
     pub(crate) fn close_completion(&mut self, cx: &mut Context<Self>) {
@@ -302,9 +473,9 @@ impl ConversationView {
         match name {
             "compact" => self.compact(Some(args.to_owned()).filter(|a| !a.is_empty()), cx),
             "new" => cx.emit(ConversationEvent::Command(WindowCommand::NewChat)),
-            "model" => self.toggle_picker(Picker::Model, window, cx),
-            "thinking" => self.toggle_picker(Picker::Thinking, window, cx),
-            "permissions" => self.toggle_picker(Picker::Permissions, window, cx),
+            "model" => self.run_model_command(args, window, cx),
+            "thinking" => self.run_thinking_command(args, window, cx),
+            "permissions" => self.run_permissions_command(args, window, cx),
             "tree" => self.toggle_tree(cx),
             "mcp" => cx.emit(ConversationEvent::Command(WindowCommand::Mcp)),
             "reload" => cx.emit(ConversationEvent::Command(WindowCommand::Reload)),
@@ -332,6 +503,62 @@ impl ConversationView {
         }
         cx.notify();
         true
+    }
+
+    /// `/model <query>`: switches to the only model matching `query` (or an exact id).
+    fn run_model_command(&mut self, query: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let choices = self.models_matching(query, cx);
+        let lower = query.to_lowercase();
+        let exact = choices.iter().find(|choice| {
+            choice.model.qualified_id().to_lowercase() == lower
+                || choice.model.id.to_lowercase() == lower
+        });
+        match (exact, choices.as_slice()) {
+            (Some(choice), _) | (None, [choice]) => {
+                self.select_model(choice.model.clone(), window, cx)
+            }
+            (None, []) => self.info = Some(format!("No available model matches “{query}”")),
+            (None, _) => {
+                self.info = Some(format!(
+                    "{} models match “{query}”; type /model to choose one",
+                    choices.len()
+                ))
+            }
+        }
+    }
+
+    /// `/thinking <level>`.
+    fn run_thinking_command(&mut self, arg: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(coding) = &self.coding else { return };
+        let supported = coding.agent().model().supported_thinking_levels();
+        match arg.to_lowercase().parse::<ThinkingLevel>() {
+            Ok(level) if supported.contains(&level) => self.select_thinking(level, window, cx),
+            _ => {
+                let names: Vec<&str> = supported.iter().map(|l| l.as_str()).collect();
+                self.info = Some(format!(
+                    "Unknown reasoning level “{arg}”; this model supports: {}",
+                    names.join(", ")
+                ));
+            }
+        }
+    }
+
+    /// `/permissions <mode>`.
+    fn run_permissions_command(&mut self, arg: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let lower = arg.to_lowercase();
+        match PermissionMode::ALL
+            .into_iter()
+            .find(|mode| mode.cli_name() == lower || mode.label().to_lowercase() == lower)
+        {
+            Some(mode) => self.select_permission_mode(mode, window, cx),
+            None => {
+                let names: Vec<&str> = PermissionMode::ALL.iter().map(|m| m.cli_name()).collect();
+                self.info = Some(format!(
+                    "Unknown permission mode “{arg}”; choose one of: {}",
+                    names.join(", ")
+                ));
+            }
+        }
     }
 
     // ----- attachments -------------------------------------------------------------

@@ -1289,8 +1289,10 @@ impl ConversationView {
                 .bg(colors.surface)
                 .max_h(px(280.))
                 .overflow_y_scroll()
+                .track_scroll(&self.completion_scroll)
                 .children(completion.items.iter().enumerate().map(|(index, item)| {
                     let selected = index == completion.selected;
+                    let options = completion.kind == super::composer::CompletionKind::Option;
                     div()
                         .id(("completion-item", index))
                         .flex()
@@ -1302,6 +1304,15 @@ impl ConversationView {
                         .cursor_pointer()
                         .when(selected, |this| this.bg(colors.surface_hover))
                         .hover_style(|s| s.bg(colors.surface_hover))
+                        .when(options, |this| {
+                            this.child(
+                                div()
+                                    .w(px(12.))
+                                    .flex_shrink_0()
+                                    .text_size(px(12.))
+                                    .child(if item.current { "✓" } else { "" }),
+                            )
+                        })
                         .child(
                             div()
                                 .flex_shrink_0()
@@ -1333,6 +1344,9 @@ impl ConversationView {
                             }
                             super::composer::CompletionKind::File => {
                                 "↑↓ to choose · Tab or Enter to attach · Esc to close"
+                            }
+                            super::composer::CompletionKind::Option => {
+                                "Type to filter · ↑↓ to choose · Tab or Enter to select · Esc to close"
                             }
                         }),
                 )

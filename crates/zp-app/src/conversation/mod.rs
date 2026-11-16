@@ -21,7 +21,7 @@ use std::time::Duration;
 use futures::StreamExt as _;
 use gpui::{
     App, AppContext as _, Context, Entity, EventEmitter, FocusHandle, Focusable, ListAlignment,
-    ListState, Subscription, Task, Window, px,
+    ListState, ScrollHandle, Subscription, Task, Window, px,
 };
 use gpui_elements::editable_text::{EditableTextState, StringStorage, TextChanged};
 use zp_agent::AgentEvent;
@@ -124,6 +124,8 @@ pub struct ConversationView {
     approvals: Vec<permissions::Approval>,
     /// The `/` or `@` completion menu.
     completion: Option<composer::Completion>,
+    /// Scrolls the selected completion item into view.
+    completion_scroll: ScrollHandle,
     /// The draft the user closed the menu for (not reopened until it changes).
     suppress_completion: Option<String>,
     /// Project files for `@` completion.
@@ -193,6 +195,7 @@ impl ConversationView {
             tool_diffs: RefCell::default(),
             approvals: Vec::new(),
             completion: None,
+            completion_scroll: ScrollHandle::new(),
             suppress_completion: None,
             file_list: None,
             loading_files: false,
@@ -696,7 +699,6 @@ impl ConversationView {
         }
     }
 
-    /// Models the picker offers: those of providers with credentials.
     /// Models the picker offers: those of providers with credentials (or that need none).
     fn model_choices(&self, cx: &App) -> Vec<ModelChoice> {
         let Some(app_models) = cx.try_global::<AppModels>() else {
@@ -725,7 +727,13 @@ impl ConversationView {
     }
 
     fn filtered_models(&self, cx: &App) -> Vec<ModelChoice> {
-        let filter = self.model_filter.read(cx).as_str().trim().to_lowercase();
+        let filter = self.model_filter.read(cx).as_str().to_owned();
+        self.models_matching(&filter, cx)
+    }
+
+    /// Available models whose id or name contains every word of `filter`.
+    fn models_matching(&self, filter: &str, cx: &App) -> Vec<ModelChoice> {
+        let filter = filter.trim().to_lowercase();
         self.model_choices(cx)
             .into_iter()
             .filter(|choice| {
@@ -759,18 +767,22 @@ impl ConversationView {
 
     fn send(&mut self, _: &SendMessage, window: &mut Window, cx: &mut Context<Self>) {
         // Enter completes, unless the draft already is the selected command.
-        let draft = self.composer.read(cx).as_str().trim_end().to_owned();
+        let raw = self.composer.read(cx).as_str().to_owned();
+        let draft = raw.trim_end();
         let complete = self.completion.as_ref().is_some_and(|completion| {
             completion
                 .items
                 .get(completion.selected)
-                .is_some_and(|item| item.replacement.trim_end() != draft)
+                .is_some_and(|item| match &item.action {
+                    composer::CompletionAction::Insert(text) => text.trim_end() != draft,
+                    _ => true,
+                })
         });
         if complete && self.accept_completion(None, window, cx) {
             return;
         }
         self.completion = None;
-        let text = self.composer.read(cx).as_str().trim().to_owned();
+        let text = raw.trim().to_owned();
         if (text.is_empty() && self.attachments.is_empty()) || self.compacting {
             return;
         }
@@ -779,6 +791,11 @@ impl ConversationView {
         };
         self.info = None;
         self.needs_key = None;
+        // `/model`, `/thinking` and `/permissions` without an argument list their
+        // choices in the completion menu.
+        if !self.running && self.open_command_options(&text, window, cx) {
+            return;
+        }
         if !self.running && self.run_builtin(&text, window, cx) {
             self.composer
                 .update(cx, |composer, cx| composer.emplace("", cx));

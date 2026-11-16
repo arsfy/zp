@@ -109,6 +109,71 @@ fn commands_templates_and_skills(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+fn option_commands_choose_in_the_completion_menu(cx: &mut TestAppContext) {
+    let a = FauxProvider::new("faux-a");
+    let b = FauxProvider::new("faux-b");
+    let _data = setup_models(cx, &[&a, &b], false);
+    let (_dir, project) = project_dir();
+    let window = open(cx, &project);
+    let conversation = active(window, cx);
+    let labels = |cx: &mut TestAppContext| -> Vec<String> {
+        conversation.read_with(cx, |view, _| {
+            let completion = view.completion().unwrap();
+            assert_eq!(completion.kind, CompletionKind::Option);
+            completion.items.iter().map(|i| i.label.clone()).collect()
+        })
+    };
+
+    // Completing `/thinking` lists the levels, the current one selected.
+    set_draft(window, "/thin", cx);
+    cx.dispatch_action(window.into(), crate::actions::SendMessage);
+    cx.run_until_parked();
+    assert_eq!(
+        conversation.read_with(cx, |v, cx| v.draft(cx)),
+        "/thinking "
+    );
+    assert!(labels(cx).contains(&"high".to_owned()));
+    let current = conversation.read_with(cx, |v, _| {
+        let completion = v.completion().unwrap();
+        completion.items[completion.selected].current
+    });
+    assert!(current);
+
+    // Typing filters; Enter applies and clears the draft.
+    set_draft(window, "/thinking hi", cx);
+    assert_eq!(labels(cx), ["high"]);
+    cx.dispatch_action(window.into(), crate::actions::SendMessage);
+    cx.run_until_parked();
+    assert_eq!(conversation.read_with(cx, |v, cx| v.draft(cx)), "");
+    assert_eq!(
+        conversation.read_with(cx, |v, _| v.status().thinking),
+        zp_ai::ThinkingLevel::High
+    );
+    assert!(conversation.read_with(cx, |v, _| v.completion().is_none()));
+
+    // Enter on a bare `/model` opens the list instead of a popover.
+    send(window, "/model", cx);
+    assert_eq!(conversation.read_with(cx, |v, cx| v.draft(cx)), "/model ");
+    assert_eq!(labels(cx).len(), 2);
+    set_draft(window, "/model faux-b", cx);
+    assert_eq!(labels(cx), ["faux-b/faux-1"]);
+    cx.dispatch_action(window.into(), crate::actions::AcceptCompletion);
+    cx.run_until_parked();
+    let model = conversation.read_with(cx, |v, _| v.status().model.unwrap().qualified_id());
+    assert_eq!(model, "faux-b/faux-1");
+
+    // `/permissions` works the same; an argument applies directly.
+    send(window, "/permissions", cx);
+    assert_eq!(labels(cx).len(), 4);
+    send(window, "/permissions full-auto", cx);
+    assert_eq!(
+        conversation.read_with(cx, |v, _| v.permission_mode()),
+        zp_core::permissions::PermissionMode::FullAuto
+    );
+    assert_eq!(conversation.read_with(cx, |v, cx| v.draft(cx)), "");
+}
+
+#[gpui::test]
 fn file_references_and_images(cx: &mut TestAppContext) {
     let faux = FauxProvider::default();
     faux.push(FauxResponse::text("seen"));
