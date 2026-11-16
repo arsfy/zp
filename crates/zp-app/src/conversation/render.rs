@@ -12,6 +12,7 @@ use gpui_elements::editable_text::{text_area, text_input};
 use zp_ai::{AssistantContent, StopReason, ToolCall};
 use zp_core::checkpoint::RecordedChange;
 
+use super::permissions::permission_mode_color;
 use super::transcript::{Row, ToolStatus};
 use super::{ConversationEvent, ConversationView, Picker};
 use crate::actions::KEY_SEND;
@@ -102,6 +103,15 @@ fn ghost_button(
     label: impl Into<SharedString>,
     cx: &App,
 ) -> gpui::Stateful<gpui::Div> {
+    ghost_button_with_color(element_id, label, None, cx)
+}
+
+fn ghost_button_with_color(
+    element_id: impl Into<ElementId>,
+    label: impl Into<SharedString>,
+    color: Option<gpui::Rgba>,
+    cx: &App,
+) -> gpui::Stateful<gpui::Div> {
     let colors = &cx.theme().colors;
     div()
         .id(element_id)
@@ -109,9 +119,12 @@ fn ghost_button(
         .py_0p5()
         .rounded(px(4.))
         .text_size(px(12.))
-        .text_color(colors.text_muted)
+        .text_color(color.unwrap_or(colors.text_muted))
         .cursor_pointer()
-        .hover_style(|s| s.bg(colors.surface_hover).text_color(colors.text))
+        .hover_style(|s| {
+            s.bg(colors.surface_hover)
+                .text_color(color.unwrap_or(colors.text))
+        })
         .child(label.into())
 }
 
@@ -962,6 +975,10 @@ impl ConversationView {
 
         let picker_button = |picker: Picker, label: String, cx: &mut Context<Self>| {
             let open = self.picker == Some(picker);
+            let color = match picker {
+                Picker::Permissions => permission_mode_color(self.permission_mode(), cx),
+                _ => None,
+            };
             div()
                 .relative()
                 // Placed before the button so the popover anchors at its top and opens upward.
@@ -973,13 +990,14 @@ impl ConversationView {
                     })
                 })
                 .child(
-                    ghost_button(
+                    ghost_button_with_color(
                         match picker {
                             Picker::Model => "model-button",
                             Picker::Thinking => "thinking-button",
                             Picker::Permissions => "permissions-button",
                         },
                         format!("{label} ▾"),
+                        color,
                         cx,
                     )
                     .on_click(cx.listener(move |this, _, window, cx| {

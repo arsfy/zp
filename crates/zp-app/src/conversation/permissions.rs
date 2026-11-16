@@ -5,8 +5,8 @@ use std::rc::Rc;
 
 use futures::channel::oneshot;
 use gpui::{
-    AnyElement, AppContext as _, ColorExt as _, Context, ElementId, Entity, Focusable as _,
-    FontWeight, IntoElement, Window, div, prelude::*, px, rgb_to_hsla,
+    AnyElement, App, AppContext as _, ColorExt as _, Context, ElementId, Entity, Focusable as _,
+    FontWeight, IntoElement, Rgba, Window, div, prelude::*, px, rgb_to_hsla,
 };
 use gpui_elements::editable_text::{EditableTextState, StringStorage, text_input};
 use zp_core::diff::{DEFAULT_CONTEXT, FileDiff};
@@ -20,6 +20,16 @@ use crate::theme::ActiveTheme;
 
 /// Diff rows shown in an approval card.
 const PREVIEW_ROWS: usize = 30;
+
+pub(super) fn permission_mode_color(mode: PermissionMode, cx: &App) -> Option<Rgba> {
+    let colors = &cx.theme().colors;
+    match mode {
+        PermissionMode::Ask => None,
+        PermissionMode::AutoEdit => Some(colors.success),
+        PermissionMode::AutoReview => Some(colors.accent),
+        PermissionMode::FullAuto => Some(colors.warning),
+    }
+}
 
 /// A tool call waiting for the user.
 pub struct Approval {
@@ -269,6 +279,9 @@ impl ConversationView {
                     .rounded(px(4.))
                     .cursor_pointer()
                     .hover_style(|s| s.bg(colors.surface_hover))
+                    .when_some(permission_mode_color(mode, cx), |this, color| {
+                        this.text_color(color)
+                    })
                     .child(div().w(px(12.)).flex_shrink_0().child(if mode == current {
                         "✓"
                     } else {

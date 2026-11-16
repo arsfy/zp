@@ -1,13 +1,13 @@
 //! M8: approval cards, session grants, the permission mode picker, stopping while waiting
 //! and project trust — with real tools in a temp project.
 
-use gpui::{Entity, TestAppContext};
+use gpui::{Entity, IntoElement as _, Render as _, TestAppContext};
 use serde_json::json;
 use zp_ai::{FauxProvider, FauxResponse};
 use zp_core::permissions::{Decision, PermissionMode};
 
 use crate::actions::StopRun;
-use crate::conversation::ConversationView;
+use crate::conversation::{ConversationView, Picker};
 use crate::tests::{project_dir, saved_state};
 use crate::tests_conversation::{
     active, open, send, set_permission_mode, setup_models, wait_until,
@@ -145,6 +145,28 @@ fn approvals_with_reasons_grants_and_previews(cx: &mut TestAppContext) {
         "new\n"
     );
     assert!(pending(&conversation, cx).is_empty());
+}
+
+#[gpui::test]
+fn permission_modes_render_with_picker_open_and_closed(cx: &mut TestAppContext) {
+    let faux = FauxProvider::default();
+    let _data = setup_models(cx, &[&faux], false);
+    let (_dir, project) = project_dir();
+    let window = open(cx, &project);
+    let conversation = active(window, cx);
+    for mode in PermissionMode::ALL {
+        window
+            .update(cx, |_, window, cx| {
+                conversation.update(cx, |view, cx| {
+                    view.select_permission_mode(mode, window, cx);
+                    let _ = view.render(window, cx).into_any_element();
+                    view.toggle_picker(Picker::Permissions, window, cx);
+                    let _ = view.render(window, cx).into_any_element();
+                });
+            })
+            .unwrap();
+        cx.run_until_parked();
+    }
 }
 
 #[gpui::test]
