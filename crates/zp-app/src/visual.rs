@@ -12,7 +12,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use gpui::{AppContext as _, Modifiers, VisualTestAppContext, point, px, size};
+use gpui::{AppContext as _, Modifiers, MouseButton, VisualTestAppContext, point, px, size};
 use serde_json::json;
 use zp_agent::{AgentEvent, AgentMessage, AgentToolResult};
 use zp_ai::{
@@ -145,6 +145,25 @@ pub fn run(out: PathBuf) {
             .map(|view| view.active_conversation().unwrap().clone())
             .unwrap()
     });
+    let selection = cx.update(|cx| conversation.read(cx).text_selection());
+    let code = "fn add(a: i32, b: i32) -> i32 {\n    a + b\n}";
+    let from = selection
+        .point_for_text(code, 0)
+        .expect("visible fenced code");
+    let to = selection.point_for_text(code, code.len()).unwrap();
+    cx.simulate_mouse_down(window.into(), from, MouseButton::Left, Modifiers::none());
+    cx.simulate_mouse_move(window.into(), to, MouseButton::Left, Modifiers::none());
+    cx.simulate_mouse_up(window.into(), to, MouseButton::Left, Modifiers::none());
+    cx.simulate_keystrokes(window.into(), "secondary-c");
+    assert_eq!(
+        cx.update(|cx| cx.read_from_clipboard().unwrap().text().unwrap()),
+        code.trim_end()
+    );
+    pump(&mut cx, Duration::from_millis(100));
+    cx.capture_screenshot(window.into())
+        .unwrap()
+        .save(out.join("3-code-selected.png"))
+        .unwrap();
     cx.update_window(window.into(), |_, window, cx| {
         conversation.update(cx, |view, cx| view.toggle_picker(Picker::Model, window, cx));
     })

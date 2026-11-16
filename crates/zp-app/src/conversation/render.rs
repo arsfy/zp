@@ -1,12 +1,77 @@
 //! Rendering of the conversation: transcript rows, tool cards and the composer.
 
+#[cfg(test)]
+mod selection_tests {
+    use gpui::{Modifiers, MouseButton, TestAppContext, VisualTestContext};
+    use zp_ai::{FauxProvider, FauxResponse};
+
+    use crate::tests::project_dir;
+    use crate::tests_conversation::{active, idle, open, send, setup_models};
+
+    #[gpui::test]
+    fn messages_and_code_support_drag_selection_and_copy(cx: &mut TestAppContext) {
+        let faux = FauxProvider::default();
+        faux.push(FauxResponse::text(
+            "你好，使用 `cargo test` 检查。\n\n```rust\nfn main() {}\n```",
+        ));
+        let _data = setup_models(cx, &[&faux], false);
+        let (_dir, project) = project_dir();
+        let window = open(cx, &project);
+        let conversation = active(window, cx);
+        send(window, "选择这段用户文本", cx);
+        idle(&conversation, 2, cx);
+        cx.run_until_parked();
+        let selection = conversation.read_with(cx, |view, _| view.text_selection.clone());
+        let mut cx = VisualTestContext::from_window(window.into(), cx);
+        let drag = |from: (&str, usize), to: (&str, usize), cx: &mut VisualTestContext| {
+            let start = selection
+                .point_for_text(from.0, from.1)
+                .unwrap_or_else(|| panic!("start text is rendered: {from:?}"));
+            let end = selection
+                .point_for_text(to.0, to.1)
+                .expect("end text is rendered");
+            cx.simulate_mouse_down(start, MouseButton::Left, Modifiers::none());
+            cx.simulate_mouse_move(end, MouseButton::Left, Modifiers::none());
+            cx.simulate_mouse_up(end, MouseButton::Left, Modifiers::none());
+            cx.simulate_keystrokes("secondary-c");
+            cx.update(|_, cx| cx.read_from_clipboard().unwrap().text().unwrap())
+        };
+        let user = "选择这段用户文本";
+        assert_eq!(drag((user, 6), (user, 18), &mut cx), "这段用户");
+        let reply = "你好，使用 cargo test 检查。";
+        assert_eq!(drag((reply, 27), (reply, 9), &mut cx), "使用 cargo test ");
+        let code = "fn main() {}";
+        assert_eq!(drag((code, 0), (code, 12), &mut cx), "fn main() {}");
+        assert_eq!(
+            drag((reply, 0), (code, 12), &mut cx),
+            format!("{reply}\n\nfn main() {{}}")
+        );
+
+        cx.simulate_keystrokes("secondary-a secondary-c");
+        assert_eq!(
+            cx.update(|_, cx| cx.read_from_clipboard().unwrap().text().unwrap()),
+            format!("{reply}\n\n{code}")
+        );
+
+        conversation.update(&mut cx, |view, cx| {
+            view.set_draft("draft stays editable", cx)
+        });
+        cx.update(|window, cx| conversation.update(cx, |view, cx| view.focus_composer(window, cx)));
+        cx.simulate_keystrokes("secondary-a secondary-c");
+        assert_eq!(
+            cx.update(|_, cx| cx.read_from_clipboard().unwrap().text().unwrap()),
+            "draft stays editable"
+        );
+    }
+}
+
 use std::time::Duration;
 
 use gpui::{
     Anchor, Animation, AnimationExt as _, AnyElement, App, ClipboardItem, ColorExt as _, Context,
-    ElementId, FontWeight, IntoElement, Render, SharedString, Window, anchored, canvas, deferred,
-    div, linear_color_stop, linear_gradient, list, point, prelude::*, px, relative, rgb_to_hsla,
-    svg,
+    DispatchPhase, ElementId, FontWeight, IntoElement, MouseButton, Render, SharedString, Window,
+    anchored, canvas, deferred, div, linear_color_stop, linear_gradient, list, point, prelude::*,
+    px, relative, rgb_to_hsla, svg,
 };
 use gpui_elements::editable_text::{text_area, text_input};
 use zp_ai::{AssistantContent, StopReason, ToolCall};
@@ -18,6 +83,7 @@ use super::{ConversationEvent, ConversationView, Picker};
 use crate::actions::KEY_SEND;
 use crate::diff_view::{DiffColors, render_unified_row};
 use crate::markdown::{IdGen, MarkdownStyle, render_markdown};
+use crate::selectable_text::SelectableText;
 use crate::theme::ActiveTheme;
 
 /// Readable width of the transcript and composer.
@@ -162,7 +228,7 @@ impl ConversationView {
                 images,
                 files,
                 ..
-            }) => self.render_user(text, *images, files, cx),
+            }) => self.render_user(ix, text, *images, files, cx),
             Some(Row::Assistant { .. }) => self.render_assistant(ix, cx),
             Some(Row::Notice { kind, text, .. }) if kind == zp_session::COMPACTION_SUMMARY_TYPE => {
                 let colors = cx.theme().colors.clone();
@@ -171,7 +237,11 @@ impl ConversationView {
                 let toggle_key = key.clone();
                 let summary = expanded.then(|| {
                     let blocks = self.parsed_markdown(text);
-                    let mut ids = IdGen::new(format!("compaction-md-{ix}"));
+                    let mut ids = IdGen::new(
+                        format!("compaction-md-{ix}"),
+                        (ix, 0),
+                        self.text_selection.clone(),
+                    );
                     render_markdown(&blocks, &MarkdownStyle::from_theme(cx), &mut ids)
                 });
                 div()
@@ -418,8 +488,16 @@ impl ConversationView {
     }
 
     /// The user's message: a bubble as wide as its text, on the right.
-    fn render_user(&self, text: &str, images: usize, files: &[String], cx: &App) -> AnyElement {
+    fn render_user(
+        &self,
+        row: usize,
+        text: &str,
+        images: usize,
+        files: &[String],
+        cx: &App,
+    ) -> AnyElement {
         let colors = &cx.theme().colors;
+        self.text_selection.begin_document(row, 0);
         let bubble = div()
             .max_w(relative(0.85))
             .flex()
@@ -429,7 +507,13 @@ impl ConversationView {
             .py_2()
             .rounded(px(10.))
             .bg(colors.surface)
-            .child(text.to_owned())
+            .child(SelectableText::new(
+                id("user-text", row),
+                (row, 0, 0),
+                text.to_owned().into(),
+                self.text_selection.clone(),
+                "\n\n",
+            ))
             .when(!files.is_empty(), |this| {
                 this.child(
                     div()
@@ -463,7 +547,11 @@ impl ConversationView {
                 AssistantContent::Text(text) if text.text.trim().is_empty() => column,
                 AssistantContent::Text(text) => {
                     let blocks = self.parsed_markdown(&text.text);
-                    let mut ids = IdGen::new(format!("md-{row}-{block}"));
+                    let mut ids = IdGen::new(
+                        format!("md-{row}-{block}"),
+                        (row, block),
+                        self.text_selection.clone(),
+                    );
                     column.child(render_markdown(&blocks, &style, &mut ids))
                 }
                 AssistantContent::Thinking(thinking) => column.child(self.render_thinking(
@@ -1499,6 +1587,7 @@ impl ConversationView {
 
 impl Render for ConversationView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.text_selection.begin_frame();
         let transcript = if self.transcript.is_empty() {
             self.render_empty(cx)
         } else {
@@ -1513,6 +1602,41 @@ impl Render for ConversationView {
             .id("conversation")
             .key_context("Conversation")
             .track_focus(&self.focus_handle)
+            .on_action(cx.listener(
+                |this, _: &gpui_elements::editable_text::actions::Copy, window, cx| {
+                    if this.text_selection.is_focused(window)
+                        && let Some(text) = this.text_selection.selected_text()
+                    {
+                        cx.write_to_clipboard(ClipboardItem::new_string(text));
+                        cx.stop_propagation();
+                    }
+                },
+            ))
+            .on_action(cx.listener(
+                |this, _: &gpui_elements::editable_text::actions::SelectAll, window, cx| {
+                    if this.text_selection.is_focused(window) {
+                        this.text_selection.select_all();
+                        window.refresh();
+                        cx.stop_propagation();
+                    }
+                },
+            ))
+            .on_mouse_move_all({
+                let selection = self.text_selection.clone();
+                move |event, phase, _, window, _| {
+                    if phase == DispatchPhase::Bubble {
+                        selection.extend_at(event.position, window);
+                    }
+                }
+            })
+            .on_mouse_up_all({
+                let selection = self.text_selection.clone();
+                move |event, phase, _, _, _| {
+                    if phase == DispatchPhase::Bubble && event.button == MouseButton::Left {
+                        selection.end_drag();
+                    }
+                }
+            })
             .on_action(cx.listener(Self::send))
             .on_action(cx.listener(Self::stop))
             .on_action(cx.listener(Self::close_picker))

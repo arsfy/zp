@@ -1,15 +1,12 @@
 //! Renders parsed markdown blocks as GPUI elements.
 
-use std::ops::Range;
-use std::rc::Rc;
-
 use gpui::{
-    AnyElement, App, ClipboardItem, ElementId, FontStyle, FontWeight, HighlightStyle,
-    InteractiveText, IntoElement, Rgba, SharedString, StrikethroughStyle, StyledText,
-    UnderlineStyle, div, prelude::*, px, rgb_to_hsla,
+    AnyElement, App, ClipboardItem, ElementId, FontStyle, FontWeight, HighlightStyle, IntoElement,
+    Rgba, SharedString, StrikethroughStyle, UnderlineStyle, div, prelude::*, px, rgb_to_hsla,
 };
 
 use super::parse::{Block, Inline};
+use crate::selectable_text::{SelectableText, TextSelection};
 use crate::theme::ActiveTheme;
 
 /// Colors and fonts used for markdown.
@@ -41,19 +38,41 @@ impl MarkdownStyle {
 pub struct IdGen {
     base: SharedString,
     next: usize,
+    document: (usize, usize),
+    selection: TextSelection,
+    separator: &'static str,
 }
 
 impl IdGen {
-    pub fn new(base: impl Into<SharedString>) -> Self {
+    pub fn new(
+        base: impl Into<SharedString>,
+        document: (usize, usize),
+        selection: TextSelection,
+    ) -> Self {
+        selection.begin_document(document.0, document.1);
         Self {
             base: base.into(),
             next: 0,
+            document,
+            selection,
+            separator: "\n\n",
         }
     }
 
     fn next(&mut self) -> ElementId {
         self.next += 1;
         ElementId::NamedInteger(self.base.clone(), self.next as u64)
+    }
+
+    fn text(&mut self, content: SharedString) -> SelectableText {
+        let element_id = self.next();
+        SelectableText::new(
+            element_id,
+            (self.document.0, self.document.1, self.next),
+            content,
+            self.selection.clone(),
+            std::mem::replace(&mut self.separator, ""),
+        )
     }
 }
 
@@ -74,66 +93,6 @@ fn render_inline(inline: &Inline, style: &MarkdownStyle, ids: &mut IdGen) -> Any
         .filter(|(_, span)| span.code)
         .map(|(range, _)| range.clone())
         .collect();
-    if code_ranges.is_empty() {
-        return render_inline_text(inline, style, ids);
-    }
-
-    // Inline boxes reserve space for padding in the surrounding text flow.
-    let mut paragraph = div();
-    let mut offset = 0;
-    for range in code_ranges {
-        if offset < range.start {
-            paragraph = paragraph.child(render_inline_text(
-                &inline_slice(inline, offset..range.start),
-                style,
-                ids,
-            ));
-        }
-        let code = inline_slice(inline, range.clone());
-        paragraph = paragraph.child(
-            div()
-                .inline_flex()
-                .align_middle()
-                .px_1()
-                .py(px(1.))
-                .rounded(px(4.))
-                .bg(style.code_background)
-                .child(render_inline_text(&code, style, ids)),
-        );
-        offset = range.end;
-    }
-    if offset < inline.text.len() {
-        paragraph = paragraph.child(render_inline_text(
-            &inline_slice(inline, offset..inline.text.len()),
-            style,
-            ids,
-        ));
-    }
-    paragraph.into_any_element()
-}
-
-fn inline_slice(inline: &Inline, range: Range<usize>) -> Inline {
-    let intersect = |other: &Range<usize>| {
-        let start = other.start.max(range.start);
-        let end = other.end.min(range.end);
-        (start < end).then(|| start - range.start..end - range.start)
-    };
-    Inline {
-        text: inline.text[range.clone()].to_owned(),
-        spans: inline
-            .spans
-            .iter()
-            .filter_map(|(range, span)| intersect(range).map(|range| (range, *span)))
-            .collect(),
-        links: inline
-            .links
-            .iter()
-            .filter_map(|(range, url)| intersect(range).map(|range| (range, url.clone())))
-            .collect(),
-    }
-}
-
-fn render_inline_text(inline: &Inline, style: &MarkdownStyle, ids: &mut IdGen) -> AnyElement {
     let highlights: Vec<_> = inline
         .spans
         .iter()
@@ -162,34 +121,15 @@ fn render_inline_text(inline: &Inline, style: &MarkdownStyle, ids: &mut IdGen) -
             (range.clone(), highlight)
         })
         .collect();
-    let code_fonts: Vec<_> = inline
-        .spans
-        .iter()
-        .filter(|(_, span)| span.code)
-        .map(|(range, _)| (range.clone(), style.mono_font.clone()))
-        .collect();
-    let text = StyledText::new(inline.text.clone())
-        .with_highlights(highlights)
-        .with_font_family_overrides(code_fonts);
-    if inline.links.is_empty() {
-        return text.into_any_element();
-    }
-    let urls: Rc<Vec<String>> = Rc::new(inline.links.iter().map(|(_, url)| url.clone()).collect());
-    let ranges = inline
-        .links
-        .iter()
-        .map(|(range, _)| range.clone())
-        .collect();
-    InteractiveText::new(ids.next(), text)
-        .on_click(ranges, move |index, _, cx| {
-            if let Some(url) = urls.get(index) {
-                cx.open_url(url);
-            }
-        })
+    ids.text(inline.text.clone().into())
+        .highlights(highlights)
+        .inline_code(code_ranges, style.mono_font.clone(), style.code_background)
+        .links(inline.links.clone())
         .into_any_element()
 }
 
 fn render_block(block: &Block, style: &MarkdownStyle, ids: &mut IdGen) -> AnyElement {
+    ids.separator = "\n\n";
     match block {
         Block::Paragraph(inline) => div()
             .child(render_inline(inline, style, ids))
@@ -247,13 +187,15 @@ fn render_block(block: &Block, style: &MarkdownStyle, ids: &mut IdGen) -> AnyEle
         Block::Rule => div().h(px(1.)).my_1().bg(style.border).into_any_element(),
         Block::Table { header, rows } => {
             let cell = |inline: &Inline, bold: bool, ids: &mut IdGen| {
+                let content = render_inline(inline, style, ids);
+                ids.separator = "\t";
                 div()
                     .flex_1()
                     .min_w_0()
                     .px_2()
                     .py_1()
                     .when(bold, |this| this.font_weight(FontWeight::SEMIBOLD))
-                    .child(render_inline(inline, style, ids))
+                    .child(content)
             };
             let mut table = div()
                 .flex()
@@ -270,6 +212,7 @@ fn render_block(block: &Block, style: &MarkdownStyle, ids: &mut IdGen) -> AnyEle
                 ),
             );
             for row in rows {
+                ids.separator = "\n";
                 table = table.child(
                     div()
                         .flex()
@@ -326,41 +269,7 @@ fn code_block(
                 .pt_1()
                 .font_family(style.mono_font.clone())
                 .text_size(px(12.))
-                .child(text.to_owned()),
+                .child(ids.text(text.to_owned().into())),
         )
         .into_any_element()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn inline_code_segments_preserve_surrounding_styles_and_links() {
-        let blocks = super::super::parse::parse(
-            "**Before [`cargo test` and docs](https://example.com) after**",
-        );
-        let Block::Paragraph(inline) = &blocks[0] else {
-            panic!("expected a paragraph");
-        };
-        let code = inline
-            .spans
-            .iter()
-            .find(|(_, span)| span.code)
-            .unwrap()
-            .0
-            .clone();
-        let before = inline_slice(inline, 0..code.start);
-        let command = inline_slice(inline, code.clone());
-        let after = inline_slice(inline, code.end..inline.text.len());
-
-        assert_eq!(before.text, "Before ");
-        assert!(before.links.is_empty());
-        assert_eq!(command.text, "cargo test");
-        assert!(command.spans[0].1.bold && command.spans[0].1.code);
-        assert_eq!(command.links, vec![(0..10, "https://example.com".into())]);
-        assert_eq!(after.text, " and docs after");
-        assert_eq!(after.links, vec![(0..9, "https://example.com".into())]);
-        assert!(after.spans.iter().all(|(_, span)| span.bold));
-    }
 }

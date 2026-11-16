@@ -215,6 +215,16 @@ pub fn bind_keys(cx: &mut App) {
     // Text fields first, so the more specific bindings below override them.
     cx.bind_keys(default_bindings().as_keybindings(Some(DEFAULT_INPUT_CONTEXT)));
     cx.bind_keys([
+        KeyBinding::new(
+            "secondary-c",
+            gpui_elements::editable_text::actions::Copy,
+            Some("Conversation"),
+        ),
+        KeyBinding::new(
+            "secondary-a",
+            gpui_elements::editable_text::actions::SelectAll,
+            Some("Conversation"),
+        ),
         KeyBinding::new("shift-enter", Enter, Some(COMPOSER_INPUT)),
         KeyBinding::new("enter", SubmitEdit, Some(MESSAGE_EDITOR_INPUT)),
         KeyBinding::new("shift-enter", Enter, Some(MESSAGE_EDITOR_INPUT)),

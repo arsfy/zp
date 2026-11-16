@@ -33,6 +33,7 @@ use self::transcript::{Changes, Transcript};
 use crate::actions::{ClosePicker, PickFirstModel, SendMessage, StopRun};
 use crate::diff_view::DiffItem;
 use crate::markdown::{Block, parse};
+use crate::selectable_text::TextSelection;
 use crate::store::{AppModels, AppPaths};
 
 /// Minimum time between applying event batches.
@@ -117,6 +118,7 @@ pub struct ModelChoice {
 }
 
 pub struct ConversationView {
+    text_selection: TextSelection,
     root: PathBuf,
     coding: Option<Arc<CodingSession>>,
     unavailable: Option<String>,
@@ -199,6 +201,7 @@ impl ConversationView {
         cx: &mut Context<Self>,
     ) -> Self {
         let composer = cx.new(|cx| EditableTextState::new(StringStorage::default(), cx));
+        let focus_handle = cx.focus_handle();
         let model_filter = cx.new(|cx| EditableTextState::new(StringStorage::default(), cx));
         // The composer redraws itself while typing; only the model filter changes our list.
         let subscriptions = vec![
@@ -221,6 +224,7 @@ impl ConversationView {
             }),
         ];
         let mut this = Self {
+            text_selection: TextSelection::new(focus_handle.clone()),
             root,
             coding: None,
             unavailable: None,
@@ -259,7 +263,7 @@ impl ConversationView {
             overflow_retried: false,
             tree_open: false,
             title_requested: false,
-            focus_handle: cx.focus_handle(),
+            focus_handle,
             _agent_events: None,
             _pump: None,
             _approvals: None,
@@ -346,6 +350,7 @@ impl ConversationView {
             }
         });
 
+        self.text_selection.clear();
         self.transcript = Transcript::from_messages(&coding.agent().messages());
         // One more item at the end: room for the floating composer.
         self.list_state = ListState::new(self.transcript.len() + 1, ListAlignment::Top, px(1000.));
@@ -473,6 +478,7 @@ impl ConversationView {
 
     /// Rebuilds the rows from the agent's transcript (after retry or branch changes).
     fn reload_transcript(&mut self) {
+        self.text_selection.clear();
         if let Some(coding) = &self.coding {
             self.transcript = Transcript::from_messages(&coding.agent().messages());
             self.editing = None;
@@ -564,6 +570,12 @@ impl ConversationView {
     #[cfg(test)]
     pub fn transcript(&self) -> &Transcript {
         &self.transcript
+    }
+
+    /// Shared text selection for native interaction screenshots.
+    #[cfg(feature = "visual-tests")]
+    pub fn text_selection(&self) -> TextSelection {
+        self.text_selection.clone()
     }
 
     /// Feeds scripted agent events, as if a run were in progress (screenshots).
