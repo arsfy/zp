@@ -110,6 +110,11 @@ pub fn run(out: PathBuf) {
         models.set_provider(Arc::new(faux.clone()));
         AppModels::set(models, false, cx);
     });
+    inline_code_layout(&mut cx, &root, &out);
+    if std::env::var("ZP_VISUAL_SCENE").as_deref() == Ok("inline-code") {
+        println!("inline code screenshots written to {}", out.display());
+        return;
+    }
     let window = cx
         .open_offscreen_window(size(px(1280.), px(820.)), |window, cx| {
             cx.new(|cx| ProjectWindow::new(root.clone(), window, cx))
@@ -259,6 +264,76 @@ pub fn run(out: PathBuf) {
 
 fn data_dir_of(data: &tempfile::TempDir) -> PathBuf {
     data.path().to_path_buf()
+}
+
+fn inline_code_layout(
+    cx: &mut VisualTestAppContext,
+    root: &std::path::Path,
+    out: &std::path::Path,
+) {
+    let markdown = "Staged across 5 files: `shell::all_allowed` now treats navigation as an allowed helper, new `unapproved_prefixes` skips navigation and approved commands, plus `debug_selector` on approval buttons and tests confirm the behavior. `PLAN.md` remains untracked. 后续 `echo` 和 `git status` 也保持对齐。 Wrapped `cargo test -p zp-app selection && cargo check -p zp-app && cargo fmt --all -- --check` then `git status`.";
+    let blocks = crate::markdown::parse(markdown);
+    let crate::markdown::Block::Paragraph(inline) = &blocks[0] else {
+        panic!("expected paragraph")
+    };
+    let ranges: Vec<_> = inline
+        .spans
+        .iter()
+        .filter(|(_, span)| span.code)
+        .map(|(range, _)| range.clone())
+        .collect();
+    for (width, name) in [
+        (1000., "33-inline-code-wide.png"),
+        (700., "34-inline-code-narrow.png"),
+    ] {
+        let window = cx
+            .open_offscreen_window(size(px(width), px(650.)), |window, cx| {
+                let session = zp_session::Session::in_memory(root);
+                cx.new(|cx| ProjectWindow::new_with_session(root.to_owned(), session, window, cx))
+            })
+            .unwrap();
+        let conversation = cx.update(|cx| {
+            window
+                .read(cx)
+                .unwrap()
+                .active_conversation()
+                .unwrap()
+                .clone()
+        });
+        cx.update(|cx| {
+            conversation.update(cx, |view, cx| {
+                view.inject(
+                    vec![AgentEvent::MessageEnd {
+                        message: assistant(vec![AssistantContent::Text(TextContent {
+                            text: markdown.into(),
+                        })])
+                        .into(),
+                    }],
+                    false,
+                    cx,
+                );
+            })
+        });
+        pump(cx, Duration::from_millis(100));
+        let selection = cx.update(|cx| conversation.read(cx).text_selection());
+        selection.assert_inline_geometry(&inline.text, &ranges);
+        cx.capture_screenshot(window.into())
+            .unwrap()
+            .save(out.join(name))
+            .unwrap();
+
+        let range = ranges.last().unwrap();
+        let from = selection.point_for_text(&inline.text, range.start).unwrap();
+        let to = selection.point_for_text(&inline.text, range.end).unwrap();
+        cx.simulate_mouse_down(window.into(), from, MouseButton::Left, Modifiers::none());
+        cx.simulate_mouse_move(window.into(), to, MouseButton::Left, Modifiers::none());
+        cx.simulate_mouse_up(window.into(), to, MouseButton::Left, Modifiers::none());
+        cx.simulate_keystrokes(window.into(), "secondary-c");
+        assert_eq!(
+            cx.update(|cx| cx.read_from_clipboard().unwrap().text().unwrap()),
+            "git status"
+        );
+    }
 }
 
 /// Writes a session whose entries are `age_ms` old.
