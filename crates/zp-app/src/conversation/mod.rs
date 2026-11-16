@@ -133,6 +133,8 @@ pub struct ConversationView {
     tool_diffs: RefCell<HashMap<String, Rc<Result<files::ToolDiff, String>>>>,
     /// Tool calls waiting for the user.
     approvals: Vec<permissions::Approval>,
+    /// The row whose text was just copied (shows a check mark briefly).
+    copied_row: Option<usize>,
     /// Times the streaming response.
     response_timer: ResponseTimer,
     /// Output tokens per second of the last streamed response.
@@ -211,6 +213,7 @@ impl ConversationView {
             markdown_cache: RefCell::default(),
             tool_diffs: RefCell::default(),
             approvals: Vec::new(),
+            copied_row: None,
             response_timer: ResponseTimer::default(),
             tokens_per_second: None,
             completion: None,
@@ -327,6 +330,10 @@ impl ConversationView {
         }
         let new_len = self.transcript.len();
         if new_len > old_len {
+            // The previous last row loses the working indicator.
+            if old_len > 0 && !changes.dirty.contains(&(old_len - 1)) {
+                self.list_state.splice(old_len - 1..old_len, 1);
+            }
             self.list_state.splice(old_len..old_len, new_len - old_len);
         }
         if changes.usage {
@@ -384,6 +391,37 @@ impl ConversationView {
                 true
             }
             _ => false,
+        }
+    }
+
+    /// Shows a check mark on row `ix`'s copy button for a moment.
+    pub(super) fn show_copied(&mut self, ix: usize, cx: &mut Context<Self>) {
+        self.copied_row = Some(ix);
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(1500))
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                if this.copied_row == Some(ix) {
+                    this.copied_row = None;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Whether the agent is working (running or compacting).
+    pub(crate) fn is_busy(&self) -> bool {
+        self.running || self.compacting
+    }
+
+    /// Remeasures the last row, which shows the working indicator while busy.
+    pub(super) fn refresh_last_row(&mut self) {
+        let len = self.transcript.len();
+        if len > 0 {
+            self.list_state.splice(len - 1..len, 1);
         }
     }
 
@@ -485,6 +523,7 @@ impl ConversationView {
     #[cfg(feature = "visual-tests")]
     pub fn inject(&mut self, events: Vec<AgentEvent>, running: bool, cx: &mut Context<Self>) {
         self.running = running;
+        self.refresh_last_row();
         let now = Instant::now();
         self.apply_events(events.into_iter().map(|e| (now, e)).collect(), cx);
     }
@@ -966,6 +1005,7 @@ impl ConversationView {
         };
         self.running = true;
         self.run_error = None;
+        self.refresh_last_row();
         self.list_state.set_follow_mode(gpui::FollowMode::Tail);
         cx.emit(ConversationEvent::StatusChanged);
         let task = gpui_tokio::Tokio::spawn(cx, run(coding));
@@ -991,6 +1031,7 @@ impl ConversationView {
     /// Marks the run as over once its last event has been shown.
     fn finish_run(&mut self, cx: &mut Context<Self>) {
         self.running = false;
+        self.refresh_last_row();
         self.clear_approvals();
         self.invalidate_files();
         // A request too large for the context: compact once and try again.

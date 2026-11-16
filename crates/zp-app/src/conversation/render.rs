@@ -1,9 +1,11 @@
 //! Rendering of the conversation: transcript rows, tool cards and the composer.
 
+use std::time::Duration;
+
 use gpui::{
-    Anchor, AnyElement, App, ClipboardItem, ColorExt as _, Context, ElementId, FontWeight,
-    IntoElement, Render, SharedString, Window, anchored, deferred, div, list, point, prelude::*,
-    px, rgb_to_hsla,
+    Anchor, Animation, AnimationExt as _, AnyElement, App, ClipboardItem, ColorExt as _, Context,
+    ElementId, FontWeight, IntoElement, Render, SharedString, Window, anchored, deferred, div,
+    list, point, prelude::*, px, relative, rgb_to_hsla, svg,
 };
 use gpui_elements::editable_text::{text_area, text_input};
 use zp_ai::{AssistantContent, StopReason, ToolCall};
@@ -37,6 +39,59 @@ fn centered(content: impl IntoElement) -> gpui::Div {
         .justify_center()
         .px_4()
         .child(div().w_full().max_w(px(CONTENT_WIDTH)).child(content))
+}
+
+/// Three dots pulsing in turn: the agent is working.
+fn loading_dots(cx: &App) -> AnyElement {
+    let color = cx.theme().colors.text_muted;
+    div()
+        .id("loading")
+        .h(px(20.))
+        .flex()
+        .items_center()
+        .gap(px(5.))
+        .children((0..3usize).map(|index| {
+            div().size(px(6.)).rounded_full().bg(color).with_animation(
+                ("loading-dot", index),
+                Animation::new(Duration::from_millis(1200)).repeat_synced(),
+                move |dot, t| {
+                    // Each dot peaks a third of a cycle after the previous one.
+                    let phase = (t - index as f32 / 3.0).rem_euclid(1.0);
+                    let wave = (phase * std::f32::consts::TAU).cos() * 0.5 + 0.5;
+                    dot.opacity(0.25 + 0.75 * wave)
+                },
+            )
+        }))
+        .into_any_element()
+}
+
+/// Height of the line under a message (actions or the working indicator).
+const ACTION_SIZE: f32 = 22.0;
+const ICON_COPY: &[u8] = include_bytes!("../../../../assets/icons/copy.svg");
+const ICON_CHECK: &[u8] = include_bytes!("../../../../assets/icons/check.svg");
+const ICON_EDIT: &[u8] = include_bytes!("../../../../assets/icons/pencil.svg");
+const ICON_BRANCH: &[u8] = include_bytes!("../../../../assets/icons/git-branch.svg");
+const ICON_FORK: &[u8] = include_bytes!("../../../../assets/icons/square-arrow-out-up-right.svg");
+
+/// A small square button showing an icon, with a tooltip.
+fn icon_button(
+    element_id: impl Into<ElementId>,
+    icon: &'static [u8],
+    label: &'static str,
+    cx: &App,
+) -> gpui::Stateful<gpui::Div> {
+    let colors = cx.theme().colors.clone();
+    div()
+        .id(element_id)
+        .size(px(ACTION_SIZE))
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded(px(4.))
+        .cursor_pointer()
+        .hover_style(move |s| s.bg(colors.surface_hover))
+        .tooltip(crate::ui::tooltip(label))
+        .child(svg().data(icon).size(px(13.)).text_color(colors.text_muted))
 }
 
 fn ghost_button(
@@ -150,82 +205,123 @@ impl ConversationView {
             }
             None => div().into_any_element(),
         };
-        let group = SharedString::from(format!("row-{ix}"));
-        let actions = row.and_then(|row| self.render_row_actions(ix, &row, group.clone(), cx));
+        let footer = row.and_then(|row| self.render_row_footer(ix, &row, cx));
         centered(
             div()
-                .group(group)
-                .py_2()
+                .py_1()
                 .flex()
                 .flex_col()
                 .gap_1()
                 .child(content)
-                .children(actions),
+                .children(footer),
         )
         .into_any_element()
     }
 
-    /// Message actions, shown when the row is hovered (not while running).
+    /// Whether row `ix` ends a turn (the next row is not part of the same answer).
+    fn ends_turn(&self, ix: usize) -> bool {
+        !matches!(
+            self.transcript.rows().get(ix + 1),
+            Some(Row::Assistant { .. })
+        )
+    }
+
+    /// The line under a message: the working indicator on the last row while busy,
+    /// otherwise its actions. It has a fixed height so rows never move when it changes;
+    /// assistant messages in the middle of an answer have none.
+    fn render_row_footer(
+        &self,
+        ix: usize,
+        row: &Row,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let last = ix + 1 == self.transcript.len();
+        let is_user = match row {
+            Row::User { .. } => true,
+            Row::Assistant { .. } => false,
+            Row::Notice { .. } => return None,
+        };
+        if !is_user && !self.ends_turn(ix) {
+            return None;
+        }
+        let slot = div().h(px(ACTION_SIZE)).flex().items_center();
+        if self.is_busy() {
+            return Some(
+                slot.when(last, |this| this.child(loading_dots(cx)))
+                    .into_any_element(),
+            );
+        }
+        let Some(actions) = self.render_row_actions(ix, row, cx) else {
+            return Some(slot.into_any_element());
+        };
+        Some(
+            slot.when(is_user, |this| this.justify_end())
+                .child(actions)
+                .into_any_element(),
+        )
+    }
+
+    /// Icon buttons for a message: edit or branch, fork, copy.
     fn render_row_actions(
         &self,
         ix: usize,
         row: &Row,
-        group: SharedString,
         cx: &mut Context<Self>,
-    ) -> Option<AnyElement> {
-        if self.running || self.coding.is_none() {
-            return None;
-        }
+    ) -> Option<gpui::Div> {
+        self.coding.as_ref()?;
         let (text, is_user) = match row {
             Row::User { text, .. } => (text.clone(), true),
-            Row::Assistant { .. } => {
-                let message = self.transcript.assistant(ix)?;
-                if self.transcript.is_streaming(ix) {
-                    return None;
-                }
-                (message.text(), false)
-            }
+            Row::Assistant { .. } => (self.transcript.assistant(ix)?.text(), false),
             Row::Notice { .. } => return None,
         };
-        let mut bar = div()
-            .flex()
-            .gap_1()
-            .invisible()
-            .group_hover_style(group, |style| style.visible());
+        let mut bar = div().flex().items_center().gap_0p5();
+        if !text.trim().is_empty() {
+            let copied = self.copied_row == Some(ix);
+            bar = bar.child(
+                icon_button(
+                    id("copy", ix),
+                    if copied { ICON_CHECK } else { ICON_COPY },
+                    if copied { "Copied" } else { "Copy" },
+                    cx,
+                )
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
+                    this.show_copied(ix, cx);
+                })),
+            );
+        }
         if is_user {
-            bar = bar.child(ghost_button(id("edit", ix), "Edit & Resend", cx).on_click(
-                cx.listener(move |this, _, window, cx| this.edit_and_resend(ix, window, cx)),
-            ));
+            bar = bar.child(
+                icon_button(id("edit", ix), ICON_EDIT, "Edit & Resend", cx).on_click(
+                    cx.listener(move |this, _, window, cx| this.edit_and_resend(ix, window, cx)),
+                ),
+            );
         } else {
             bar = bar.child(
-                ghost_button(id("branch", ix), "Branch from here", cx).on_click(
+                icon_button(id("branch", ix), ICON_BRANCH, "Branch from here", cx).on_click(
                     cx.listener(move |this, _, window, cx| this.branch_from(ix, window, cx)),
                 ),
             );
         }
         bar = bar.child(
-            ghost_button(id("fork", ix), "Fork to new tab", cx)
+            icon_button(id("fork", ix), ICON_FORK, "Fork to new tab", cx)
                 .on_click(cx.listener(move |this, _, _, cx| this.fork_from(ix, cx))),
         );
-        if !text.trim().is_empty() {
-            bar = bar.child(
-                ghost_button(id("copy", ix), "Copy", cx).on_click(move |_, _, cx| {
-                    cx.write_to_clipboard(ClipboardItem::new_string(text.clone()))
-                }),
-            );
-        }
-        Some(bar.into_any_element())
+        Some(bar)
     }
 
+    /// The user's message: a bubble as wide as its text, on the right.
     fn render_user(&self, text: &str, images: usize, files: &[String], cx: &App) -> AnyElement {
         let colors = &cx.theme().colors;
-        div()
+        let bubble = div()
+            .max_w(relative(0.85))
+            .flex()
+            .flex_col()
+            .gap_0p5()
             .px_3()
             .py_2()
-            .rounded(px(8.))
+            .rounded(px(10.))
             .bg(colors.surface)
-            .border_1()
-            .border_color(colors.border)
             .child(text.to_owned())
             .when(!files.is_empty(), |this| {
                 this.child(
@@ -242,8 +338,8 @@ impl ConversationView {
                         .text_color(colors.text_muted)
                         .child(format!("{images} image(s) attached")),
                 )
-            })
-            .into_any_element()
+            });
+        div().flex().justify_end().child(bubble).into_any_element()
     }
 
     fn render_assistant(&self, row: usize, cx: &mut Context<Self>) -> AnyElement {
@@ -272,9 +368,6 @@ impl ConversationView {
                 )),
                 AssistantContent::ToolCall(call) => column.child(self.render_tool(row, call, cx)),
             };
-        }
-        if streaming && message.content.is_empty() {
-            column = column.child(div().text_color(colors.text_muted).child("Working…"));
         }
         if !streaming && matches!(message.stop_reason, StopReason::Error | StopReason::Aborted) {
             let aborted = message.stop_reason == StopReason::Aborted;

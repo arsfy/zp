@@ -704,6 +704,7 @@ impl ConversationView {
             return;
         }
         self.compacting = true;
+        self.refresh_last_row();
         self.run_error = None;
         cx.emit(ConversationEvent::StatusChanged);
         cx.notify();
@@ -713,6 +714,7 @@ impl ConversationView {
             let result = task.await;
             let _ = this.update(cx, |this, cx| {
                 this.compacting = false;
+                this.refresh_last_row();
                 match result {
                     Ok(Ok(Some((before, after)))) => {
                         this.info = Some(format!(
