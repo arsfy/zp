@@ -732,29 +732,29 @@ impl ProjectWindow {
         } else if status.as_ref().is_some_and(|s| s.running) {
             right.push("running".to_owned());
         }
-        match status
+        // The model and reasoning level are shown under the composer.
+        if let Some((status, model)) = status
             .as_ref()
             .and_then(|s| s.model.clone().map(|m| (s, m)))
         {
-            None => right.push("No model configured".to_owned()),
-            Some((status, model)) => {
-                right.push(model.qualified_id());
-                if model.reasoning {
-                    right.push(format!(
-                        "thinking {}",
-                        model.clamp_thinking_level(status.thinking)
-                    ));
-                }
-                let usage = &status.usage;
-                let tokens = usage.input + usage.output + usage.cache_read + usage.cache_write;
-                right.push(format!("{} tokens", format_tokens(tokens)));
-                right.push(format!("${:.4}", usage.cost));
-                if model.context_window > 0 {
-                    right.push(format!(
-                        "context {:.0}%",
-                        usage.last_context_tokens as f64 * 100.0 / model.context_window as f64
-                    ));
-                }
+            let usage = &status.usage;
+            let input = usage.input + usage.cache_read + usage.cache_write;
+            right.push(format!("{} tokens", format_tokens(input + usage.output)));
+            if input > 0 {
+                right.push(format!(
+                    "cache {:.0}%",
+                    usage.cache_read as f64 * 100.0 / input as f64
+                ));
+            }
+            if let Some(speed) = status.tokens_per_second {
+                right.push(format!("{speed:.0} tok/s"));
+            }
+            right.push(format!("${:.4}", usage.cost));
+            if model.context_window > 0 {
+                right.push(format!(
+                    "context {:.0}%",
+                    usage.last_context_tokens as f64 * 100.0 / model.context_window as f64
+                ));
             }
         }
         div()

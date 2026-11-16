@@ -16,7 +16,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use futures::StreamExt as _;
 use gpui::{
@@ -86,9 +86,20 @@ pub enum Picker {
 #[derive(Clone, Debug)]
 pub struct ConversationStatus {
     pub model: Option<Model>,
+    /// Shown under the composer rather than in the status bar.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub thinking: ThinkingLevel,
     pub usage: UsageTotals,
     pub running: bool,
+    /// Output speed of the last streamed response.
+    pub tokens_per_second: Option<f64>,
+}
+
+/// When the streaming response started and produced its first output.
+#[derive(Clone, Copy, Debug, Default)]
+struct ResponseTimer {
+    started: Option<Instant>,
+    first_output: Option<Instant>,
 }
 
 /// A model offered by the model picker.
@@ -122,6 +133,10 @@ pub struct ConversationView {
     tool_diffs: RefCell<HashMap<String, Rc<Result<files::ToolDiff, String>>>>,
     /// Tool calls waiting for the user.
     approvals: Vec<permissions::Approval>,
+    /// Times the streaming response.
+    response_timer: ResponseTimer,
+    /// Output tokens per second of the last streamed response.
+    tokens_per_second: Option<f64>,
     /// The `/` or `@` completion menu.
     completion: Option<composer::Completion>,
     /// Scrolls the selected completion item into view.
@@ -194,6 +209,8 @@ impl ConversationView {
             markdown_cache: RefCell::default(),
             tool_diffs: RefCell::default(),
             approvals: Vec::new(),
+            response_timer: ResponseTimer::default(),
+            tokens_per_second: None,
             completion: None,
             completion_scroll: ScrollHandle::new(),
             suppress_completion: None,
@@ -267,9 +284,10 @@ impl ConversationView {
         });
         self._approvals = Some(approvals);
 
-        let (sender, mut receiver) = futures::channel::mpsc::unbounded::<AgentEvent>();
+        // Events carry their arrival time: batches are applied up to a frame later.
+        let (sender, mut receiver) = futures::channel::mpsc::unbounded::<(Instant, AgentEvent)>();
         let subscription = coding.agent().subscribe(move |event| {
-            let _ = sender.unbounded_send(event.clone());
+            let _ = sender.unbounded_send((Instant::now(), event.clone()));
         });
         let pump = cx.spawn(async move |this, cx| {
             while let Some(first) = receiver.next().await {
@@ -296,10 +314,13 @@ impl ConversationView {
         Ok(())
     }
 
-    fn apply_events(&mut self, events: Vec<AgentEvent>, cx: &mut Context<Self>) {
+    fn apply_events(&mut self, events: Vec<(Instant, AgentEvent)>, cx: &mut Context<Self>) {
         let old_len = self.transcript.len();
         let mut changes = Changes::default();
-        for event in &events {
+        for (at, event) in &events {
+            if self.time_response(*at, event) {
+                changes.usage = true;
+            }
             self.transcript.apply(event, &mut changes);
         }
         for &row in changes.dirty.iter().filter(|&&row| row < old_len) {
@@ -312,7 +333,7 @@ impl ConversationView {
         if changes.usage {
             cx.emit(ConversationEvent::StatusChanged);
         }
-        let files_changed = events.iter().any(|event| {
+        let files_changed = events.iter().any(|(_, event)| {
             matches!(event, AgentEvent::ToolExecutionEnd { result, .. } if result.details.is_some())
         });
         if files_changed {
@@ -322,6 +343,49 @@ impl ConversationView {
             self.finish_run(cx);
         }
         cx.notify();
+    }
+
+    /// Tracks the streaming response; returns whether the output speed was updated.
+    fn time_response(&mut self, at: Instant, event: &AgentEvent) -> bool {
+        use zp_ai::{AssistantMessageEvent, Message, StopReason};
+        match event {
+            AgentEvent::MessageStart {
+                message: zp_agent::AgentMessage::Llm(Message::Assistant(_)),
+            } => {
+                self.response_timer = ResponseTimer {
+                    started: Some(at),
+                    first_output: None,
+                };
+                false
+            }
+            AgentEvent::MessageUpdate { event } => {
+                if !matches!(event, AssistantMessageEvent::Start { .. })
+                    && self.response_timer.first_output.is_none()
+                {
+                    self.response_timer.first_output = Some(at);
+                }
+                false
+            }
+            AgentEvent::MessageEnd {
+                message: zp_agent::AgentMessage::Llm(Message::Assistant(message)),
+            } => {
+                let timer = std::mem::take(&mut self.response_timer);
+                let Some(from) = timer.first_output.or(timer.started) else {
+                    return false;
+                };
+                let seconds = at.duration_since(from).as_secs_f64();
+                let output = message.usage.output;
+                if matches!(message.stop_reason, StopReason::Error | StopReason::Aborted)
+                    || output == 0
+                    || seconds < 0.05
+                {
+                    return false;
+                }
+                self.tokens_per_second = Some(output as f64 / seconds);
+                true
+            }
+            _ => false,
+        }
     }
 
     /// Rebuilds the rows from the agent's transcript (after retry or branch changes).
@@ -422,7 +486,8 @@ impl ConversationView {
     #[cfg(feature = "visual-tests")]
     pub fn inject(&mut self, events: Vec<AgentEvent>, running: bool, cx: &mut Context<Self>) {
         self.running = running;
-        self.apply_events(events, cx);
+        let now = Instant::now();
+        self.apply_events(events.into_iter().map(|e| (now, e)).collect(), cx);
     }
 
     /// Scrolls the transcript so that `row` is at the top (screenshots).
@@ -677,6 +742,7 @@ impl ConversationView {
             thinking: agent.map_or(ThinkingLevel::Off, |agent| agent.thinking_level()),
             usage: self.transcript.usage().clone(),
             running: self.running,
+            tokens_per_second: self.tokens_per_second,
         }
     }
 

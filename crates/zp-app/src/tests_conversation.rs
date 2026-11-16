@@ -690,3 +690,21 @@ fn conversations_open_without_any_api_key(cx: &mut TestAppContext) {
         None
     );
 }
+
+#[gpui::test]
+fn measures_the_output_speed(cx: &mut TestAppContext) {
+    let faux = FauxProvider::default().with_chunk_delay(Duration::from_millis(20));
+    faux.push(FauxResponse::text(
+        "a fairly long answer streamed in several chunks",
+    ));
+    let _data = setup_models(cx, &[&faux], false);
+    let (_dir, project) = project_dir();
+    let window = open(cx, &project);
+    let conversation = active(window, cx);
+    assert!(conversation.read_with(cx, |v, _| v.status().tokens_per_second.is_none()));
+
+    send(window, "hello", cx);
+    idle(&conversation, 2, cx);
+    let speed = conversation.read_with(cx, |v, _| v.status().tokens_per_second);
+    assert!(speed.is_some_and(|speed| speed > 0.0), "{speed:?}");
+}
