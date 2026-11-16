@@ -27,7 +27,7 @@ pub enum PermissionMode {
     /// Commands and file changes need approval.
     #[default]
     Ask,
-    /// File changes in the project run; commands need approval.
+    /// File changes, non-destructive Git operations and echo writes run automatically.
     AutoEdit,
     /// Like `AutoEdit`, but a review model approves safe commands; destructive ones still
     /// need the user.
@@ -50,8 +50,12 @@ impl PermissionMode {
 
     pub fn description(self) -> &'static str {
         match self {
-            Self::Ask => "Approve every command and file change",
-            Self::AutoEdit => "File changes in the project run; commands need approval",
+            Self::Ask => {
+                "Approve commands and file changes; navigation and echo output run automatically"
+            }
+            Self::AutoEdit => {
+                "Auto-approve file changes, echo writes and non-destructive Git operations"
+            }
             Self::AutoReview => "A review model approves safe commands; destructive ones need you",
             Self::FullAuto => "Everything runs without asking",
         }
@@ -338,12 +342,18 @@ impl PermissionPolicy {
                         grants: Vec::new(),
                     };
                 } else {
-                    let allowed: Vec<String> = self
+                    let mut allowed: Vec<String> = self
                         .allow_commands
                         .iter()
                         .chain(&grants.commands)
                         .cloned()
                         .collect();
+                    if matches!(
+                        self.mode,
+                        PermissionMode::AutoEdit | PermissionMode::AutoReview
+                    ) {
+                        allowed.extend(["git".to_owned(), "echo".to_owned()]);
+                    }
                     if !shell::all_allowed(command, &allowed) {
                         offer.extend(
                             shell::unapproved_prefixes(command, &allowed)
@@ -698,6 +708,75 @@ mod tests {
                 ));
                 assert!(matches!(&reasons[..], [AskReason::Dangerous(_)]));
                 assert!(grants.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn echo_and_git_follow_the_edit_mode_rules() {
+        let dir = tempfile::tempdir().unwrap();
+        let grants = Grants::default();
+        for mode in PermissionMode::ALL {
+            let policy = PermissionPolicy {
+                mode,
+                root: dir.path().to_owned(),
+                ..Default::default()
+            };
+            for command in ["echo hello", "echo 'literal > text'", "cd src && echo done"] {
+                assert_eq!(
+                    policy.evaluate("bash", &json!({"command": command}), &grants),
+                    Evaluation::Allow,
+                    "{mode:?}: {command}"
+                );
+            }
+            for command in [
+                "echo hello > file",
+                "echo hello>>file",
+                "git status",
+                "git add . && git commit -m update",
+                "git -C repo diff",
+                "git checkout feature",
+                "git switch feature",
+            ] {
+                let evaluation = policy.evaluate("bash", &json!({"command": command}), &grants);
+                if mode == PermissionMode::Ask {
+                    assert!(matches!(evaluation, Evaluation::Ask { .. }), "{command}");
+                } else {
+                    assert_eq!(evaluation, Evaluation::Allow, "{mode:?}: {command}");
+                }
+            }
+            for command in [
+                "git push",
+                "git -C repo push",
+                "git reset --hard",
+                "git -C repo clean -fd",
+                "git restore .",
+                "git checkout -- file",
+                "git branch -D feature",
+                "git stash drop",
+            ] {
+                let evaluation = policy.evaluate("bash", &json!({"command": command}), &grants);
+                if mode == PermissionMode::FullAuto {
+                    assert_eq!(evaluation, Evaluation::Allow);
+                } else {
+                    let (reasons, offers) = ask(evaluation);
+                    assert!(
+                        matches!(&reasons[..], [AskReason::Dangerous(_)]),
+                        "{mode:?}: {command}"
+                    );
+                    assert!(offers.is_empty());
+                }
+            }
+            if mode != PermissionMode::FullAuto {
+                let evaluation = policy.evaluate(
+                    "bash",
+                    &json!({"command": "echo hello > file && cargo test"}),
+                    &grants,
+                );
+                assert!(matches!(
+                    evaluation,
+                    Evaluation::Ask { .. } | Evaluation::Review { .. }
+                ));
             }
         }
     }

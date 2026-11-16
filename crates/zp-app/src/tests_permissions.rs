@@ -62,11 +62,11 @@ fn approvals_with_reasons_grants_and_previews(cx: &mut TestAppContext) {
     ));
     faux.push(FauxResponse::tool_call(
         "bash",
-        json!({"command": "cd . && echo one"}),
+        json!({"command": "cd . && printf one"}),
     ));
     faux.push(FauxResponse::tool_call(
         "bash",
-        json!({"command": "pwd >/dev/null && cd . && echo two"}),
+        json!({"command": "pwd >/dev/null && cd . && printf two"}),
     ));
     faux.push(FauxResponse::tool_call(
         "edit",
@@ -103,9 +103,9 @@ fn approvals_with_reasons_grants_and_previews(cx: &mut TestAppContext) {
     });
     conversation.update(cx, |view, cx| view.deny_approval(&first, cx));
 
-    // Approving `echo` for the session lets the next `echo` run on its own.
+    // Approving `printf` for the session lets the next `printf` run on its own.
     wait_for_approval(&conversation, cx);
-    assert_eq!(pending(&conversation, cx), ["$ cd . && echo one"]);
+    assert_eq!(pending(&conversation, cx), ["$ cd . && printf one"]);
     wait_until(cx, |cx| {
         VisualTestContext::from_window(window.into(), cx)
             .debug_bounds("approval-approve-session")
@@ -155,7 +155,7 @@ fn approvals_with_reasons_grants_and_previews(cx: &mut TestAppContext) {
 
     faux.push(FauxResponse::tool_call(
         "bash",
-        json!({"command": "cd . && pwd >/dev/null && echo next-turn"}),
+        json!({"command": "cd . && pwd >/dev/null && printf next-turn"}),
     ));
     faux.push(FauxResponse::text("done again"));
     send(window, "continue", cx);

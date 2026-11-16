@@ -83,8 +83,8 @@ async fn ask_mode_denials_grants_and_scope() {
 
     let faux = FauxProvider::default();
     faux.push(call("bash", json!({"command": "echo hi > out.txt"})));
-    faux.push(call("bash", json!({"command": "cd . && echo one"})));
-    faux.push(call("bash", json!({"command": "cd . && echo two"})));
+    faux.push(call("bash", json!({"command": "cd . && printf one"})));
+    faux.push(call("bash", json!({"command": "cd . && printf two"})));
     faux.push(call("write", json!({"path": "new.txt", "content": "x"})));
     faux.push(call("read", json!({"path": secret.to_str().unwrap()})));
     faux.push(call("read", json!({"path": "new.txt"})));
@@ -118,7 +118,7 @@ async fn ask_mode_denials_grants_and_scope() {
 
     faux.push(call(
         "bash",
-        json!({"command": "pwd >/dev/null && cd . && echo later"}),
+        json!({"command": "pwd >/dev/null && cd . && printf later"}),
     ));
     faux.push(FauxResponse::text("done again"));
     assert_eq!(
@@ -127,16 +127,78 @@ async fn ask_mode_denials_grants_and_scope() {
     );
 
     let requests = approver.requests.lock().unwrap();
-    assert_eq!(requests.len(), 4, "`echo two` was granted for the session");
+    assert_eq!(
+        requests.len(),
+        4,
+        "`printf two` was granted for the session"
+    );
     assert_eq!(requests[0].command.as_deref(), Some("echo hi > out.txt"));
     assert_eq!(requests[0].reasons, [AskReason::Mode(PermissionMode::Ask)]);
-    assert_eq!(requests[1].grants, [SessionGrant::Command("echo".into())]);
+    assert_eq!(requests[1].grants, [SessionGrant::Command("printf".into())]);
     assert_eq!(requests[2].grants, [SessionGrant::Edits]);
     assert_eq!(
         requests[3].reasons,
         [AskReason::OutsideProject(vec![secret.clone()])]
     );
-    assert_eq!(coding.permissions().unwrap().grants().commands, ["echo"]);
+    assert_eq!(coding.permissions().unwrap().grants().commands, ["printf"]);
+}
+
+#[tokio::test]
+async fn echo_output_runs_without_approval_in_every_mode() {
+    for mode in PermissionMode::ALL {
+        let project = tempfile::tempdir().unwrap();
+        let root = project.path().canonicalize().unwrap();
+        let faux = FauxProvider::default();
+        faux.push(call(
+            "bash",
+            json!({"command": "echo hello && echo 'literal > text'"}),
+        ));
+        faux.push(FauxResponse::text("done"));
+        let approver = Arc::new(Scripted::default());
+        let coding = session(&faux, &root, mode, approver.clone());
+        assert_eq!(
+            results(&coding.prompt("go").await.unwrap()),
+            [(false, "hello\nliteral > text".to_owned())],
+            "{mode:?}"
+        );
+        assert!(approver.requests.lock().unwrap().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn edit_modes_allow_echo_writes_and_local_git_but_still_ask_for_push() {
+    for mode in [PermissionMode::AutoEdit, PermissionMode::AutoReview] {
+        let project = tempfile::tempdir().unwrap();
+        let root = project.path().canonicalize().unwrap();
+        let faux = FauxProvider::default();
+        faux.push(call("bash", json!({"command": "git init -q --template= && echo first>note.txt && echo second>>note.txt && git add note.txt && git -c user.name=Test -c user.email=test@example.com -c commit.gpgsign=false -c core.hooksPath=/dev/null commit -qm initial"})));
+        faux.push(call(
+            "bash",
+            json!({"command": "git -C . push origin main"}),
+        ));
+        faux.push(FauxResponse::text("done"));
+        let approver = Arc::new(Scripted::default());
+        approver
+            .answers
+            .lock()
+            .unwrap()
+            .push_back(Decision::Deny(None));
+        let coding = session(&faux, &root, mode, approver.clone());
+        let output = results(&coding.prompt("go").await.unwrap());
+        assert!(!output[0].0, "{mode:?}: {}", output[0].1);
+        assert!(output[1].0);
+        assert_eq!(
+            std::fs::read_to_string(root.join("note.txt")).unwrap(),
+            "first\nsecond\n"
+        );
+        let requests = approver.requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert!(matches!(
+            &requests[0].reasons[..],
+            [AskReason::Dangerous(_)]
+        ));
+        assert!(requests[0].grants.is_empty());
+    }
 }
 
 #[tokio::test]

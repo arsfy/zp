@@ -12,6 +12,8 @@ pub struct Segment {
     pub words: Vec<String>,
     /// Whether the segment receives a pipe (`… | here`).
     pub piped: bool,
+    /// Accesses files through shell redirection; quoted text and descriptor copies do not.
+    pub redirected: bool,
 }
 
 /// Splits `command` at `;`, `&`, `&&`, `|`, `||`, newlines, subshells and command
@@ -76,6 +78,36 @@ pub fn segments(command: &str) -> Vec<Segment> {
                     splitter.end_segment(false);
                 }
                 ';' | '\n' | '(' | ')' => splitter.end_segment(false),
+                '<' | '>' => {
+                    splitter.end_word();
+                    splitter.word.push(c);
+                    splitter.in_word = true;
+                    if chars.peek() == Some(&c) {
+                        splitter.word.push(chars.next().unwrap());
+                    }
+                    let descriptor_copy = chars.peek() == Some(&'&');
+                    if matches!(chars.peek(), Some('&' | '|')) {
+                        splitter.word.push(chars.next().unwrap());
+                    }
+                    let target: String = chars
+                        .clone()
+                        .skip_while(|c| c.is_whitespace())
+                        .take_while(|c| {
+                            !c.is_whitespace()
+                                && !matches!(c, ';' | '&' | '|' | '(' | ')' | '<' | '>')
+                        })
+                        .collect();
+                    let descriptor = target == "-"
+                        || !target.is_empty() && target.chars().all(|c| c.is_ascii_digit());
+                    splitter.redirected |= !descriptor_copy || !descriptor;
+                }
+                '&' if chars.peek() == Some(&'>') => {
+                    chars.next();
+                    splitter.redirected = true;
+                    splitter.end_word();
+                    splitter.word.push_str("&>");
+                    splitter.in_word = true;
+                }
                 '&' | '|' => {
                     let doubled = chars.peek() == Some(&c);
                     if doubled {
@@ -104,6 +136,7 @@ struct Splitter {
     quote: Option<char>,
     /// Whether the current segment receives a pipe.
     piped: bool,
+    redirected: bool,
     /// Open substitutions: their kind and the quote to restore when they close.
     stack: Vec<(char, Option<char>)>,
 }
@@ -124,9 +157,11 @@ impl Splitter {
             self.segments.push(Segment {
                 words,
                 piped: self.piped,
+                redirected: self.redirected,
             });
         }
         self.piped = pipe;
+        self.redirected = false;
     }
 
     fn open_substitution(&mut self, kind: char) {
@@ -180,6 +215,30 @@ fn program(words: &[String]) -> Option<&str> {
     let first = words.first()?;
     // `/usr/bin/rm` is `rm`.
     Some(first.rsplit('/').next().unwrap_or(first))
+}
+
+/// Skips Git's global options before inspecting its subcommand.
+fn git_arguments(words: &[String]) -> &[String] {
+    let mut args = &words[1..];
+    while let Some(option) = args.first() {
+        if !option.starts_with('-') || option == "-" {
+            break;
+        }
+        if matches!(
+            option.as_str(),
+            "-C" | "-c"
+                | "--git-dir"
+                | "--work-tree"
+                | "--namespace"
+                | "--config-env"
+                | "--super-prefix"
+        ) {
+            args = args.get(2..).unwrap_or_default();
+        } else {
+            args = &args[1..];
+        }
+    }
+    args
 }
 
 /// Programs whose first argument is a subcommand (`git status`, `cargo test`).
@@ -276,6 +335,7 @@ fn segment_allowed(segment: &Segment, allowed: &[String]) -> bool {
     let words = command_words(segment);
     words.is_empty()
         || matches!(program(words), Some("pwd" | "cd"))
+        || program(words) == Some("echo") && !segment.redirected
         || allowed
             .iter()
             .any(|prefix| segment_matches(segment, prefix))
@@ -304,7 +364,12 @@ pub fn danger(command: &str) -> Option<String> {
         let Some(program) = program(words) else {
             continue;
         };
-        let args: Vec<&str> = words[1..].iter().map(String::as_str).collect();
+        let args = if program == "git" {
+            git_arguments(words)
+        } else {
+            &words[1..]
+        };
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
         let has = |flag: &str| args.contains(&flag);
         let has_short = |letter: char| {
             args.iter()
@@ -335,9 +400,16 @@ pub fn danger(command: &str) -> Option<String> {
                 Some("push") => Some("pushes to a remote repository"),
                 Some("reset") if has("--hard") => Some("discards local changes"),
                 Some("clean") => Some("deletes untracked files"),
-                Some("checkout") if has("--") || has(".") => Some("discards local changes"),
+                Some("checkout") if has("--") || has(".") || has_short('f') || has("--force") => {
+                    Some("discards local changes")
+                }
+                Some("switch") if has_short('f') || has("--force") || has("--discard-changes") => {
+                    Some("discards local changes")
+                }
                 Some("restore") => Some("discards local changes"),
-                Some("branch") if has("-D") || has("--delete") => Some("deletes a branch"),
+                Some("branch") if has_short('D') || has_short('d') || has("--delete") => {
+                    Some("deletes a branch")
+                }
                 Some("stash") if matches!(args.get(1).copied(), Some("drop" | "clear")) => {
                     Some("deletes stashed changes")
                 }
@@ -458,6 +530,30 @@ mod tests {
                 Some("pushes to a remote repository (`git`)"),
             ),
             (
+                "git -C repo push origin main",
+                Some("pushes to a remote repository (`git`)"),
+            ),
+            (
+                "git --no-pager -c color.ui=false -C repo reset --hard HEAD",
+                Some("discards local changes (`git`)"),
+            ),
+            (
+                "git --git-dir=repo/.git clean -fd",
+                Some("deletes untracked files (`git`)"),
+            ),
+            (
+                "git -C repo checkout --force main",
+                Some("discards local changes (`git`)"),
+            ),
+            (
+                "git checkout -qf main",
+                Some("discards local changes (`git`)"),
+            ),
+            (
+                "git switch --discard-changes main",
+                Some("discards local changes (`git`)"),
+            ),
+            (
                 "git reset --hard HEAD~1",
                 Some("discards local changes (`git`)"),
             ),
@@ -479,5 +575,41 @@ mod tests {
         ] {
             assert_eq!(danger(command).as_deref(), expected, "{command}");
         }
+    }
+
+    #[test]
+    fn echo_output_is_distinct_from_file_redirection() {
+        for command in [
+            "echo hello",
+            "echo 'hello > file'",
+            "echo \"hello < file\"",
+            "echo hello\\>file",
+            "/bin/echo -n hello",
+            "cd src && echo done",
+            "echo hello 2>&1",
+            "echo hello >&2",
+            "echo hello 2>&-",
+        ] {
+            assert!(all_allowed(command, &[]), "{command}");
+            assert!(unapproved_prefixes(command, &[]).is_empty(), "{command}");
+        }
+        for command in [
+            "echo hello > file",
+            "echo hello>>file",
+            "echo>file",
+            "echo hello 2>error.log",
+            "echo hello &>file",
+            "echo hello >|file",
+            "echo hello < file",
+            "echo hello >file 2>&1",
+            "echo hello >&file",
+        ] {
+            assert!(!all_allowed(command, &[]), "{command}");
+            assert_eq!(unapproved_prefixes(command, &[]), ["echo"], "{command}");
+            assert!(all_allowed(command, &["echo".to_owned()]), "{command}");
+        }
+        assert!(!all_allowed("echo hello | tee file", &[]));
+        assert!(!all_allowed("echo $(curl example.com)", &[]));
+        assert!(!all_allowed("echo hello; touch file", &[]));
     }
 }
