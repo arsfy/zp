@@ -660,13 +660,7 @@ pub(super) enum ButtonKind {
 }
 
 fn page_body() -> gpui::Div {
-    div()
-        .flex()
-        .flex_col()
-        .gap_2()
-        .px_6()
-        .pb_6()
-        .max_w(px(760.))
+    div().w_full().flex().flex_col().gap_2().px_6().pb_6()
 }
 
 pub(super) fn section(title: &str, description: &str, cx: &App) -> impl IntoElement {
