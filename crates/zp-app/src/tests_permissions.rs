@@ -1,7 +1,7 @@
 //! M8: approval cards, session grants, the permission mode picker, stopping while waiting
 //! and project trust — with real tools in a temp project.
 
-use gpui::{Entity, IntoElement as _, Modifiers, Render as _, TestAppContext, VisualTestContext};
+use gpui::{Entity, Modifiers, TestAppContext, VisualTestContext};
 use serde_json::json;
 use zp_ai::{FauxProvider, FauxResponse};
 use zp_core::permissions::{Decision, PermissionMode};
@@ -181,9 +181,22 @@ fn permission_modes_render_with_picker_open_and_closed(cx: &mut TestAppContext) 
             .update(cx, |_, window, cx| {
                 conversation.update(cx, |view, cx| {
                     view.select_permission_mode(mode, window, cx);
-                    let _ = view.render(window, cx).into_any_element();
-                    view.toggle_picker(Picker::Permissions, window, cx);
-                    let _ = view.render(window, cx).into_any_element();
+                });
+            })
+            .unwrap();
+        cx.run_until_parked();
+        if mode == PermissionMode::AutoReview {
+            cx.simulate_keystrokes(window.into(), "enter");
+            cx.run_until_parked();
+        }
+        assert_eq!(
+            conversation.read_with(cx, |view, _| view.permission_mode()),
+            mode
+        );
+        window
+            .update(cx, |_, window, cx| {
+                conversation.update(cx, |view, cx| {
+                    view.toggle_picker(Picker::Permissions, window, cx)
                 });
             })
             .unwrap();
@@ -230,6 +243,113 @@ fn permission_mode_is_per_project(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+fn review_mode_requires_a_model_and_restores_the_choice(cx: &mut TestAppContext) {
+    let faux = FauxProvider::default();
+    let reviewer = FauxProvider::new("reviewer");
+    let data = setup_models(cx, &[&faux, &reviewer], false);
+    set_permission_mode(&data, PermissionMode::Ask);
+    let (_dir, project) = project_dir();
+    let window = open(cx, &project);
+    let conversation = active(window, cx);
+    let select_review = |cx: &mut TestAppContext| {
+        window
+            .update(cx, |_, window, cx| {
+                conversation.update(cx, |view, cx| {
+                    view.select_permission_mode(PermissionMode::AutoReview, window, cx)
+                })
+            })
+            .unwrap();
+        cx.run_until_parked();
+    };
+    select_review(cx);
+    assert_eq!(
+        conversation.read_with(cx, |v, _| v.permission_mode()),
+        PermissionMode::Ask
+    );
+    assert!(conversation.read_with(cx, |v, _| v.review_model_picker.is_some()));
+    cx.simulate_keystrokes(window.into(), "escape");
+    cx.run_until_parked();
+    assert!(conversation.read_with(cx, |v, _| v.review_model_picker.is_none()));
+    assert_eq!(
+        saved_state(cx, &data).project(&project).permission_mode,
+        None
+    );
+
+    select_review(cx);
+    cx.simulate_input(window.into(), "does-not-exist");
+    cx.run_until_parked();
+    cx.simulate_keystrokes(window.into(), "enter");
+    cx.run_until_parked();
+    assert_eq!(
+        conversation.read_with(cx, |v, _| v.permission_mode()),
+        PermissionMode::Ask
+    );
+    assert!(conversation.read_with(cx, |v, _| v.review_model_picker.is_some()));
+    cx.simulate_keystrokes(window.into(), "secondary-a");
+    cx.simulate_input(window.into(), "reviewer");
+    cx.run_until_parked();
+    cx.simulate_keystrokes(window.into(), "enter");
+    cx.run_until_parked();
+    assert_eq!(
+        conversation.read_with(cx, |v, _| v.permission_mode()),
+        PermissionMode::AutoReview
+    );
+    let state = saved_state(cx, &data).project(&project);
+    assert_eq!(state.permission_mode, Some(PermissionMode::AutoReview));
+    assert_eq!(state.review_model, Some(reviewer.model().qualified_id()));
+
+    window
+        .update(cx, |_, window, _| window.remove_window())
+        .unwrap();
+    cx.run_until_parked();
+    cx.update(|cx| crate::store::AppStore::init(Some(zp_core::paths::state_file(data.path())), cx));
+    let reopened = open(cx, &project);
+    assert_eq!(
+        active(reopened, cx).read_with(cx, |v, _| v.permission_mode()),
+        PermissionMode::AutoReview
+    );
+    let policy = cx.update(|cx| crate::approvals::project_policy(&project, cx));
+    assert_eq!(policy.review_model, Some(reviewer.model().qualified_id()));
+    reopened
+        .update(cx, |project, window, cx| {
+            project
+                .active_conversation()
+                .unwrap()
+                .update(cx, |view, cx| {
+                    view.select_permission_mode(PermissionMode::AutoReview, window, cx);
+                });
+        })
+        .unwrap();
+    cx.run_until_parked();
+    cx.simulate_keystrokes(reopened.into(), "enter");
+    cx.run_until_parked();
+    let policy = cx.update(|cx| crate::approvals::project_policy(&project, cx));
+    assert_eq!(policy.review_model, Some(reviewer.model().qualified_id()));
+}
+
+#[gpui::test]
+fn review_mode_without_an_available_model_falls_back_to_ask(cx: &mut TestAppContext) {
+    let faux = FauxProvider::default();
+    let data = setup_models(cx, &[&faux], false);
+    set_permission_mode(&data, PermissionMode::AutoReview);
+    let (_dir, project) = project_dir();
+    let window = open(cx, &project);
+    assert_eq!(
+        active(window, cx).read_with(cx, |v, _| v.permission_mode()),
+        PermissionMode::Ask
+    );
+    cx.update(|cx| {
+        crate::store::AppStore::update(cx, |state| {
+            let state = state.project_mut(&project);
+            state.permission_mode = Some(PermissionMode::AutoReview);
+            state.review_model = Some("unavailable/model".into());
+        });
+        let policy = crate::approvals::project_policy(&project, cx);
+        assert_eq!(policy.mode, PermissionMode::Ask);
+    });
+}
+
+#[gpui::test]
 fn stopping_while_waiting_for_approval(cx: &mut TestAppContext) {
     let faux = FauxProvider::default();
     faux.push(FauxResponse::tool_call(
@@ -238,6 +358,12 @@ fn stopping_while_waiting_for_approval(cx: &mut TestAppContext) {
     ));
     let data = setup_models(cx, &[&faux], false);
     set_permission_mode(&data, PermissionMode::AutoReview);
+    let mut settings =
+        zp_core::settings::Settings::load(&zp_core::paths::settings_file(data.path())).unwrap();
+    settings.permissions.review_model = Some(faux.model().qualified_id());
+    settings
+        .save(&zp_core::paths::settings_file(data.path()))
+        .unwrap();
     let (_dir, project) = project_dir();
     std::fs::create_dir(project.join("build")).unwrap();
     let window = open(cx, &project);

@@ -111,6 +111,9 @@ pub struct ProjectUiState {
     /// The permission mode chosen for this project (overrides the settings).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub permission_mode: Option<crate::permissions::PermissionMode>,
+    /// The review model selected for this project (overrides the settings).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub review_model: Option<String>,
 }
 
 /// A conversation tab to restore.

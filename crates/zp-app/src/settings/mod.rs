@@ -17,6 +17,7 @@ use zp_ai::ThinkingLevel;
 use zp_core::permissions::PermissionMode;
 use zp_core::settings::ThemeChoice;
 
+use crate::review_model_picker::{ReviewModelEvent, ReviewModelPicker};
 use crate::store::{AppModels, AppSettings};
 use crate::theme::ActiveTheme;
 use crate::ui::{CUSTOM_TITLE_BAR, title_bar};
@@ -82,7 +83,8 @@ pub struct SettingsWindow {
     dialog: Option<ProviderDialog>,
     dialog_subscription: Option<Subscription>,
     // Permissions
-    review_model: Entity<EditableTextState>,
+    review_model_picker: Option<Entity<ReviewModelPicker>>,
+    review_model_subscription: Option<Subscription>,
     allow_commands: Entity<EditableTextState>,
     directories: Entity<EditableTextState>,
     // Keybindings
@@ -148,7 +150,6 @@ impl SettingsWindow {
         let permissions = &settings.permissions;
         let model_filter = input("", cx);
         let model_search = input("", cx);
-        let review_model = input(permissions.review_model.clone().unwrap_or_default(), cx);
         let allow_commands = input(permissions.allow_commands.join("\n"), cx);
         let directories = input(permissions.additional_directories.join("\n"), cx);
         let subscriptions = vec![
@@ -177,7 +178,8 @@ impl SettingsWindow {
             model_search,
             dialog: None,
             dialog_subscription: None,
-            review_model,
+            review_model_picker: None,
+            review_model_subscription: None,
             allow_commands,
             directories,
             recording: None,
@@ -198,6 +200,8 @@ impl SettingsWindow {
             self.notice = None;
             self.dialog = None;
             self.dialog_subscription = None;
+            self.review_model_picker = None;
+            self.review_model_subscription = None;
             self.stop_recording();
         }
         cx.notify();
@@ -261,13 +265,76 @@ impl SettingsWindow {
 
     // ----- Permissions -----------------------------------------------------------------
 
-    pub fn set_permission_mode(&mut self, mode: PermissionMode, cx: &mut Context<Self>) {
+    pub fn set_permission_mode(
+        &mut self,
+        mode: PermissionMode,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if mode == PermissionMode::AutoReview {
+            self.open_review_model_picker(true, window, cx);
+            return;
+        }
         let result = AppSettings::update(cx, |s| s.permissions.mode = Some(mode))
             .map(|()| format!("Default permission mode: {}", mode.label()));
         self.report(result, cx);
     }
 
-    /// Saves the review model, allowed commands and directories.
+    pub(crate) fn open_review_model_picker(
+        &mut self,
+        enable_review: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let current = AppSettings::get(cx).permissions.review_model.clone();
+        let picker = cx.new(|cx| ReviewModelPicker::new(current, window, cx));
+        self.review_model_subscription = Some(cx.subscribe_in(
+            &picker,
+            window,
+            move |this, _, event: &ReviewModelEvent, window, cx| {
+                if let ReviewModelEvent::Selected(spec) = event {
+                    this.set_review_model(spec, enable_review, cx);
+                }
+                this.review_model_picker = None;
+                this.review_model_subscription = None;
+                this.focus_handle.focus(window, cx);
+                cx.notify();
+            },
+        ));
+        self.review_model_picker = Some(picker);
+        cx.notify();
+    }
+
+    pub(crate) fn set_review_model(
+        &mut self,
+        spec: &str,
+        enable_review: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let models = &cx.global::<AppModels>().models;
+        let result = if !models
+            .find(spec)
+            .is_some_and(|model| models.resolve_auth(&model.provider).is_some())
+        {
+            Err(anyhow::anyhow!("unavailable review model `{spec}`"))
+        } else {
+            AppSettings::update(cx, |s| {
+                s.permissions.review_model = Some(spec.to_owned());
+                if enable_review {
+                    s.permissions.mode = Some(PermissionMode::AutoReview);
+                }
+            })
+            .map(|()| format!("Review model: {spec}"))
+        };
+        self.report(result, cx);
+    }
+
+    #[cfg(any(test, feature = "visual-tests"))]
+    pub(crate) fn review_model_picker(&self) -> Option<Entity<ReviewModelPicker>> {
+        self.review_model_picker.clone()
+    }
+
+    /// Saves the allowed commands and directories.
     pub fn save_permission_lists(&mut self, cx: &mut Context<Self>) {
         let lines = |input: &Entity<EditableTextState>, cx: &App| -> Vec<String> {
             input
@@ -279,31 +346,20 @@ impl SettingsWindow {
                 .map(str::to_owned)
                 .collect()
         };
-        let review = self.review_model.read(cx).as_str().trim().to_owned();
         let commands = lines(&self.allow_commands, cx);
         let directories = lines(&self.directories, cx);
-        let models = &cx.global::<AppModels>().models;
-        let result = if !review.is_empty() && models.find(&review).is_none() {
-            Err(anyhow::anyhow!("unknown review model `{review}`"))
-        } else {
-            AppSettings::update(cx, |s| {
-                s.permissions.review_model = (!review.is_empty()).then_some(review);
-                s.permissions.allow_commands = commands;
-                s.permissions.additional_directories = directories;
-            })
-            .map(|()| "Permissions saved".to_owned())
-        };
+        let result = AppSettings::update(cx, |s| {
+            s.permissions.allow_commands = commands;
+            s.permissions.additional_directories = directories;
+        })
+        .map(|()| "Permissions saved".to_owned());
         self.report(result, cx);
     }
 
     /// The permission text inputs (tests).
     #[cfg(test)]
-    pub fn permission_inputs(&self) -> [Entity<EditableTextState>; 3] {
-        [
-            self.review_model.clone(),
-            self.allow_commands.clone(),
-            self.directories.clone(),
-        ]
+    pub fn permission_inputs(&self) -> [Entity<EditableTextState>; 2] {
+        [self.allow_commands.clone(), self.directories.clone()]
     }
 
     // ----- Appearance ------------------------------------------------------------------
@@ -482,14 +538,24 @@ impl SettingsWindow {
             ))
             .children(PermissionMode::ALL.into_iter().enumerate().map(|(index, mode)| {
                 radio(("permission-mode", index), mode.label(), mode.description(), mode == current, cx)
-                    .on_click(cx.listener(move |this, _, _, cx| this.set_permission_mode(mode, cx)))
+                    .on_click(cx.listener(move |this, _, window, cx| this.set_permission_mode(mode, window, cx)))
             }))
             .child(section(
                 "Review model",
-                "Model for auto-review, as provider/model. Empty: the cheapest model of the conversation's provider.",
+                "Model used to review tool calls.",
                 cx,
             ))
-            .child(text_field(&self.review_model, "e.g. openai/gpt-5-mini", cx))
+            .child(div().flex().child(
+                button(
+                    "review-model-button",
+                    format!("{} \u{25be}", AppSettings::get(cx).permissions.review_model.as_deref().map(crate::ui::model_display_name).unwrap_or("Choose a model")),
+                    ButtonKind::Normal,
+                    cx,
+                )
+                .max_w_full()
+                .truncate()
+                .on_click(cx.listener(|this, _, window, cx| this.open_review_model_picker(false, window, cx))),
+            ))
             .child(section(
                 "Allowed commands",
                 "Command prefixes that run without asking, one per line (e.g. `cargo test`, `git status`). Destructive commands always ask.",
@@ -647,6 +713,7 @@ impl Render for SettingsWindow {
                     ),
             )
             .children(self.render_provider_dialog(cx))
+            .children(self.review_model_picker.clone())
     }
 }
 

@@ -3,7 +3,7 @@
 
 use std::sync::Arc;
 
-use gpui::{TestAppContext, WindowHandle};
+use gpui::{Modifiers, TestAppContext, VisualTestContext, WindowHandle};
 use zp_ai::{FauxProvider, Models, ThinkingLevel};
 use zp_core::permissions::PermissionMode;
 use zp_core::settings::{Settings, ThemeChoice};
@@ -357,8 +357,8 @@ fn permission_settings_apply_to_open_projects(cx: &mut TestAppContext) {
     );
     let window = settings_window(Page::Permissions, cx);
     window
-        .update(cx, |view, _, cx| {
-            view.set_permission_mode(PermissionMode::AutoEdit, cx)
+        .update(cx, |view, window, cx| {
+            view.set_permission_mode(PermissionMode::AutoEdit, window, cx)
         })
         .unwrap();
     assert_eq!(
@@ -366,22 +366,22 @@ fn permission_settings_apply_to_open_projects(cx: &mut TestAppContext) {
         PermissionMode::AutoEdit
     );
 
-    // Lists are saved with the button; an unknown review model is refused.
-    let [review, commands, _directories] = window
+    // Lists are saved with the button; unavailable review models are refused.
+    let [commands, _directories] = window
         .update(cx, |view, _, _| view.permission_inputs())
         .unwrap();
-    review.update(cx, |input, cx| input.emplace("nope/nothing", cx));
     commands.update(cx, |input, cx| {
         input.emplace("cargo test\n\n git status ", cx)
     });
     window
-        .update(cx, |view, _, cx| view.save_permission_lists(cx))
+        .update(cx, |view, _, cx| {
+            view.set_review_model("nope/nothing", false, cx)
+        })
         .unwrap();
     let error = window
         .update(cx, |view, _, _| view.notice().cloned())
         .unwrap();
-    assert!(matches!(error, Some((text, true)) if text.contains("unknown review model")));
-    review.update(cx, |input, cx| input.emplace("", cx));
+    assert!(matches!(error, Some((text, true)) if text.contains("unavailable review model")));
     window
         .update(cx, |view, _, cx| view.save_permission_lists(cx))
         .unwrap();
@@ -394,6 +394,86 @@ fn permission_settings_apply_to_open_projects(cx: &mut TestAppContext) {
     assert_eq!(
         cx.update(|cx| AppSettings::get(cx).permissions.mode),
         Some(PermissionMode::AutoEdit)
+    );
+}
+
+#[gpui::test]
+fn review_model_is_chosen_from_settings_dialog(cx: &mut TestAppContext) {
+    let faux = FauxProvider::default();
+    let data = setup_models(cx, &[&faux], false);
+    let (_dir, project) = project_dir();
+    let project_window = open(cx, &project);
+    let conversation = active(project_window, cx);
+    let window = settings_window(Page::Permissions, cx);
+    window
+        .update(cx, |view, window, cx| {
+            view.set_permission_mode(PermissionMode::AutoReview, window, cx)
+        })
+        .unwrap();
+    cx.run_until_parked();
+    assert!(
+        window
+            .update(cx, |view, _, _| view.review_model_picker().is_some())
+            .unwrap()
+    );
+    assert_eq!(
+        saved(&data).permissions.mode,
+        Some(PermissionMode::FullAuto)
+    );
+    cx.simulate_keystrokes(window.into(), "escape");
+    cx.run_until_parked();
+    assert!(
+        window
+            .update(cx, |view, _, _| view.review_model_picker().is_none())
+            .unwrap()
+    );
+    assert_eq!(saved(&data).permissions.review_model, None);
+
+    // Choosing the review model alone leaves the mode unchanged.
+    window
+        .update(cx, |view, window, cx| {
+            view.open_review_model_picker(false, window, cx)
+        })
+        .unwrap();
+    cx.run_until_parked();
+    cx.simulate_input(window.into(), "faux-1");
+    cx.run_until_parked();
+    {
+        let mut visual = VisualTestContext::from_window(window.into(), cx);
+        let option = visual.debug_bounds("review-model-0").unwrap();
+        visual.simulate_click(option.center(), Modifiers::none());
+    }
+    cx.run_until_parked();
+    assert_eq!(
+        saved(&data).permissions.review_model,
+        Some(faux.model().qualified_id())
+    );
+    assert_eq!(
+        saved(&data).permissions.mode,
+        Some(PermissionMode::FullAuto)
+    );
+
+    // Switching mode still asks for a model, with the saved model marked.
+    window
+        .update(cx, |view, window, cx| {
+            view.set_permission_mode(PermissionMode::AutoReview, window, cx)
+        })
+        .unwrap();
+    cx.run_until_parked();
+    assert!(
+        window
+            .update(cx, |view, _, _| view.review_model_picker().is_some())
+            .unwrap()
+    );
+    cx.simulate_keystrokes(window.into(), "enter");
+    cx.run_until_parked();
+    assert_eq!(
+        saved(&data).permissions.mode,
+        Some(PermissionMode::AutoReview)
+    );
+    assert_eq!(
+        conversation.read_with(cx, |view, _| view.permission_mode()),
+        PermissionMode::AutoReview
     );
 }
 

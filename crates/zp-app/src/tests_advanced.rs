@@ -427,7 +427,7 @@ fn notifications_for_background_tabs(cx: &mut TestAppContext) {
     faux.push(FauxResponse::text("done in the background"));
     faux.push(FauxResponse::tool_call(
         "bash",
-        json!({"command": "echo hi"}),
+        json!({"command": "printf hi"}),
     ));
     let data = setup_models(cx, &[&faux], false);
     crate::tests_conversation::set_permission_mode(
@@ -462,7 +462,7 @@ fn notifications_for_background_tabs(cx: &mut TestAppContext) {
     let shown = cx.shown_system_notifications();
     assert_eq!(
         shown.last().unwrap().body.as_ref(),
-        "Needs approval: $ echo hi"
+        "Needs approval: $ printf hi"
     );
     cx.simulate_system_notification_response(gpui::SystemNotificationResponse {
         tag: shown.last().unwrap().tag.clone(),

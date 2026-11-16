@@ -17,6 +17,17 @@ pub const TRAFFIC_LIGHTS: (f32, f32) = (12.0, 11.0);
 /// Space left of the title for the traffic lights.
 const TRAFFIC_LIGHTS_WIDTH: f32 = 78.0;
 
+/// Hides the provider prefix when the model name already has a namespace.
+pub fn model_display_name(qualified_id: &str) -> &str {
+    if let Some((_, model)) = qualified_id.split_once('/')
+        && model.matches('/').count() == 1
+    {
+        model
+    } else {
+        qualified_id
+    }
+}
+
 /// A custom title row: drags the window, double-click zooms (per system preference).
 pub fn title_bar(id: impl Into<ElementId>) -> Stateful<Div> {
     div()

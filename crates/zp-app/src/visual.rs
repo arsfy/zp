@@ -110,6 +110,11 @@ pub fn run(out: PathBuf) {
         models.set_provider(Arc::new(faux.clone()));
         AppModels::set(models, false, cx);
     });
+    if std::env::var("ZP_VISUAL_SCENE").as_deref() == Ok("review-model") {
+        review_model_dialogs(&mut cx, &root, &out);
+        println!("review model screenshots written to {}", out.display());
+        return;
+    }
     inline_code_layout(&mut cx, &root, &out);
     if std::env::var("ZP_VISUAL_SCENE").as_deref() == Ok("inline-code") {
         println!("inline code screenshots written to {}", out.display());
@@ -264,6 +269,82 @@ pub fn run(out: PathBuf) {
 
 fn data_dir_of(data: &tempfile::TempDir) -> PathBuf {
     data.path().to_path_buf()
+}
+
+fn review_model_dialogs(
+    cx: &mut VisualTestAppContext,
+    root: &std::path::Path,
+    out: &std::path::Path,
+) {
+    use zp_core::permissions::PermissionMode;
+
+    let window = cx
+        .open_offscreen_window(size(px(1000.), px(700.)), |window, cx| {
+            let session = zp_session::Session::in_memory(root);
+            cx.new(|cx| ProjectWindow::new_with_session(root.to_owned(), session, window, cx))
+        })
+        .unwrap();
+    window
+        .update(cx, |project, window, cx| {
+            let conversation = project.active_conversation().unwrap().clone();
+            conversation.update(cx, |view, cx| {
+                view.select_permission_mode(PermissionMode::AutoReview, window, cx);
+            });
+        })
+        .unwrap();
+    pump(cx, Duration::from_millis(100));
+    cx.capture_screenshot(window.into())
+        .unwrap()
+        .save(out.join("35-conversation-review-model.png"))
+        .unwrap();
+    cx.simulate_keystrokes(window.into(), "enter");
+    pump(cx, Duration::from_millis(100));
+    window
+        .update(cx, |project, _, cx| {
+            assert_eq!(
+                project
+                    .active_conversation()
+                    .unwrap()
+                    .read(cx)
+                    .permission_mode(),
+                PermissionMode::AutoReview
+            );
+        })
+        .unwrap();
+
+    let settings = cx
+        .open_offscreen_window(size(px(980.), px(700.)), |window, cx| {
+            cx.new(|cx| {
+                crate::settings::SettingsWindow::new_on(
+                    crate::settings::Page::Permissions,
+                    window,
+                    cx,
+                )
+            })
+        })
+        .unwrap();
+    pump(cx, Duration::from_millis(100));
+    cx.capture_screenshot(settings.into())
+        .unwrap()
+        .save(out.join("36-permission-settings.png"))
+        .unwrap();
+    settings
+        .update(cx, |view, window, cx| {
+            view.set_permission_mode(PermissionMode::AutoReview, window, cx)
+        })
+        .unwrap();
+    pump(cx, Duration::from_millis(100));
+    cx.capture_screenshot(settings.into())
+        .unwrap()
+        .save(out.join("37-settings-review-model.png"))
+        .unwrap();
+    cx.simulate_keystrokes(settings.into(), "escape");
+    pump(cx, Duration::from_millis(100));
+    settings
+        .update(cx, |view, _, _| {
+            assert!(view.review_model_picker().is_none())
+        })
+        .unwrap();
 }
 
 fn inline_code_layout(
@@ -782,6 +863,7 @@ fn approvals(cx: &mut VisualTestAppContext, faux: &FauxProvider, out: &std::path
         crate::store::AppStore::update(cx, move |state| {
             state.project_mut(&root).permission_mode =
                 Some(zp_core::permissions::PermissionMode::AutoReview);
+            state.project_mut(&root).review_model = Some(faux.model().qualified_id());
         });
     });
     faux.push(FauxResponse::blocks(vec![

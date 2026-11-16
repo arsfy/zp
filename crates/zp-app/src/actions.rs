@@ -232,6 +232,26 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("escape", StopRun, Some(COMPOSER_INPUT)),
         KeyBinding::new("enter", PickFirstModel, Some(MODEL_FILTER_INPUT)),
         KeyBinding::new("escape", ClosePicker, Some(MODEL_FILTER_INPUT)),
+        KeyBinding::new(
+            "down",
+            CompletionNext,
+            Some("ReviewModelPicker > EditableText"),
+        ),
+        KeyBinding::new(
+            "up",
+            CompletionPrevious,
+            Some("ReviewModelPicker > EditableText"),
+        ),
+        KeyBinding::new(
+            "enter",
+            AcceptCompletion,
+            Some("ReviewModelPicker > EditableText"),
+        ),
+        KeyBinding::new(
+            "escape",
+            CloseCompletion,
+            Some("ReviewModelPicker > EditableText"),
+        ),
         KeyBinding::new("down", SelectNextSession, Some(SESSION_SEARCH_INPUT)),
         KeyBinding::new("up", SelectPreviousSession, Some(SESSION_SEARCH_INPUT)),
         KeyBinding::new("enter", OpenSelectedSession, Some(SESSION_SEARCH_INPUT)),

@@ -16,6 +16,8 @@ use super::files::ToolDiff;
 use super::{ConversationEvent, ConversationView};
 use crate::approvals::PendingApproval;
 use crate::diff_view::{DiffColors, render_unified_row, unified_rows};
+use crate::review_model_picker::{ReviewModelEvent, ReviewModelPicker};
+use crate::store::AppStore;
 use crate::theme::ActiveTheme;
 
 /// Diff rows shown in an approval card.
@@ -249,6 +251,50 @@ impl ConversationView {
     }
 
     pub(crate) fn select_permission_mode(
+        &mut self,
+        mode: PermissionMode,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if mode == PermissionMode::AutoReview {
+            let current = self
+                .coding
+                .as_ref()
+                .and_then(|coding| coding.permissions())
+                .and_then(|gate| gate.policy().review_model);
+            let picker = cx.new(|cx| ReviewModelPicker::new(current, window, cx));
+            self.review_model_subscription = Some(cx.subscribe_in(
+                &picker,
+                window,
+                |this, _, event: &ReviewModelEvent, window, cx| {
+                    this.review_model_picker = None;
+                    this.review_model_subscription = None;
+                    if let ReviewModelEvent::Selected(spec) = event {
+                        AppStore::update(cx, |state| {
+                            let project = state.project_mut(&this.root);
+                            project.review_model = Some(spec.clone());
+                            project.permission_mode = Some(PermissionMode::AutoReview);
+                        });
+                        let policy = crate::approvals::project_policy(&this.root, cx);
+                        this.set_permission_policy(policy, cx);
+                        this.apply_permission_mode(PermissionMode::AutoReview, window, cx);
+                    } else {
+                        this.focus_composer(window, cx);
+                        cx.notify();
+                    }
+                },
+            ));
+            self.review_model_picker = Some(picker);
+            self.picker = None;
+            cx.notify();
+            return;
+        }
+        self.review_model_picker = None;
+        self.review_model_subscription = None;
+        self.apply_permission_mode(mode, window, cx);
+    }
+
+    fn apply_permission_mode(
         &mut self,
         mode: PermissionMode,
         window: &mut Window,

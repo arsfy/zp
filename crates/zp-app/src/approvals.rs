@@ -6,10 +6,12 @@ use std::path::Path;
 use futures::channel::{mpsc, oneshot};
 use futures::future::BoxFuture;
 use gpui::App;
-use zp_core::permissions::{Approver, Decision, PermissionPolicy, PermissionRequest};
+use zp_core::permissions::{
+    Approver, Decision, PermissionMode, PermissionPolicy, PermissionRequest,
+};
 use zp_core::settings::ProjectSettings;
 
-use crate::store::{AppPaths, AppStore};
+use crate::store::{AppModels, AppPaths, AppStore};
 
 /// A request waiting for the user, with the channel for the answer.
 pub struct PendingApproval {
@@ -55,5 +57,20 @@ pub fn project_policy(root: &Path, cx: &App) -> PermissionPolicy {
     let state = AppStore::state(cx).project(root);
     let data_dir = cx.try_global::<AppPaths>().and_then(|p| p.data_dir.clone());
     let settings = ProjectSettings::load(data_dir.as_deref(), root, state.trusted == Some(true));
-    settings.permission_policy(root, state.permission_mode)
+    let mut policy = settings.permission_policy(root, state.permission_mode);
+    if let Some(model) = state.review_model {
+        policy.review_model = Some(model);
+    }
+    if policy.mode == PermissionMode::AutoReview
+        && !policy.review_model.as_deref().is_some_and(|spec| {
+            cx.try_global::<AppModels>().is_some_and(|app| {
+                app.models
+                    .find(spec)
+                    .is_some_and(|model| app.models.resolve_auth(&model.provider).is_some())
+            })
+        })
+    {
+        policy.mode = PermissionMode::Ask;
+    }
+    policy
 }

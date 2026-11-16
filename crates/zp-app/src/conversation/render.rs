@@ -85,6 +85,7 @@ use crate::diff_view::{DiffColors, render_unified_row};
 use crate::markdown::{IdGen, MarkdownStyle, render_markdown};
 use crate::selectable_text::SelectableText;
 use crate::theme::ActiveTheme;
+use crate::ui::model_display_name;
 
 /// Readable width of the transcript and composer.
 const CONTENT_WIDTH: f32 = 820.0;
@@ -94,17 +95,6 @@ const OUTPUT_PREVIEW_LINES: usize = 30;
 const INLINE_DIFF_ROWS: usize = 40;
 /// Models listed at once in the picker.
 const PICKER_LIMIT: usize = 200;
-
-/// Hides the provider prefix when the model name already has a namespace.
-fn model_display_name(qualified_id: &str) -> &str {
-    if let Some((_, model)) = qualified_id.split_once('/')
-        && model.matches('/').count() == 1
-    {
-        model
-    } else {
-        qualified_id
-    }
-}
 
 pub(super) fn id(name: impl Into<SharedString>, index: usize) -> ElementId {
     ElementId::NamedInteger(name.into(), index as u64)
@@ -1683,6 +1673,7 @@ impl Render for ConversationView {
             )
             .child(self.render_composer(cx))
             .when(self.tree_open, |this| this.child(self.render_tree(cx)))
+            .children(self.review_model_picker.clone())
     }
 }
 

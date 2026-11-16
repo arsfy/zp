@@ -14,6 +14,7 @@ mod markdown;
 mod mcp;
 mod notifications;
 mod project;
+mod review_model_picker;
 mod selectable_text;
 mod settings;
 mod store;

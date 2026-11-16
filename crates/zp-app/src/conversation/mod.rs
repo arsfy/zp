@@ -33,6 +33,7 @@ use self::transcript::{Changes, Transcript};
 use crate::actions::{ClosePicker, PickFirstModel, SendMessage, StopRun};
 use crate::diff_view::DiffItem;
 use crate::markdown::{Block, parse};
+use crate::review_model_picker::ReviewModelPicker;
 use crate::selectable_text::TextSelection;
 use crate::store::{AppModels, AppPaths};
 
@@ -134,6 +135,8 @@ pub struct ConversationView {
     history_draft: String,
     model_filter: Entity<EditableTextState>,
     picker: Option<Picker>,
+    pub(crate) review_model_picker: Option<Entity<ReviewModelPicker>>,
+    review_model_subscription: Option<Subscription>,
     /// When a popover was last closed by clicking outside it; a click on its own toggle
     /// button right after must not reopen it.
     picker_closed_at: Option<std::time::Instant>,
@@ -238,6 +241,8 @@ impl ConversationView {
             history_draft: String::new(),
             model_filter,
             picker: None,
+            review_model_picker: None,
+            review_model_subscription: None,
             picker_closed_at: None,
             expanded_thinking: HashSet::new(),
             tool_expanded: HashMap::new(),
