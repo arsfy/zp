@@ -646,6 +646,7 @@ impl ProjectWindow {
         let colors = cx.theme().colors.clone();
         title_bar("title-bar")
             .gap_2()
+            .pr_0p5()
             .bg(colors.surface)
             .border_b_1()
             .border_color(colors.border)

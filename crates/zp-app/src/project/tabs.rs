@@ -595,52 +595,58 @@ impl ProjectWindow {
 
     pub(crate) fn render_tab_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = cx.theme().colors.clone();
-        let radius = cx.theme().metrics.radius;
         let tabs = (0..self.tabs.len()).map(|index| {
             let tab = &self.tabs[index];
             let active = index == self.active;
             let title: SharedString = tab.conversation.read(cx).title().into();
             let group = SharedString::from(format!("tab-{index}"));
+            let side_width = px(if tab.pinned { 48. } else { 16. });
             div()
                 .id(("tab", index))
                 .group(group.clone())
+                .h_full()
                 .flex()
                 .items_center()
                 .gap_1p5()
                 .flex_shrink_0()
                 .min_w(px(80.))
                 .max_w(px(220.))
-                .pl_3()
-                .pr_1p5()
-                .py_1p5()
-                .rounded_t(radius)
-                .border_1()
-                .border_b_0()
+                .px_1p5()
+                .border_r_1()
+                .border_color(colors.border)
                 .cursor_pointer()
-                .when(active, |this| {
-                    this.bg(colors.background).border_color(colors.border)
-                })
+                .when(active, |this| this.bg(colors.background))
                 .when(!active, |this| {
-                    this.border_color(gpui::transparent_black())
+                    this.border_b_1()
                         .text_color(colors.text_muted)
                         .hover_style(|s| s.bg(colors.surface_hover))
                 })
-                .when(tab.pinned, |this| {
-                    this.child(
-                        div()
-                            .px_1()
-                            .rounded(px(3.))
-                            .text_size(px(10.))
-                            .text_color(colors.text_muted)
-                            .bg(colors.code_background)
-                            .child("pinned"),
-                    )
-                })
-                .children(self.render_tab_status(index, cx))
+                .child(
+                    div()
+                        .w(side_width)
+                        .flex_shrink_0()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .gap_1()
+                        .when(tab.pinned, |this| {
+                            this.child(
+                                div()
+                                    .px_1()
+                                    .rounded(px(3.))
+                                    .text_size(px(10.))
+                                    .text_color(colors.text_muted)
+                                    .bg(colors.code_background)
+                                    .child("pinned"),
+                            )
+                        })
+                        .children(self.render_tab_status(index, cx)),
+                )
                 .child(
                     div()
                         .flex_1()
                         .min_w_0()
+                        .text_center()
                         .truncate()
                         .when(tab.preview, |this| this.italic())
                         .child(title.clone()),
@@ -654,9 +660,8 @@ impl ProjectWindow {
                             .text_center()
                             .rounded(px(3.))
                             .text_color(colors.text_muted)
-                            .when(!active, |this| {
-                                this.invisible().group_hover_style(group, |s| s.visible())
-                            })
+                            .invisible()
+                            .group_hover_style(group, |s| s.visible())
                             .hover_style(|s| s.bg(colors.surface_hover).text_color(colors.text))
                             .child("×")
                             .on_click(cx.listener(move |this, _, window, cx| {
@@ -664,6 +669,9 @@ impl ProjectWindow {
                                 this.close_tab(index, window, cx)
                             })),
                     )
+                })
+                .when(tab.pinned, |this| {
+                    this.child(div().w(side_width).flex_shrink_0())
                 })
                 .on_click(
                     cx.listener(move |this, event: &gpui::ClickEvent, window, cx| {
@@ -704,21 +712,27 @@ impl ProjectWindow {
             .is_some_and(|c| c.read(cx).is_tree_open());
         div()
             .id("tab-bar")
+            .relative()
             .h(px(36.))
             .flex_shrink_0()
             .flex()
-            .items_end()
-            .gap_1()
-            .pl_2()
+            .items_center()
             .bg(colors.surface)
-            .border_b_1()
-            .border_color(colors.border)
+            // The active tab paints over this line to join the conversation below.
+            .child(
+                div()
+                    .absolute()
+                    .bottom_0()
+                    .w_full()
+                    .h(px(1.))
+                    .bg(colors.border),
+            )
             .child(
                 div()
                     .id("tabs")
+                    .h_full()
                     .flex()
-                    .items_end()
-                    .gap_0p5()
+                    .items_center()
                     .min_w_0()
                     .overflow_x_scroll()
                     .children(tabs),
@@ -726,8 +740,12 @@ impl ProjectWindow {
             .child(
                 div()
                     .id("new-tab")
-                    .px_2()
-                    .py_1p5()
+                    .w(px(32.))
+                    .h_full()
+                    .flex_shrink_0()
+                    .flex()
+                    .items_center()
+                    .justify_center()
                     .text_color(colors.text_muted)
                     .cursor_pointer()
                     .hover_style(|s| s.text_color(colors.text))
