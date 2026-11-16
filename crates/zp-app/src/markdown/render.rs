@@ -1,5 +1,6 @@
 //! Renders parsed markdown blocks as GPUI elements.
 
+use std::ops::Range;
 use std::rc::Rc;
 
 use gpui::{
@@ -67,6 +68,72 @@ pub fn render_markdown(blocks: &[Block], style: &MarkdownStyle, ids: &mut IdGen)
 }
 
 fn render_inline(inline: &Inline, style: &MarkdownStyle, ids: &mut IdGen) -> AnyElement {
+    let code_ranges: Vec<_> = inline
+        .spans
+        .iter()
+        .filter(|(_, span)| span.code)
+        .map(|(range, _)| range.clone())
+        .collect();
+    if code_ranges.is_empty() {
+        return render_inline_text(inline, style, ids);
+    }
+
+    // Inline boxes reserve space for padding in the surrounding text flow.
+    let mut paragraph = div();
+    let mut offset = 0;
+    for range in code_ranges {
+        if offset < range.start {
+            paragraph = paragraph.child(render_inline_text(
+                &inline_slice(inline, offset..range.start),
+                style,
+                ids,
+            ));
+        }
+        let code = inline_slice(inline, range.clone());
+        paragraph = paragraph.child(
+            div()
+                .inline_flex()
+                .align_middle()
+                .px_1()
+                .py(px(1.))
+                .rounded(px(4.))
+                .bg(style.code_background)
+                .child(render_inline_text(&code, style, ids)),
+        );
+        offset = range.end;
+    }
+    if offset < inline.text.len() {
+        paragraph = paragraph.child(render_inline_text(
+            &inline_slice(inline, offset..inline.text.len()),
+            style,
+            ids,
+        ));
+    }
+    paragraph.into_any_element()
+}
+
+fn inline_slice(inline: &Inline, range: Range<usize>) -> Inline {
+    let intersect = |other: &Range<usize>| {
+        let start = other.start.max(range.start);
+        let end = other.end.min(range.end);
+        (start < end).then(|| start - range.start..end - range.start)
+    };
+    Inline {
+        text: inline.text[range.clone()].to_owned(),
+        spans: inline
+            .spans
+            .iter()
+            .filter_map(|(range, span)| intersect(range).map(|range| (range, *span)))
+            .collect(),
+        links: inline
+            .links
+            .iter()
+            .filter_map(|(range, url)| intersect(range).map(|range| (range, url.clone())))
+            .collect(),
+    }
+}
+
+fn render_inline_text(inline: &Inline, style: &MarkdownStyle, ids: &mut IdGen) -> AnyElement {
     let highlights: Vec<_> = inline
         .spans
         .iter()
@@ -83,9 +150,6 @@ fn render_inline(inline: &Inline, style: &MarkdownStyle, ids: &mut IdGen) -> Any
                     thickness: px(1.),
                     color: None,
                 });
-            }
-            if span.code {
-                highlight.background_color = Some(rgb_to_hsla(style.code_background));
             }
             if span.link {
                 highlight.color = Some(rgb_to_hsla(style.link));
@@ -265,4 +329,38 @@ fn code_block(
                 .child(text.to_owned()),
         )
         .into_any_element()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn inline_code_segments_preserve_surrounding_styles_and_links() {
+        let blocks = super::super::parse::parse(
+            "**Before [`cargo test` and docs](https://example.com) after**",
+        );
+        let Block::Paragraph(inline) = &blocks[0] else {
+            panic!("expected a paragraph");
+        };
+        let code = inline
+            .spans
+            .iter()
+            .find(|(_, span)| span.code)
+            .unwrap()
+            .0
+            .clone();
+        let before = inline_slice(inline, 0..code.start);
+        let command = inline_slice(inline, code.clone());
+        let after = inline_slice(inline, code.end..inline.text.len());
+
+        assert_eq!(before.text, "Before ");
+        assert!(before.links.is_empty());
+        assert_eq!(command.text, "cargo test");
+        assert!(command.spans[0].1.bold && command.spans[0].1.code);
+        assert_eq!(command.links, vec![(0..10, "https://example.com".into())]);
+        assert_eq!(after.text, " and docs after");
+        assert_eq!(after.links, vec![(0..9, "https://example.com".into())]);
+        assert!(after.spans.iter().all(|(_, span)| span.bold));
+    }
 }
