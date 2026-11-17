@@ -131,7 +131,14 @@ fn terminal_links_search_selection_and_context_menu(cx: &mut TestAppContext) {
     let terminal = window
         .update(cx, |project, _, _| project.terminal().unwrap())
         .unwrap();
-    terminal.update(cx, |view, _| view.write(b"printf '\\033[2J\\033[Hhttps://example.com/zp-terminal\\nfind-marker find-marker\\n'; sleep 30\r".to_vec()));
+    // Clear the screen, then show a link and two search hits from its first line; the
+    // shell keeps quiet while `sleep` runs. Windows runs PowerShell.
+    let command: &[u8] = if cfg!(windows) {
+        b"Write-Host -NoNewline \"$([char]27)[2J$([char]27)[Hhttps://example.com/zp-terminal`nfind-marker find-marker`n\"; Start-Sleep 30\r"
+    } else {
+        b"printf '\\033[2J\\033[Hhttps://example.com/zp-terminal\\nfind-marker find-marker\\n'; sleep 30\r"
+    };
+    terminal.update(cx, |view, _| view.write(command.to_vec()));
     wait_until(cx, |cx| {
         terminal.read_with(cx, |view, _| {
             view.screen_text()
