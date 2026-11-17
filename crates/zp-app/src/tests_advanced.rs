@@ -604,10 +604,16 @@ fn terminal_panel_runs_a_shell(cx: &mut TestAppContext) {
         .unwrap()
         .expect("a shell started");
 
-    // The shell runs in the project and answers.
-    terminal.update(cx, |view, _| {
-        view.write(b"echo zp-term-$((40+2)); pwd\r".to_vec())
-    });
+    // The shell (PowerShell on Windows) runs in the project and answers.
+    let (first, second_command): (&[u8], &[u8]) = if cfg!(windows) {
+        (
+            b"echo \"zp-term-$(40+2)\"; pwd\r",
+            b"echo \"second-$(1+1)\"\r",
+        )
+    } else {
+        (b"echo zp-term-$((40+2)); pwd\r", b"echo second-$((1+1))\r")
+    };
+    terminal.update(cx, |view, _| view.write(first.to_vec()));
     wait_until(cx, |cx| {
         terminal.read_with(cx, |view, _| view.screen_text().contains("zp-term-42"))
     });
@@ -615,17 +621,20 @@ fn terminal_panel_runs_a_shell(cx: &mut TestAppContext) {
     let name = project.file_name().unwrap().to_string_lossy().into_owned();
     assert!(screen.contains(&name), "{screen}");
 
-    // The label follows the program in the foreground; a name given by the user wins.
+    // The label follows the program in the foreground (Unix only); a name given by the
+    // user wins.
     let labels = |cx: &mut TestAppContext| {
         window
             .update(cx, |view, _, cx| view.terminal_labels(cx))
             .unwrap()
     };
     let shell = labels(cx)[0].clone();
-    terminal.update(cx, |view, _| view.write(b"sleep 30\r".to_vec()));
-    wait_until(cx, |cx| labels(cx) == ["sleep"]);
-    terminal.update(cx, |view, _| view.write(b"\x03".to_vec()));
-    wait_until(cx, |cx| labels(cx) == [shell.clone()]);
+    if cfg!(unix) {
+        terminal.update(cx, |view, _| view.write(b"sleep 30\r".to_vec()));
+        wait_until(cx, |cx| labels(cx) == ["sleep"]);
+        terminal.update(cx, |view, _| view.write(b"\x03".to_vec()));
+        wait_until(cx, |cx| labels(cx) == [shell.clone()]);
+    }
     window
         .update(cx, |view, window, cx| {
             view.rename_terminal(terminal.entity_id(), Some("build".into()), window, cx)
@@ -673,7 +682,7 @@ fn terminal_panel_runs_a_shell(cx: &mut TestAppContext) {
     assert_eq!((tabs.len(), active), (2, 1));
     let second = tabs[1].clone();
     assert_ne!(second.entity_id(), terminal.entity_id());
-    second.update(cx, |view, _| view.write(b"echo second-$((1+1))\r".to_vec()));
+    second.update(cx, |view, _| view.write(second_command.to_vec()));
     wait_until(cx, |cx| {
         second.read_with(cx, |view, _| view.screen_text().contains("second-2"))
     });
