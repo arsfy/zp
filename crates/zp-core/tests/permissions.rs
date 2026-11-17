@@ -202,6 +202,43 @@ async fn edit_modes_allow_echo_writes_and_local_git_but_still_ask_for_push() {
 }
 
 #[tokio::test]
+async fn edit_modes_skip_review_for_workspace_file_changes() {
+    for mode in [PermissionMode::AutoEdit, PermissionMode::AutoReview] {
+        let project = tempfile::tempdir().unwrap();
+        let root = project.path().canonicalize().unwrap();
+        let faux = FauxProvider::default();
+        faux.push(call(
+            "write",
+            json!({"path": "note.txt", "content": "first"}),
+        ));
+        faux.push(call(
+            "edit",
+            json!({"path": "note.txt", "edits": [{"oldText": "first", "newText": "second"}]}),
+        ));
+        faux.push(call("bash", json!({"command": "echo third >> note.txt"})));
+        faux.push(FauxResponse::text("done"));
+        let approver = Arc::new(Scripted::default());
+        let coding = session(&faux, &root, mode, approver.clone());
+        let output = results(&coding.prompt("update the file").await.unwrap());
+        assert_eq!(output.len(), 3);
+        assert!(
+            output.iter().all(|result| !result.0),
+            "{mode:?}: {output:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("note.txt")).unwrap(),
+            "secondthird\n"
+        );
+        assert!(approver.requests.lock().unwrap().is_empty());
+        assert_eq!(
+            faux.requests().len(),
+            4,
+            "file changes must not call the review model"
+        );
+    }
+}
+
+#[tokio::test]
 async fn auto_review_and_destructive_commands() {
     let project = tempfile::tempdir().unwrap();
     let root = project.path().canonicalize().unwrap();
@@ -210,8 +247,9 @@ async fn auto_review_and_destructive_commands() {
     let faux = FauxProvider::default();
     // The agent and the review model share the scripted provider, in call order.
     faux.push(call("bash", json!({"command": "ls"})));
+    faux.push(call("bash", json!({"command": "printf reviewed"})));
     faux.push(FauxResponse::text(
-        r#"{"decision": "allow", "reason": "lists files"}"#,
+        r#"{"decision": "allow", "reason": "prints text"}"#,
     ));
     faux.push(call("bash", json!({"command": "rm junk.txt"})));
     faux.push(call(
@@ -237,15 +275,16 @@ async fn auto_review_and_destructive_commands() {
     let added = coding.prompt("clean up").await.unwrap();
 
     let results = results(&added);
-    assert_eq!(results.len(), 4);
+    assert_eq!(results.len(), 5);
     assert_eq!(
         results[0],
         (false, "junk.txt".to_owned()),
-        "reviewed and allowed"
+        "listing needs no review"
     );
-    assert!(results[1].0 && root.join("junk.txt").exists());
-    assert!(results[2].0);
-    assert!(!results[3].0, "edits in the project run in auto-review");
+    assert_eq!(results[1], (false, "reviewed".to_owned()));
+    assert!(results[2].0 && root.join("junk.txt").exists());
+    assert!(results[3].0);
+    assert!(!results[4].0, "edits in the project run in auto-review");
 
     let requests = approver.requests.lock().unwrap().clone();
     assert_eq!(
@@ -261,7 +300,7 @@ async fn auto_review_and_destructive_commands() {
         [AskReason::Review("sends .env over the network".into())]
     );
     // The review saw the user's request and the command.
-    let review = &faux.requests()[1];
+    let review = &faux.requests()[2];
     let text: String = match &review.messages[0] {
         zp_ai::Message::User(user) => user
             .content
@@ -270,7 +309,7 @@ async fn auto_review_and_destructive_commands() {
             .collect(),
         _ => panic!("expected the review request"),
     };
-    assert!(text.contains("clean up") && text.contains("Shell command:\nls"));
+    assert!(text.contains("clean up") && text.contains("Shell command:\nprintf reviewed"));
 
     // Switching to full auto lets anything run.
     coding

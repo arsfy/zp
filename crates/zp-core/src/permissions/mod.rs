@@ -56,7 +56,9 @@ impl PermissionMode {
             Self::AutoEdit => {
                 "Auto-approve file changes, echo writes and non-destructive Git operations"
             }
-            Self::AutoReview => "A review model approves safe commands; destructive ones need you",
+            Self::AutoReview => {
+                "Auto-approve file changes; a review model checks other commands; destructive ones need you"
+            }
             Self::FullAuto => "Everything runs without asking",
         }
     }
@@ -675,12 +677,21 @@ mod tests {
     }
 
     #[test]
-    fn navigation_is_allowed_in_every_mode_and_omitted_from_grants() {
+    fn navigation_and_listing_are_allowed_in_every_mode_and_omitted_from_grants() {
         let dir = tempfile::tempdir().unwrap();
         let none = Grants::default();
         for mode in PermissionMode::ALL {
             let policy = policy(mode, dir.path());
-            for command in ["pwd", "cd /tmp", "cd .. && pwd -P", "cd src && git status"] {
+            for command in [
+                "pwd",
+                "cd /tmp",
+                "cd .. && pwd -P",
+                "cd src && git status",
+                "ls",
+                "ls -la /tmp",
+                "/bin/ls",
+                "cd src && ls && pwd",
+            ] {
                 assert_eq!(
                     policy.evaluate("bash", &json!({"command": command}), &none),
                     Evaluation::Allow,
@@ -689,7 +700,7 @@ mod tests {
             }
             let evaluation = policy.evaluate(
                 "bash",
-                &json!({"command": "cd src && pwd && cargo test && git status"}),
+                &json!({"command": "cd src && ls && pwd && cargo test && git status"}),
                 &none,
             );
             let expected = vec![SessionGrant::Command("cargo test".into())];
@@ -790,16 +801,18 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
         std::fs::create_dir_all(base.join("elsewhere")).unwrap();
         std::os::unix::fs::symlink(base.join("elsewhere"), root.join("link")).unwrap();
-        let ask_mode = policy(PermissionMode::AutoEdit, &root);
-        let evaluation = ask_mode.evaluate(
-            "write",
-            &json!({"path": "link/new.txt", "content": "x"}),
-            &Grants::default(),
-        );
-        assert!(
-            matches!(&evaluation, Evaluation::Ask { reasons, .. } if matches!(&reasons[0], AskReason::OutsideProject(p) if p[0] == base.join("elsewhere/new.txt"))),
-            "{evaluation:?}"
-        );
+        for mode in [PermissionMode::AutoEdit, PermissionMode::AutoReview] {
+            let policy = policy(mode, &root);
+            let evaluation = policy.evaluate(
+                "write",
+                &json!({"path": "link/new.txt", "content": "x"}),
+                &Grants::default(),
+            );
+            assert!(
+                matches!(&evaluation, Evaluation::Ask { reasons, .. } if matches!(&reasons[0], AskReason::OutsideProject(p) if p[0] == base.join("elsewhere/new.txt"))),
+                "{mode:?}: {evaluation:?}"
+            );
+        }
     }
 
     #[test]

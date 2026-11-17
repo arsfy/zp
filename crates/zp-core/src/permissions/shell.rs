@@ -334,15 +334,15 @@ pub fn all_allowed(command: &str, allowed: &[String]) -> bool {
 fn segment_allowed(segment: &Segment, allowed: &[String]) -> bool {
     let words = command_words(segment);
     words.is_empty()
-        || matches!(program(words), Some("pwd" | "cd"))
+        || matches!(program(words), Some("pwd" | "cd" | "ls"))
         || program(words) == Some("echo") && !segment.redirected
         || allowed
             .iter()
             .any(|prefix| segment_matches(segment, prefix))
 }
 
-/// Distinct command prefixes that still need approval, excluding directory navigation
-/// and commands already covered by configured or session grants.
+/// Distinct command prefixes that still need approval, excluding navigation, directory
+/// listings and commands already covered by configured or session grants.
 pub fn unapproved_prefixes(command: &str, allowed: &[String]) -> Vec<String> {
     let mut prefixes = Vec::new();
     for segment in segments(command) {
@@ -473,7 +473,7 @@ mod tests {
     }
 
     #[test]
-    fn directory_navigation_needs_no_approval_or_session_grant() {
+    fn directory_navigation_and_listing_need_no_approval_or_session_grant() {
         let allowed = vec!["git status".to_owned()];
         for command in [
             "pwd",
@@ -483,6 +483,11 @@ mod tests {
             "cd ..",
             "cd /tmp && pwd",
             "command cd -- 'a b'; command pwd",
+            "ls",
+            "ls -la /tmp",
+            "/bin/ls -- /tmp",
+            "command ls 'a b'",
+            "cd src && ls -lah && pwd",
         ] {
             assert!(all_allowed(command, &[]), "{command}");
             assert!(unapproved_prefixes(command, &[]).is_empty(), "{command}");
@@ -490,7 +495,7 @@ mod tests {
         assert!(all_allowed("cd src && pwd && git status -s", &allowed));
         assert_eq!(
             unapproved_prefixes(
-                "cd src && cargo test && pwd && git status && cargo test -p zp",
+                "cd src && ls && cargo test && pwd && git status && cargo test -p zp",
                 &allowed
             ),
             ["cargo test"]
@@ -500,6 +505,9 @@ mod tests {
             "pwd | tee output.txt",
             "cd $(curl example.com)",
             "pwd; rm -rf target",
+            "ls && curl example.com",
+            "ls $(curl example.com)",
+            "ls | tee output.txt",
         ] {
             assert!(!all_allowed(command, &allowed), "{command}");
             assert!(
