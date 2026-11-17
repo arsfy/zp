@@ -71,7 +71,7 @@ impl IdGen {
             (self.document.0, self.document.1, self.next),
             content,
             self.selection.clone(),
-            std::mem::replace(&mut self.separator, ""),
+            std::mem::take(&mut self.separator),
         )
     }
 }

@@ -89,15 +89,15 @@ impl TextGeometry {
             .find(|(_, line)| point.y < line.origin.y + line.size.height)
             .or_else(|| lines.last().map(|line| (lines.len() - 1, line)))
         {
-            point.y = self.line_height
-                * (index as f32 + f32::from((point.y - line.origin.y) / line.size.height));
+            point.y =
+                self.line_height * (index as f32 + (point.y - line.origin.y) / line.size.height);
         }
         point
     }
 
     #[cfg(any(test, feature = "visual-tests"))]
     fn painted_point(&self, mut point: Point<Pixels>) -> Point<Pixels> {
-        let row = f32::from(point.y / self.line_height).max(0.);
+        let row = (point.y / self.line_height).max(0.);
         if let Some(line) = self.inline.lines.get(row as usize) {
             point.y = line.origin.y + line.size.height * row.fract();
         }
@@ -112,7 +112,7 @@ impl TextGeometry {
                 continue;
             }
             for mut bounds in self.shaped.selection_bounds(range, self.line_height) {
-                if f32::from(bounds.origin.y / self.line_height).max(0.) as usize == span.line {
+                if (bounds.origin.y / self.line_height).max(0.) as usize == span.line {
                     let line = &self.inline.lines[span.line];
                     // Source ranges can include synthetic padding boxes at their boundaries.
                     let left = bounds.left().max(span.x_range.start);
@@ -451,46 +451,6 @@ pub struct SelectableText {
     code_style: Option<(SharedString, Rgba)>,
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn selection_copies_unicode_and_separators_in_both_directions() {
-        let mut state = SelectionState::default();
-        for (id, text, separator) in [
-            ((0, 0, 0), "hello ", "\n\n"),
-            ((0, 0, 1), "中文", ""),
-            ((0, 0, 2), " world", ""),
-            ((0, 0, 3), "fn main() {}\n", "\n\n"),
-        ] {
-            state.fragments.insert(
-                id,
-                Fragment {
-                    text: text.into(),
-                    separator,
-                },
-            );
-        }
-        let start = Endpoint {
-            id: (0, 0, 0),
-            offset: 3,
-        };
-        let end = Endpoint {
-            id: (0, 0, 3),
-            offset: 12,
-        };
-        for (anchor, head) in [(start, end), (end, start)] {
-            state.anchor = Some(anchor);
-            state.head = Some(head);
-            assert_eq!(
-                state.selected_text().as_deref(),
-                Some("lo 中文 world\n\nfn main() {}")
-            );
-        }
-    }
-}
-
 impl SelectableText {
     pub fn new(
         element_id: impl Into<ElementId>,
@@ -810,5 +770,45 @@ impl Element for SelectableText {
                 }
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn selection_copies_unicode_and_separators_in_both_directions() {
+        let mut state = SelectionState::default();
+        for (id, text, separator) in [
+            ((0, 0, 0), "hello ", "\n\n"),
+            ((0, 0, 1), "中文", ""),
+            ((0, 0, 2), " world", ""),
+            ((0, 0, 3), "fn main() {}\n", "\n\n"),
+        ] {
+            state.fragments.insert(
+                id,
+                Fragment {
+                    text: text.into(),
+                    separator,
+                },
+            );
+        }
+        let start = Endpoint {
+            id: (0, 0, 0),
+            offset: 3,
+        };
+        let end = Endpoint {
+            id: (0, 0, 3),
+            offset: 12,
+        };
+        for (anchor, head) in [(start, end), (end, start)] {
+            state.anchor = Some(anchor);
+            state.head = Some(head);
+            assert_eq!(
+                state.selected_text().as_deref(),
+                Some("lo 中文 world\n\nfn main() {}")
+            );
+        }
     }
 }

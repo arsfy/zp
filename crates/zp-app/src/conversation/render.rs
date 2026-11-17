@@ -1,70 +1,5 @@
 //! Rendering of the conversation: transcript rows, tool cards and the composer.
 
-#[cfg(test)]
-mod selection_tests {
-    use gpui::{Modifiers, MouseButton, TestAppContext, VisualTestContext};
-    use zp_ai::{FauxProvider, FauxResponse};
-
-    use crate::tests::project_dir;
-    use crate::tests_conversation::{active, idle, open, send, setup_models};
-
-    #[gpui::test]
-    fn messages_and_code_support_drag_selection_and_copy(cx: &mut TestAppContext) {
-        let faux = FauxProvider::default();
-        faux.push(FauxResponse::text(
-            "你好，使用 `cargo test` 检查。\n\n```rust\nfn main() {}\n```",
-        ));
-        let _data = setup_models(cx, &[&faux], false);
-        let (_dir, project) = project_dir();
-        let window = open(cx, &project);
-        let conversation = active(window, cx);
-        send(window, "选择这段用户文本", cx);
-        idle(&conversation, 2, cx);
-        cx.run_until_parked();
-        let selection = conversation.read_with(cx, |view, _| view.text_selection.clone());
-        let mut cx = VisualTestContext::from_window(window.into(), cx);
-        let drag = |from: (&str, usize), to: (&str, usize), cx: &mut VisualTestContext| {
-            let start = selection
-                .point_for_text(from.0, from.1)
-                .unwrap_or_else(|| panic!("start text is rendered: {from:?}"));
-            let end = selection
-                .point_for_text(to.0, to.1)
-                .expect("end text is rendered");
-            cx.simulate_mouse_down(start, MouseButton::Left, Modifiers::none());
-            cx.simulate_mouse_move(end, MouseButton::Left, Modifiers::none());
-            cx.simulate_mouse_up(end, MouseButton::Left, Modifiers::none());
-            cx.simulate_keystrokes("secondary-c");
-            cx.update(|_, cx| cx.read_from_clipboard().unwrap().text().unwrap())
-        };
-        let user = "选择这段用户文本";
-        assert_eq!(drag((user, 6), (user, 18), &mut cx), "这段用户");
-        let reply = "你好，使用 cargo test 检查。";
-        assert_eq!(drag((reply, 27), (reply, 9), &mut cx), "使用 cargo test ");
-        let code = "fn main() {}";
-        assert_eq!(drag((code, 0), (code, 12), &mut cx), "fn main() {}");
-        assert_eq!(
-            drag((reply, 0), (code, 12), &mut cx),
-            format!("{reply}\n\nfn main() {{}}")
-        );
-
-        cx.simulate_keystrokes("secondary-a secondary-c");
-        assert_eq!(
-            cx.update(|_, cx| cx.read_from_clipboard().unwrap().text().unwrap()),
-            format!("{reply}\n\n{code}")
-        );
-
-        conversation.update(&mut cx, |view, cx| {
-            view.set_draft("draft stays editable", cx)
-        });
-        cx.update(|window, cx| conversation.update(cx, |view, cx| view.focus_composer(window, cx)));
-        cx.simulate_keystrokes("secondary-a secondary-c");
-        assert_eq!(
-            cx.update(|_, cx| cx.read_from_clipboard().unwrap().text().unwrap()),
-            "draft stays editable"
-        );
-    }
-}
-
 use std::time::Duration;
 
 use gpui::{
@@ -1828,5 +1763,70 @@ impl ConversationView {
                 )
                 .into_any_element(),
         )
+    }
+}
+
+#[cfg(test)]
+mod selection_tests {
+    use gpui::{Modifiers, MouseButton, TestAppContext, VisualTestContext};
+    use zp_ai::{FauxProvider, FauxResponse};
+
+    use crate::tests::project_dir;
+    use crate::tests_conversation::{active, idle, open, send, setup_models};
+
+    #[gpui::test]
+    fn messages_and_code_support_drag_selection_and_copy(cx: &mut TestAppContext) {
+        let faux = FauxProvider::default();
+        faux.push(FauxResponse::text(
+            "你好，使用 `cargo test` 检查。\n\n```rust\nfn main() {}\n```",
+        ));
+        let _data = setup_models(cx, &[&faux], false);
+        let (_dir, project) = project_dir();
+        let window = open(cx, &project);
+        let conversation = active(window, cx);
+        send(window, "选择这段用户文本", cx);
+        idle(&conversation, 2, cx);
+        cx.run_until_parked();
+        let selection = conversation.read_with(cx, |view, _| view.text_selection.clone());
+        let mut cx = VisualTestContext::from_window(window.into(), cx);
+        let drag = |from: (&str, usize), to: (&str, usize), cx: &mut VisualTestContext| {
+            let start = selection
+                .point_for_text(from.0, from.1)
+                .unwrap_or_else(|| panic!("start text is rendered: {from:?}"));
+            let end = selection
+                .point_for_text(to.0, to.1)
+                .expect("end text is rendered");
+            cx.simulate_mouse_down(start, MouseButton::Left, Modifiers::none());
+            cx.simulate_mouse_move(end, MouseButton::Left, Modifiers::none());
+            cx.simulate_mouse_up(end, MouseButton::Left, Modifiers::none());
+            cx.simulate_keystrokes("secondary-c");
+            cx.update(|_, cx| cx.read_from_clipboard().unwrap().text().unwrap())
+        };
+        let user = "选择这段用户文本";
+        assert_eq!(drag((user, 6), (user, 18), &mut cx), "这段用户");
+        let reply = "你好，使用 cargo test 检查。";
+        assert_eq!(drag((reply, 27), (reply, 9), &mut cx), "使用 cargo test ");
+        let code = "fn main() {}";
+        assert_eq!(drag((code, 0), (code, 12), &mut cx), "fn main() {}");
+        assert_eq!(
+            drag((reply, 0), (code, 12), &mut cx),
+            format!("{reply}\n\nfn main() {{}}")
+        );
+
+        cx.simulate_keystrokes("secondary-a secondary-c");
+        assert_eq!(
+            cx.update(|_, cx| cx.read_from_clipboard().unwrap().text().unwrap()),
+            format!("{reply}\n\n{code}")
+        );
+
+        conversation.update(&mut cx, |view, cx| {
+            view.set_draft("draft stays editable", cx)
+        });
+        cx.update(|window, cx| conversation.update(cx, |view, cx| view.focus_composer(window, cx)));
+        cx.simulate_keystrokes("secondary-a secondary-c");
+        assert_eq!(
+            cx.update(|_, cx| cx.read_from_clipboard().unwrap().text().unwrap()),
+            "draft stays editable"
+        );
     }
 }
