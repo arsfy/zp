@@ -1,5 +1,6 @@
 //! MCP over stdio (a shell script server) and streamable HTTP (an in-process server).
 
+#[cfg(unix)]
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::time::Duration;

@@ -22,7 +22,7 @@ zp-tools = { path = "crates/zp-tools" }
 # GPUI Community Edition, pinned to a specific revision because the API moves fast.
 # The library crate is published as `gpui-ce` but its lib name is `gpui`.
 gpui = { package = "gpui-ce", git = "https://github.com/gpui-ce/gpui-ce", rev = "f388375d03e63d75811fa1cca3a563203b920d98" }
-gpui_platform = { package = "gpui_ce_platform", git = "https://github.com/gpui-ce/gpui-ce", rev = "f388375d03e63d75811fa1cca3a563203b920d98", features = ["font-kit"] }
+gpui_platform = { package = "gpui_ce_platform", git = "https://github.com/gpui-ce/gpui-ce", rev = "f388375d03e63d75811fa1cca3a563203b920d98", features = ["font-kit", "wayland", "x11"] }
 gpui_elements = { package = "gpui_ce_elements", git = "https://github.com/gpui-ce/gpui-ce", rev = "f388375d03e63d75811fa1cca3a563203b920d98" }
 gpui_tokio = { package = "gpui_ce_tokio", git = "https://github.com/gpui-ce/gpui-ce", rev = "f388375d03e63d75811fa1cca3a563203b920d98" }
 
