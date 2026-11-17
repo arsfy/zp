@@ -15,7 +15,7 @@ use super::permissions::permission_mode_color;
 use super::transcript::{Row, ToolStatus};
 use super::{ConversationEvent, ConversationView, Picker};
 use crate::actions::KEY_SEND;
-use crate::diff_view::{DiffColors, render_unified_row};
+use crate::diff_view::{DiffColors, Gutters, render_unified_row};
 use crate::markdown::{IdGen, MarkdownStyle, render_markdown};
 use crate::selectable_text::SelectableText;
 use crate::store::AppSettings;
@@ -954,13 +954,14 @@ impl ConversationView {
                     .flex()
                     .flex_col()
                     .py_1()
-                    .children(
-                        tool_diff
-                            .rows
-                            .iter()
-                            .take(INLINE_DIFF_ROWS)
-                            .map(|row| render_unified_row(row, &diff_colors)),
-                    )
+                    .children(tool_diff.rows.iter().take(INLINE_DIFF_ROWS).map(|row| {
+                        render_unified_row(
+                            row,
+                            &diff_colors,
+                            Gutters::estimate(&tool_diff.diff),
+                            None,
+                        )
+                    }))
                     .child(footer(
                         (hidden > 0).then(|| format!("… {hidden} more lines")),
                     ))

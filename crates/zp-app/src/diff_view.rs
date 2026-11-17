@@ -6,18 +6,28 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use gpui::{
-    AnyElement, App, ColorExt as _, Context, EventEmitter, FocusHandle, Focusable, FontWeight,
-    IntoElement, Render, Rgba, SharedString, UniformListScrollHandle, Window, div, prelude::*, px,
+    AnyElement, App, ClipboardItem, ColorExt as _, Context, DispatchPhase, ElementId, EventEmitter,
+    FocusHandle, Focusable, FontWeight, IntoElement, ListHorizontalSizingBehavior, MouseButton,
+    Pixels, Render, Rgba, SharedString, UniformListScrollHandle, Window, div, prelude::*, px,
     uniform_list,
 };
 use zp_core::changes::RevertStatus;
 use zp_core::diff::{DEFAULT_CONTEXT, DiffLine, FileDiff, LineKind, SideLine, SplitRow};
 
 use crate::actions::{CloseDiff, NextDiffFile, PreviousDiffFile, ToggleDiffLayout};
+use crate::selectable_text::{SelectableText, TextId, TextSelection};
 use crate::theme::ActiveTheme;
 
 /// Height of one diff row.
 const ROW_HEIGHT: f32 = 20.;
+/// Font size of diff text.
+const FONT_SIZE: f32 = 12.;
+/// Width of the `+` / `-` column.
+const SIGN_WIDTH: f32 = 16.;
+/// Space after the text of a line (horizontal scrolling ends there).
+const TEXT_END_PADDING: f32 = 16.;
+/// Digit width used when the font cannot be measured (inline previews).
+const ESTIMATED_DIGIT_WIDTH: f32 = 7.5;
 
 /// Something that reverts the change shown (a file of a session or turn).
 pub type RevertFn = Rc<dyn Fn(&mut Window, &mut App)>;
@@ -111,9 +121,68 @@ impl DiffColors {
     }
 }
 
-fn gutter(number: Option<usize>, colors: &DiffColors) -> impl IntoElement {
+/// Widths of the line number columns, from the largest number shown; `None` hides a
+/// column that would stay empty (old numbers of a new file, new ones of a deleted file).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Gutters {
+    pub old: Option<Pixels>,
+    pub new: Option<Pixels>,
+}
+
+impl Gutters {
+    /// Gutters for `diff` with digits `digit` wide.
+    pub fn of(diff: &FileDiff, digit: Pixels) -> Self {
+        let lines = || diff.hunks.iter().flat_map(|hunk| hunk.lines.iter());
+        let width = |n: usize| digit * n.to_string().len() as f32 + px(16.);
+        Self {
+            old: lines().filter_map(|line| line.old).max().map(width),
+            new: lines().filter_map(|line| line.new).max().map(width),
+        }
+    }
+
+    /// Gutters with an estimated digit width (where no window is at hand).
+    pub fn estimate(diff: &FileDiff) -> Self {
+        Self::of(diff, px(ESTIMATED_DIGIT_WIDTH))
+    }
+
+    fn total(&self) -> Pixels {
+        self.old.unwrap_or_default() + self.new.unwrap_or_default()
+    }
+}
+
+/// Text as drawn: tabs as four spaces (a single-line text run would collapse them).
+fn expand_tabs(text: &str) -> String {
+    text.replace('\t', "    ")
+}
+
+/// Columns `text` takes in a monospace font: wide (CJK, fullwidth, emoji) characters
+/// take two.
+fn display_columns(text: &str) -> usize {
+    text.chars()
+        .map(|c| match c as u32 {
+            0x09 => 4,
+            0x1100..=0x115F
+            | 0x2E80..=0x303E
+            | 0x3041..=0x33FF
+            | 0x3400..=0x4DBF
+            | 0x4E00..=0x9FFF
+            | 0xA000..=0xA4CF
+            | 0xAC00..=0xD7A3
+            | 0xF900..=0xFAFF
+            | 0xFE30..=0xFE4F
+            | 0xFF00..=0xFF60
+            | 0xFFE0..=0xFFE6
+            | 0x1F300..=0x1F64F
+            | 0x1F900..=0x1F9FF
+            | 0x20000..=0x3FFFD => 2,
+            _ => 1,
+        })
+        .sum()
+}
+
+fn gutter(number: Option<usize>, width: Pixels, colors: &DiffColors) -> impl IntoElement {
     div()
-        .w(px(44.))
+        .w(width)
         .flex_shrink_0()
         .pr_2()
         .flex()
@@ -122,30 +191,56 @@ fn gutter(number: Option<usize>, colors: &DiffColors) -> impl IntoElement {
         .child(number.map(|n| n.to_string()).unwrap_or_default())
 }
 
-fn code(text: &str) -> impl IntoElement {
-    // Tabs would collapse in a single-line text run.
-    div()
-        .flex_1()
-        .min_w_0()
-        .overflow_hidden()
-        .whitespace_nowrap()
-        .child(text.replace('\t', "    "))
+/// A line's text: selectable and as wide as it is (the diff view scrolls sideways), or
+/// cut off at the row's end (small previews).
+fn code(text: &str, selection: Option<(&TextSelection, TextId)>) -> AnyElement {
+    let text: SharedString = expand_tabs(text).into();
+    match selection {
+        Some((selection, id)) => div()
+            .flex_shrink_0()
+            .pr(px(TEXT_END_PADDING))
+            .child(SelectableText::new(
+                ElementId::Name(format!("diff-text-{}-{}", id.0, id.1).into()),
+                id,
+                text,
+                selection.clone(),
+                "\n",
+            ))
+            .into_any_element(),
+        None => div()
+            .flex_1()
+            .min_w_0()
+            .overflow_hidden()
+            .child(text)
+            .into_any_element(),
+    }
 }
 
-/// A unified diff row.
-pub fn render_unified_row(row: &UnifiedRow, colors: &DiffColors) -> AnyElement {
-    let base = div()
+fn row_base(selectable: bool, colors: &DiffColors) -> gpui::Div {
+    div()
         .h(px(ROW_HEIGHT))
-        .w_full()
         .flex()
         .items_center()
+        .whitespace_nowrap()
         .font_family(colors.mono.clone())
-        .text_size(px(12.));
+        .text_size(px(FONT_SIZE))
+        .when(selectable, |row| row.min_w_full())
+        .when(!selectable, |row| row.w_full())
+}
+
+/// A unified diff row; with `selection` (and the row's index) its text can be selected.
+pub fn render_unified_row(
+    row: &UnifiedRow,
+    colors: &DiffColors,
+    gutters: Gutters,
+    selection: Option<(&TextSelection, usize)>,
+) -> AnyElement {
+    let base = row_base(selection.is_some(), colors);
     match row {
         UnifiedRow::Header(header) => base
             .bg(colors.header_bg)
             .text_color(colors.muted)
-            .pl(px(96.))
+            .pl(gutters.total() + px(SIGN_WIDTH))
             .child(header.clone())
             .into_any_element(),
         UnifiedRow::Line(line) => {
@@ -156,61 +251,147 @@ pub fn render_unified_row(row: &UnifiedRow, colors: &DiffColors) -> AnyElement {
             };
             base.when_some(colors.line_bg(line.kind), |this, bg| this.bg(bg))
                 .text_color(colors.text)
-                .child(gutter(line.old, colors))
-                .child(gutter(line.new, colors))
+                .when_some(gutters.old, |this, width| {
+                    this.child(gutter(line.old, width, colors))
+                })
+                .when_some(gutters.new, |this, width| {
+                    this.child(gutter(line.new, width, colors))
+                })
                 .child(
                     div()
-                        .w(px(14.))
+                        .w(px(SIGN_WIDTH))
                         .flex_shrink_0()
                         .text_color(color)
                         .child(sign),
                 )
-                .child(code(&line.text))
+                .child(code(
+                    &line.text,
+                    selection.map(|(selection, index)| (selection, (0, index, 0))),
+                ))
                 .into_any_element()
         }
     }
 }
 
-fn render_side(side: Option<&SideLine>, colors: &DiffColors) -> impl IntoElement {
+/// One side of a split row: at least `width` wide, so long lines scroll sideways.
+fn render_side(
+    side: Option<&SideLine>,
+    column: usize,
+    index: usize,
+    gutter_width: Pixels,
+    width: Pixels,
+    colors: &DiffColors,
+    selection: &TextSelection,
+) -> impl IntoElement {
     div()
         .flex_1()
-        .min_w_0()
+        .min_w(width)
         .h_full()
         .flex()
         .items_center()
+        .overflow_hidden()
         .when_some(side.and_then(|s| colors.line_bg(s.kind)), |this, bg| {
             this.bg(bg)
         })
         .when(side.is_none(), |this| this.bg(colors.muted.opacity(0.05)))
         .when_some(side, |this, side| {
-            this.child(gutter(Some(side.number), colors))
-                .child(code(&side.text))
+            this.child(gutter(Some(side.number), gutter_width, colors))
+                .child(code(&side.text, Some((selection, (column, index, 0)))))
         })
 }
 
-/// A side-by-side diff row.
-pub fn render_split_row(row: &SplitRow, diff: &FileDiff, colors: &DiffColors) -> AnyElement {
-    let base = div()
-        .h(px(ROW_HEIGHT))
-        .w_full()
-        .flex()
-        .items_center()
-        .font_family(colors.mono.clone())
-        .text_size(px(12.))
-        .text_color(colors.text);
+/// Widths of the split layout: each side's line number column and its minimum width.
+#[derive(Clone, Copy, Debug)]
+pub struct SplitWidths {
+    gutters: (Pixels, Pixels),
+    sides: (Pixels, Pixels),
+}
+
+impl SplitWidths {
+    fn of(rows: &[SplitRow], gutters: Gutters, digit: Pixels) -> Self {
+        let columns = |side: fn(&SplitRow) -> Option<&SideLine>| {
+            rows.iter()
+                .filter_map(side)
+                .map(|line| display_columns(&line.text))
+                .max()
+                .unwrap_or(0)
+        };
+        let left = columns(|row| match row {
+            SplitRow::Lines { left, .. } => left.as_ref(),
+            SplitRow::Header(_) => None,
+        });
+        let right = columns(|row| match row {
+            SplitRow::Lines { right, .. } => right.as_ref(),
+            SplitRow::Header(_) => None,
+        });
+        let gutters = (
+            gutters.old.unwrap_or(digit + px(16.)),
+            gutters.new.unwrap_or(digit + px(16.)),
+        );
+        let side =
+            |gutter: Pixels, columns: usize| gutter + digit * columns as f32 + px(TEXT_END_PADDING);
+        Self {
+            gutters,
+            sides: (side(gutters.0, left), side(gutters.1, right)),
+        }
+    }
+}
+
+/// A side-by-side diff row; its text can be selected, one side at a time.
+pub fn render_split_row(
+    row: &SplitRow,
+    index: usize,
+    diff: &FileDiff,
+    colors: &DiffColors,
+    widths: SplitWidths,
+    selection: &TextSelection,
+) -> AnyElement {
+    let base = row_base(true, colors).text_color(colors.text);
     match row {
-        SplitRow::Header(index) => base
+        SplitRow::Header(hunk) => base
             .bg(colors.header_bg)
             .text_color(colors.muted)
-            .pl(px(52.))
-            .child(diff.hunks[*index].header())
+            .pl(widths.gutters.0)
+            .child(diff.hunks[*hunk].header())
             .into_any_element(),
         SplitRow::Lines { left, right } => base
-            .child(render_side(left.as_ref(), colors))
-            .child(div().w(px(1.)).h_full().bg(colors.muted.opacity(0.3)))
-            .child(render_side(right.as_ref(), colors))
+            .child(render_side(
+                left.as_ref(),
+                0,
+                index,
+                widths.gutters.0,
+                widths.sides.0,
+                colors,
+                selection,
+            ))
+            .child(
+                div()
+                    .w(px(1.))
+                    .h_full()
+                    .flex_shrink_0()
+                    .bg(colors.muted.opacity(0.3)),
+            )
+            .child(render_side(
+                right.as_ref(),
+                1,
+                index,
+                widths.gutters.1,
+                widths.sides.1,
+                colors,
+                selection,
+            ))
             .into_any_element(),
     }
+}
+
+/// Width of a digit in the monospace diff font.
+fn digit_width(font: &SharedString, window: &Window) -> Pixels {
+    let text_system = window.text_system();
+    let font_id = text_system.resolve_font(&gpui::font(font.clone()));
+    text_system
+        .advance(font_id, px(FONT_SIZE), '0')
+        .map(|size| size.width)
+        .unwrap_or(px(ESTIMATED_DIGIT_WIDTH))
 }
 
 /// Events of a [`DiffView`].
@@ -227,6 +408,8 @@ pub struct DiffView {
     unified: Rc<Vec<UnifiedRow>>,
     split: Rc<Vec<SplitRow>>,
     scroll: UniformListScrollHandle,
+    /// Selected text across the lines, for copying.
+    selection: TextSelection,
     focus_handle: FocusHandle,
 }
 
@@ -239,6 +422,7 @@ impl DiffView {
         layout: DiffLayout,
         cx: &mut Context<Self>,
     ) -> Self {
+        let focus_handle = cx.focus_handle();
         let mut this = Self {
             items,
             index: 0,
@@ -247,7 +431,8 @@ impl DiffView {
             unified: Rc::default(),
             split: Rc::default(),
             scroll: UniformListScrollHandle::new(),
-            focus_handle: cx.focus_handle(),
+            selection: TextSelection::new(focus_handle.clone()),
+            focus_handle,
         };
         this.show(index);
         this
@@ -264,6 +449,82 @@ impl DiffView {
         self.split = Rc::new(diff.split_rows());
         self.diff = Rc::new(diff);
         self.scroll = UniformListScrollHandle::new();
+        self.reset_selection();
+    }
+
+    /// Makes every line of the current layout selectable (also lines not drawn yet).
+    fn reset_selection(&self) {
+        match self.layout {
+            DiffLayout::Unified => self.selection.set_fragments(
+                self.unified
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, row)| match row {
+                        UnifiedRow::Line(line) => {
+                            Some(((0, index, 0), expand_tabs(&line.text).into()))
+                        }
+                        UnifiedRow::Header(_) => None,
+                    }),
+                "\n",
+            ),
+            DiffLayout::Split => self.selection.set_fragments(
+                self.split
+                    .iter()
+                    .enumerate()
+                    .flat_map(|(index, row)| match row {
+                        SplitRow::Lines { left, right } => [
+                            left.as_ref()
+                                .map(|l| ((0, index, 0), expand_tabs(&l.text).into())),
+                            right
+                                .as_ref()
+                                .map(|r| ((1, index, 0), expand_tabs(&r.text).into())),
+                        ],
+                        SplitRow::Header(_) => [None, None],
+                    })
+                    .flatten(),
+                "\n",
+            ),
+        }
+    }
+
+    /// The text selection (tests).
+    #[cfg(test)]
+    pub fn selection(&self) -> TextSelection {
+        self.selection.clone()
+    }
+
+    /// The horizontal scroll offset, the list's width and the width of its content
+    /// (tests).
+    #[cfg(test)]
+    pub fn horizontal_scroll(&self) -> (Pixels, Pixels, Pixels) {
+        let state = self.scroll.0.borrow();
+        let size = state.last_item_size.expect("laid out");
+        (
+            state.base_handle.offset().x,
+            size.item.width,
+            size.contents.width,
+        )
+    }
+
+    /// The row the list measures for its width: the widest one.
+    fn widest_row(&self) -> usize {
+        match self.layout {
+            DiffLayout::Unified => self
+                .unified
+                .iter()
+                .enumerate()
+                .max_by_key(|(_, row)| match row {
+                    UnifiedRow::Line(line) => display_columns(&line.text),
+                    UnifiedRow::Header(header) => header.len(),
+                })
+                .map_or(0, |(index, _)| index),
+            // Every line row has both sides at their minimum widths.
+            DiffLayout::Split => self
+                .split
+                .iter()
+                .position(|row| matches!(row, SplitRow::Lines { .. }))
+                .unwrap_or(0),
+        }
     }
 
     pub fn layout(&self) -> DiffLayout {
@@ -296,6 +557,7 @@ impl DiffView {
 
     pub fn set_layout(&mut self, layout: DiffLayout, cx: &mut Context<Self>) {
         self.layout = layout;
+        self.reset_selection();
         cx.notify();
     }
 
@@ -517,7 +779,8 @@ impl Focusable for DiffView {
 }
 
 impl Render for DiffView {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.selection.begin_frame();
         let colors = cx.theme().colors.clone();
         let diff_colors = DiffColors::of(cx);
         let body: AnyElement = if self.diff.too_large {
@@ -538,14 +801,32 @@ impl Render for DiffView {
             let split = self.split.clone();
             let layout = self.layout;
             let count = self.row_count();
+            let digit = digit_width(&diff_colors.mono, window);
+            let gutters = Gutters::of(&diff, digit);
+            let widths = SplitWidths::of(&split, gutters, digit);
+            let selection = self.selection.clone();
             uniform_list("diff-rows", count, move |range, _, _| {
                 range
                     .map(|ix| match layout {
-                        DiffLayout::Unified => render_unified_row(&unified[ix], &diff_colors),
-                        DiffLayout::Split => render_split_row(&split[ix], &diff, &diff_colors),
+                        DiffLayout::Unified => render_unified_row(
+                            &unified[ix],
+                            &diff_colors,
+                            gutters,
+                            Some((&selection, ix)),
+                        ),
+                        DiffLayout::Split => render_split_row(
+                            &split[ix],
+                            ix,
+                            &diff,
+                            &diff_colors,
+                            widths,
+                            &selection,
+                        ),
                     })
                     .collect::<Vec<_>>()
             })
+            .with_horizontal_sizing_behavior(ListHorizontalSizingBehavior::Unconstrained)
+            .with_width_from_item(Some(self.widest_row()))
             .track_scroll(&self.scroll)
             .size_full()
             .into_any_element()
@@ -555,6 +836,35 @@ impl Render for DiffView {
             .key_context("DiffView")
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(|_, _: &CloseDiff, _, cx| cx.emit(DiffViewEvent::Close)))
+            .on_action(cx.listener(
+                |this, _: &gpui_elements::editable_text::actions::Copy, _, cx| {
+                    if let Some(text) = this.selection.selected_text() {
+                        cx.write_to_clipboard(ClipboardItem::new_string(text));
+                    }
+                },
+            ))
+            .on_action(cx.listener(
+                |this, _: &gpui_elements::editable_text::actions::SelectAll, window, _| {
+                    this.selection.select_all();
+                    window.refresh();
+                },
+            ))
+            .on_mouse_move_all({
+                let selection = self.selection.clone();
+                move |event, phase, _, window, _| {
+                    if phase == DispatchPhase::Bubble {
+                        selection.extend_at(event.position, window);
+                    }
+                }
+            })
+            .on_mouse_up_all({
+                let selection = self.selection.clone();
+                move |event, phase, _, _, _| {
+                    if phase == DispatchPhase::Bubble && event.button == MouseButton::Left {
+                        selection.end_drag();
+                    }
+                }
+            })
             .on_action(cx.listener(|this, _: &NextDiffFile, _, cx| this.step(1, cx)))
             .on_action(cx.listener(|this, _: &PreviousDiffFile, _, cx| this.step(-1, cx)))
             .on_action(cx.listener(|this, _: &ToggleDiffLayout, _, cx| {
@@ -587,5 +897,25 @@ mod tests {
         assert_eq!(rows.len(), 4);
         assert!(matches!(&rows[0], UnifiedRow::Header(h) if h == "@@ -1,2 +1,2 @@"));
         assert!(matches!(&rows[2], UnifiedRow::Line(l) if l.kind == LineKind::Removed));
+    }
+
+    #[test]
+    fn gutters_fit_the_numbers_and_skip_empty_columns() {
+        let digit = px(8.);
+        let created = FileDiff::compute(None, Some("a\nb\n"), 3);
+        assert_eq!(
+            Gutters::of(&created, digit),
+            Gutters {
+                old: None,
+                new: Some(px(24.))
+            }
+        );
+        let deleted = FileDiff::compute(Some("a\n"), None, 3);
+        assert_eq!(Gutters::of(&deleted, digit).new, None);
+        let long: String = (0..1200).map(|i| format!("{i}\n")).collect();
+        let changed = FileDiff::compute(Some(&long), Some(&long.replace("1100\n", "x\n")), 3);
+        let gutters = Gutters::of(&changed, digit);
+        assert_eq!((gutters.old, gutters.new), (Some(px(48.)), Some(px(48.))));
+        assert_eq!(display_columns("a中\tb"), 8);
     }
 }

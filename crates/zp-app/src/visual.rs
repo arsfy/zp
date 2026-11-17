@@ -1498,7 +1498,11 @@ fn git_panel(cx: &mut VisualTestAppContext, out: &std::path::Path) {
         "fn main() {\n    run();\n}\n",
     )
     .unwrap();
-    std::fs::write(root.join("PLAN.md"), "# Plan\n\n- git panel\n").unwrap();
+    std::fs::write(
+        root.join("PLAN.md"),
+        "# On the Value of ‘Slowness’\n\n**Abstract**: This article discusses the long-term benefits of deliberately slowing down the pace in fast-paced software development, including less rework, clearer designs, and a deeper shared understanding of the codebase amongst the team. This line has been deliberately made long to test horizontal scrolling.\n**Keywords**: pace, quality, maintainability\n",
+    )
+    .unwrap();
     std::fs::remove_file(root.join("README.md")).unwrap();
 
     let window = cx
@@ -1578,5 +1582,60 @@ fn git_panel(cx: &mut VisualTestAppContext, out: &std::path::Path) {
     cx.capture_screenshot(any)
         .unwrap()
         .save(out.join("42-git-history.png"))
+        .unwrap();
+
+    // A new file's diff: no old line numbers, long lines scroll sideways, selected text.
+    cx.update_window(any, |_, _, cx| {
+        panel.update(cx, |panel, cx| {
+            panel.set_tab(crate::git_panel::GitTab::Changes, cx);
+            let file = panel
+                .status()
+                .unwrap()
+                .files
+                .iter()
+                .find(|f| f.repo_path == "PLAN.md")
+                .unwrap()
+                .clone();
+            panel.open_file(&file, crate::git_panel::Side::Unstaged, cx);
+        })
+    })
+    .unwrap();
+    pump(cx, Duration::from_millis(500));
+    cx.simulate_mouse_down(
+        any,
+        point(px(300.), px(180.)),
+        MouseButton::Left,
+        Modifiers::none(),
+    );
+    cx.simulate_mouse_move(
+        any,
+        point(px(560.), px(220.)),
+        Some(MouseButton::Left),
+        Modifiers::none(),
+    );
+    cx.simulate_mouse_up(
+        any,
+        point(px(560.), px(220.)),
+        MouseButton::Left,
+        Modifiers::none(),
+    );
+    pump(cx, Duration::from_millis(200));
+    cx.capture_screenshot(any)
+        .unwrap()
+        .save(out.join("45-git-diff-new-file.png"))
+        .unwrap();
+    cx.simulate_event(
+        any,
+        gpui::ScrollWheelEvent {
+            position: point(px(600.), px(300.)),
+            delta: gpui::ScrollDelta::Pixels(point(px(-400.), px(0.))),
+            modifiers: Modifiers::none(),
+            touch_phase: gpui::TouchPhase::Moved,
+        },
+    );
+    pump(cx, Duration::from_millis(200));
+    cx.capture_screenshot(any)
+        .unwrap()
+        .save(out.join("46-git-diff-scrolled.png"))
         .unwrap();
 }

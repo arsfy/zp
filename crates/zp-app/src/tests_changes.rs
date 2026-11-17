@@ -880,3 +880,120 @@ fn git_working_tree(cx: &mut TestAppContext) {
         ("Working tree vs HEAD", 3, 1)
     );
 }
+
+#[gpui::test]
+fn diff_view_scrolls_sideways_and_copies_selected_lines(cx: &mut TestAppContext) {
+    use gpui::{MouseButton, ScrollDelta, ScrollWheelEvent, TouchPhase, point, px};
+
+    let faux = FauxProvider::default();
+    let _data = setup_models(cx, &[&faux], false);
+    let (_dir, project) = project_dir();
+    let git = |args: &[&str]| {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(&project)
+            .args([
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "commit.gpgsign=false",
+            ])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+    };
+    git(&["init", "-q"]);
+    std::fs::write(project.join("main.rs"), "fn main() {}\n").unwrap();
+    git(&["add", "."]);
+    git(&["commit", "-q", "-m", "init"]);
+    let long = format!("    let s = \"{}\";", "x".repeat(400));
+    let comment = "    // 中文注释";
+    std::fs::write(
+        project.join("main.rs"),
+        format!("fn main() {{\n{long}\n{comment}\n}}\n"),
+    )
+    .unwrap();
+
+    let window = open(cx, &project);
+    let git_panel = panel(window, cx).read_with(cx, |panel, _| panel.git().clone());
+    wait_until(cx, |cx| {
+        git_panel.read_with(cx, |git, _| git.status().is_some())
+    });
+    git_panel.update(cx, |git, cx| git.open_all(cx));
+    wait_until(cx, |cx| {
+        with_window(window, cx, |view, _, _| view.diff_view()).is_some()
+    });
+    let diff = with_window(window, cx, |view, _, _| view.diff_view()).unwrap();
+    cx.run_until_parked();
+
+    // The long line makes the content wider than the list, which scrolls sideways.
+    let (offset, width, content) = diff.read_with(cx, |diff, _| diff.horizontal_scroll());
+    assert_eq!(offset, px(0.));
+    assert!(content > width + px(1000.), "{content:?} vs {width:?}");
+    let selection = diff.read_with(cx, |diff, _| diff.selection());
+    let start = selection.point_for_text(comment, 7).expect("comment drawn");
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    visual.simulate_event(ScrollWheelEvent {
+        position: start,
+        delta: ScrollDelta::Pixels(point(px(-300.), px(0.))),
+        modifiers: Modifiers::none(),
+        touch_phase: TouchPhase::Moved,
+    });
+    visual.run_until_parked();
+    let (offset, ..) = diff.read_with(&visual, |diff, _| diff.horizontal_scroll());
+    assert_eq!(offset, px(-300.));
+    visual.simulate_event(ScrollWheelEvent {
+        position: start,
+        delta: ScrollDelta::Pixels(point(px(300.), px(0.))),
+        modifiers: Modifiers::none(),
+        touch_phase: TouchPhase::Moved,
+    });
+    visual.run_until_parked();
+
+    // Drag across the wide characters, copy.
+    let start = selection.point_for_text(comment, 7).unwrap();
+    let end = selection.point_for_text(comment, 19).unwrap();
+    visual.simulate_mouse_down(start, MouseButton::Left, Modifiers::none());
+    visual.simulate_mouse_move(end, MouseButton::Left, Modifiers::none());
+    visual.simulate_mouse_up(end, MouseButton::Left, Modifiers::none());
+    visual.simulate_keystrokes("secondary-c");
+    let copied = |visual: &mut VisualTestContext| {
+        visual.update(|_, cx| cx.read_from_clipboard().unwrap().text().unwrap())
+    };
+    assert_eq!(copied(&mut visual), "中文注释");
+
+    // Across lines, then everything: lines joined by newlines, without the hunk header.
+    let first = selection.point_for_text("fn main() {", 3).unwrap();
+    visual.simulate_mouse_down(first, MouseButton::Left, Modifiers::none());
+    visual.simulate_mouse_move(end, MouseButton::Left, Modifiers::none());
+    visual.simulate_mouse_up(end, MouseButton::Left, Modifiers::none());
+    visual.simulate_keystrokes("secondary-c");
+    assert_eq!(
+        copied(&mut visual),
+        format!("main() {{\n{long}\n    // 中文注释")
+    );
+    visual.simulate_keystrokes("secondary-a secondary-c");
+    assert_eq!(
+        copied(&mut visual),
+        format!("fn main() {{}}\nfn main() {{\n{long}\n{comment}\n}}")
+    );
+
+    // Side by side: a selection down one side leaves out the other side's lines.
+    diff.update(&mut visual, |diff, cx| {
+        diff.set_layout(DiffLayout::Split, cx)
+    });
+    visual.run_until_parked();
+    let top = selection.point_for_text("fn main() {", 0).unwrap();
+    let bottom = selection.point_for_text(comment, 19).unwrap();
+    visual.simulate_mouse_down(top, MouseButton::Left, Modifiers::none());
+    visual.simulate_mouse_move(bottom, MouseButton::Left, Modifiers::none());
+    visual.simulate_mouse_up(bottom, MouseButton::Left, Modifiers::none());
+    visual.simulate_keystrokes("secondary-c");
+    assert_eq!(
+        copied(&mut visual),
+        format!("fn main() {{\n{long}\n{comment}")
+    );
+}

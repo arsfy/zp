@@ -15,7 +15,7 @@ use zp_core::permissions::{AskReason, Decision, PermissionMode, PermissionPolicy
 use super::files::ToolDiff;
 use super::{ConversationEvent, ConversationView};
 use crate::approvals::PendingApproval;
-use crate::diff_view::{DiffColors, render_unified_row, unified_rows};
+use crate::diff_view::{DiffColors, Gutters, render_unified_row, unified_rows};
 use crate::review_model_picker::{ReviewModelEvent, ReviewModelPicker};
 use crate::store::AppStore;
 use crate::theme::ActiveTheme;
@@ -479,13 +479,14 @@ impl ConversationView {
                             .rounded(px(4.))
                             .overflow_hidden()
                             .bg(colors.code_background)
-                            .children(
-                                preview
-                                    .rows
-                                    .iter()
-                                    .take(PREVIEW_ROWS)
-                                    .map(|row| render_unified_row(row, &diff_colors)),
-                            )
+                            .children(preview.rows.iter().take(PREVIEW_ROWS).map(|row| {
+                                render_unified_row(
+                                    row,
+                                    &diff_colors,
+                                    Gutters::estimate(&preview.diff),
+                                    None,
+                                )
+                            }))
                             .when(hidden > 0, |this| {
                                 this.child(
                                     div()

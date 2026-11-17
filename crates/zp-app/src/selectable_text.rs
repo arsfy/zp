@@ -275,6 +275,21 @@ impl TextSelection {
             .retain(|id, _| (id.0, id.1) != (row, block));
     }
 
+    /// Replaces the selectable text with `fragments`, also those not drawn yet (rows of a
+    /// virtualized list), so a selection or Select All spans all of them.
+    pub fn set_fragments(
+        &self,
+        fragments: impl IntoIterator<Item = (TextId, SharedString)>,
+        separator: &'static str,
+    ) {
+        let mut state = self.state.borrow_mut();
+        *state = SelectionState::default();
+        state.fragments = fragments
+            .into_iter()
+            .map(|(id, text)| (id, Fragment { text, separator }))
+            .collect();
+    }
+
     pub fn selected_text(&self) -> Option<String> {
         self.state.borrow().selected_text()
     }
