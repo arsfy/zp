@@ -1,10 +1,42 @@
 use alacritty_terminal::event::VoidListener;
 use alacritty_terminal::vte::ansi::Processor;
-use gpui::{Modifiers, TestAppContext, VisualTestContext};
+use std::time::{Duration, Instant};
+
+use gpui::{Entity, Modifiers, TestAppContext, VisualTestContext};
 
 use super::*;
 use crate::tests::project_dir;
-use crate::tests_conversation::{open, setup_models, wait_until};
+use crate::tests_conversation::{open, setup_models};
+
+const LINK: &str = "https://example.com/zp-terminal";
+
+/// Lets the shell run until its screen satisfies `done`. Waits in real time, and long:
+/// shells start slowly on CI (PowerShell especially).
+fn wait_for_screen(
+    cx: &mut TestAppContext,
+    terminal: &Entity<TerminalView>,
+    done: impl Fn(&str) -> bool,
+) {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        cx.run_until_parked();
+        let text = terminal.read_with(cx, |view, _| view.screen_text());
+        if done(&text) {
+            return;
+        }
+        assert!(Instant::now() < deadline, "timed out, screen:\n{text}");
+        cx.executor().advance_clock(Duration::from_millis(50));
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// The screen row showing `LINK` on its own.
+fn link_row(view: &TerminalView) -> usize {
+    view.screen_text()
+        .lines()
+        .position(|line| line == LINK)
+        .unwrap()
+}
 
 fn grid(text: &str, columns: usize, lines: usize) -> Term<VoidListener> {
     let mut term = Term::new(
@@ -131,24 +163,32 @@ fn terminal_links_search_selection_and_context_menu(cx: &mut TestAppContext) {
     let terminal = window
         .update(cx, |project, _, _| project.terminal().unwrap())
         .unwrap();
-    // Clear the screen, then show a link and two search hits from its first line; the
-    // shell keeps quiet while `sleep` runs. Windows runs PowerShell.
+    // Show a link and two search hits on their own lines; the shell keeps quiet while
+    // `sleep` runs. The command builds them so its echo doesn't contain them. Windows
+    // runs PowerShell (through ConPTY, which redraws rather than passing output through,
+    // so the test finds the lines instead of clearing the screen), and is only fed once
+    // its prompt is up.
     let command: &[u8] = if cfg!(windows) {
-        b"Write-Host -NoNewline \"$([char]27)[2J$([char]27)[Hhttps://example.com/zp-terminal`nfind-marker find-marker`n\"; Start-Sleep 30\r"
+        wait_for_screen(cx, &terminal, |text| {
+            text.lines().any(|line| line.starts_with("PS "))
+        });
+        b"Write-Host ('https://example.com/zp-{0}' -f 'terminal'); Write-Host ('find-{0} find-{0}' -f 'marker'); Start-Sleep 30\r"
     } else {
-        b"printf '\\033[2J\\033[Hhttps://example.com/zp-terminal\\nfind-marker find-marker\\n'; sleep 30\r"
+        b"printf 'https://example.com/zp-%s\\nfind-%s find-%s\\n' terminal marker marker; sleep 30\r"
     };
     terminal.update(cx, |view, _| view.write(command.to_vec()));
-    wait_until(cx, |cx| {
-        terminal.read_with(cx, |view, _| {
-            view.screen_text()
-                .starts_with("https://example.com/zp-terminal")
-        })
+    wait_for_screen(cx, &terminal, |text| {
+        let mut lines = text.lines().skip_while(|line| *line != LINK);
+        lines.next().is_some() && lines.next() == Some("find-marker find-marker")
     });
     cx.run_until_parked();
     let point = terminal.read_with(cx, |view, _| {
         let metrics = *view.metrics.borrow();
-        metrics.origin + point(metrics.cell.width * 8., metrics.cell.height / 2.)
+        metrics.origin
+            + point(
+                metrics.cell.width * 8.,
+                metrics.cell.height * (link_row(view) as f32 + 0.5),
+            )
     });
     let modifier = if cfg!(target_os = "macos") {
         Modifiers {
@@ -170,10 +210,7 @@ fn terminal_links_search_selection_and_context_menu(cx: &mut TestAppContext) {
         let mut visual = VisualTestContext::from_window(window.into(), cx);
         visual.simulate_click(point, modifier);
     }
-    assert_eq!(
-        cx.opened_url().as_deref(),
-        Some("https://example.com/zp-terminal")
-    );
+    assert_eq!(cx.opened_url().as_deref(), Some(LINK));
 
     let expected = terminal.read_with(cx, |view, _| {
         let mut search = search::Search::default();
@@ -223,20 +260,15 @@ fn terminal_links_search_selection_and_context_menu(cx: &mut TestAppContext) {
         },
     );
     let copied = cx.update(|cx| cx.read_from_clipboard().unwrap().text().unwrap());
-    assert!(copied.contains("https://example.com/zp-terminal"));
+    assert!(copied.contains(LINK));
     terminal.update(cx, |view, cx| view.scroll_display(Scroll::Bottom, cx));
     cx.run_until_parked();
     let point = terminal.read_with(cx, |view, _| {
         let metrics = *view.metrics.borrow();
-        let line = view
-            .screen_text()
-            .lines()
-            .position(|line| line.starts_with("https://example.com/zp-terminal"))
-            .unwrap();
         metrics.origin
             + gpui::point(
                 metrics.cell.width * 8.,
-                metrics.cell.height * (line as f32 + 0.5),
+                metrics.cell.height * (link_row(view) as f32 + 0.5),
             )
     });
     terminal.update(cx, |view, _| {
@@ -245,7 +277,7 @@ fn terminal_links_search_selection_and_context_menu(cx: &mut TestAppContext) {
         view.update_hover(point, modifier);
         assert_eq!(
             view.hovered_link.as_ref().map(|link| link.url.as_str()),
-            Some("https://example.com/zp-terminal")
+            Some(LINK)
         );
     });
     window
