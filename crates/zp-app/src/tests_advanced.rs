@@ -238,7 +238,7 @@ fn file_references_and_images(cx: &mut TestAppContext) {
         ImageFormat::Png,
         vec![1, 2, 3],
     )));
-    cx.simulate_keystrokes(window.into(), "cmd-v");
+    cx.simulate_keystrokes(window.into(), "secondary-v");
     cx.run_until_parked();
     let names: Vec<String> = conversation.read_with(cx, |v, _| {
         v.attachments().iter().map(|a| a.name.clone()).collect()
@@ -246,7 +246,7 @@ fn file_references_and_images(cx: &mut TestAppContext) {
     assert_eq!(names, ["shot.png", "Pasted image"]);
     // Plain text still pastes into the field.
     cx.write_to_clipboard(ClipboardItem::new_string("what is this?".into()));
-    cx.simulate_keystrokes(window.into(), "cmd-v");
+    cx.simulate_keystrokes(window.into(), "secondary-v");
     cx.run_until_parked();
     assert_eq!(
         conversation.read_with(cx, |v, cx| v.draft(cx)),
@@ -399,7 +399,7 @@ fn command_palette_runs_commands(cx: &mut TestAppContext) {
     let _data = setup_models(cx, &[&faux], false);
     let (_dir, project) = project_dir();
     let window = open(cx, &project);
-    cx.simulate_keystrokes(window.into(), "cmd-shift-p");
+    cx.simulate_keystrokes(window.into(), "secondary-shift-p");
     cx.run_until_parked();
     let palette = window
         .update(cx, |v, _, _| v.palette())
@@ -414,7 +414,7 @@ fn command_palette_runs_commands(cx: &mut TestAppContext) {
     assert_eq!(tab_count(window, cx), 2);
     assert!(window.update(cx, |v, _, _| v.palette()).unwrap().is_none());
     // Escape closes it.
-    cx.simulate_keystrokes(window.into(), "cmd-shift-p");
+    cx.simulate_keystrokes(window.into(), "secondary-shift-p");
     cx.run_until_parked();
     cx.simulate_keystrokes(window.into(), "escape");
     cx.run_until_parked();

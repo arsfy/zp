@@ -1,5 +1,6 @@
 //! The program in a terminal's foreground, for its label (like VS Code's `${process}`).
 
+#[cfg(unix)]
 use std::future::Future;
 
 /// Watches a PTY's foreground process group.

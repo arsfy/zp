@@ -719,7 +719,7 @@ impl ConversationView {
     }
 
     /// Names of the agent's tools (tests).
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub fn tool_names(&self) -> Vec<String> {
         self.coding
             .as_ref()

@@ -339,7 +339,13 @@ fn theme_and_shortcuts(cx: &mut TestAppContext) {
     assert!(dark(cx));
     assert_eq!(saved(&data).theme, Some(ThemeChoice::Dark));
 
-    // Rebind New Chat by recording keys in the settings window.
+    // Rebind New Chat by recording keys in the settings window (saved with the
+    // platform's modifier name).
+    let recorded = if cfg!(target_os = "macos") {
+        "cmd-shift-k"
+    } else {
+        "ctrl-shift-k"
+    };
     let (_dir, project) = project_dir();
     let project_window = open(cx, &project);
     window
@@ -348,15 +354,15 @@ fn theme_and_shortcuts(cx: &mut TestAppContext) {
             view.start_recording("zp::NewChat", window, cx);
         })
         .unwrap();
-    cx.simulate_keystrokes(window.into(), "cmd-shift-k");
+    cx.simulate_keystrokes(window.into(), "secondary-shift-k");
     cx.run_until_parked();
     assert!(!window.update(cx, |view, _, _| view.is_recording()).unwrap());
-    assert_eq!(saved(&data).keybindings["zp::NewChat"], "cmd-shift-k");
+    assert_eq!(saved(&data).keybindings["zp::NewChat"], recorded);
     let before = tab_count(project_window, cx);
-    cx.simulate_keystrokes(project_window.into(), "cmd-shift-k");
+    cx.simulate_keystrokes(project_window.into(), "secondary-shift-k");
     cx.run_until_parked();
     assert_eq!(tab_count(project_window, cx), before + 1);
-    cx.simulate_keystrokes(project_window.into(), "cmd-t");
+    cx.simulate_keystrokes(project_window.into(), "secondary-t");
     cx.run_until_parked();
     assert_eq!(
         tab_count(project_window, cx),
@@ -372,11 +378,11 @@ fn theme_and_shortcuts(cx: &mut TestAppContext) {
         .unwrap();
     cx.simulate_keystrokes(window.into(), "escape");
     cx.run_until_parked();
-    assert_eq!(saved(&data).keybindings["zp::NewChat"], "cmd-shift-k");
+    assert_eq!(saved(&data).keybindings["zp::NewChat"], recorded);
     window
         .update(cx, |view, _, cx| view.set_shortcut("zp::NewChat", None, cx))
         .unwrap();
-    cx.simulate_keystrokes(project_window.into(), "cmd-t");
+    cx.simulate_keystrokes(project_window.into(), "secondary-t");
     cx.run_until_parked();
     assert_eq!(tab_count(project_window, cx), before + 2);
 }
