@@ -20,7 +20,11 @@ add() { # platform file
   entries+=("    \"$1\": {\"url\": \"$base/$2\", \"sha256\": \"$(sha "$file")\"}")
 }
 for arch in aarch64 x86_64; do
-  add "darwin-$arch" "ZP-$version-darwin-$arch.zip"
+  if [[ -f "dist/ZP-$version-darwin-$arch.dmg" ]]; then
+    add "darwin-$arch" "ZP-$version-darwin-$arch.dmg"
+  else
+    add "darwin-$arch" "ZP-$version-darwin-$arch.zip"
+  fi
   add "linux-$arch" "ZP-$version-linux-$arch.AppImage"
 done
 add "windows-x86_64" "ZP-$version-windows-x86_64-setup.exe"

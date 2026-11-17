@@ -1,18 +1,46 @@
 #!/usr/bin/env bash
-# Builds ZP.app and a zip for releases.
+# Builds ZP.app and a release zip, or a drag-to-install DMG with --dmg.
 #
-#   scripts/bundle-macos.sh [--target aarch64-apple-darwin]
+#   scripts/bundle-macos.sh [--target aarch64-apple-darwin] [--dmg]
 #
 # Signing and notarization are optional:
 #   ZP_SIGN_IDENTITY   "Developer ID Application: …" (default: ad-hoc signature)
 #   ZP_NOTARY_PROFILE  a `xcrun notarytool store-credentials` profile; when set, the app is
-#                      notarized and stapled.
+#                      notarized and stapled, along with the DMG when requested.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
 target=""
-if [[ "${1:-}" == "--target" ]]; then
-  target="$2"
+build_dmg=false
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --target)
+      if [[ $# -lt 2 || "$2" == --* || -z "$2" ]]; then
+        echo "error: --target requires a Rust target triple" >&2
+        exit 1
+      fi
+      target="$2"
+      shift 2
+      ;;
+    --dmg)
+      build_dmg=true
+      shift
+      ;;
+    --help|-h)
+      echo "Usage: $0 [--target aarch64-apple-darwin|x86_64-apple-darwin] [--dmg]"
+      exit 0
+      ;;
+    *)
+      echo "error: unknown argument: $1 (see --help)" >&2
+      exit 1
+      ;;
+  esac
+done
+
+identity="${ZP_SIGN_IDENTITY:--}"
+if [[ -n "${ZP_NOTARY_PROFILE:-}" && "$identity" == "-" ]]; then
+  echo "error: notarization requires ZP_SIGN_IDENTITY to be a Developer ID identity" >&2
+  exit 1
 fi
 version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
 arch=${target%%-*}
@@ -36,32 +64,50 @@ cp "$binary" "$app/Contents/MacOS/zp"
 sed "s/__VERSION__/$version/g" packaging/macos/Info.plist > "$app/Contents/Info.plist"
 
 echo "==> icon"
-iconset=$(mktemp -d)/ZP.iconset
-mkdir -p "$iconset"
-for size in 16 32 128 256 512; do
-  sips -z $size $size assets/icon.png --out "$iconset/icon_${size}x${size}.png" >/dev/null
-  double=$((size * 2))
-  sips -z $double $double assets/icon.png --out "$iconset/icon_${size}x${size}@2x.png" >/dev/null
-done
-iconutil -c icns "$iconset" -o "$app/Contents/Resources/ZP.icns"
+iconutil -c icns packaging/macos/ZP.iconset -o "$app/Contents/Resources/ZP.icns"
 
 echo "==> signing"
-identity="${ZP_SIGN_IDENTITY:--}"
-codesign --force --options runtime --timestamp=none \
+timestamp=(--timestamp=none)
+if [[ "$identity" != "-" ]]; then
+  timestamp=(--timestamp)
+fi
+codesign --force --options runtime "${timestamp[@]}" \
   --entitlements packaging/macos/entitlements.plist \
   --sign "$identity" "$app"
 codesign --verify --strict --verbose=1 "$app"
 
-zip="$dist/ZP-$version-darwin-$arch.zip"
-rm -f "$zip"
-ditto -c -k --keepParent "$app" "$zip"
+if [[ "$build_dmg" == true ]]; then
+  echo "==> creating DMG"
+  staging=$(mktemp -d "${TMPDIR:-/tmp}/zp-dmg.XXXXXX")
+  trap 'rm -rf "$staging"' EXIT
+  ditto "$app" "$staging/ZP.app"
+  ln -s /Applications "$staging/Applications"
+  dmg="$dist/ZP-$version-darwin-$arch.dmg"
+  hdiutil create -volname "ZP" -srcfolder "$staging" \
+    -fs HFS+ -format UDZO -ov "$dmg"
 
-if [[ -n "${ZP_NOTARY_PROFILE:-}" ]]; then
-  echo "==> notarizing"
-  xcrun notarytool submit "$zip" --keychain-profile "$ZP_NOTARY_PROFILE" --wait
-  xcrun stapler staple "$app"
+  if [[ "$identity" != "-" ]]; then
+    codesign --force --timestamp --sign "$identity" "$dmg"
+    codesign --verify --strict --verbose=1 "$dmg"
+  fi
+  if [[ -n "${ZP_NOTARY_PROFILE:-}" ]]; then
+    echo "==> notarizing DMG"
+    xcrun notarytool submit "$dmg" --keychain-profile "$ZP_NOTARY_PROFILE" --wait
+    xcrun stapler staple "$dmg"
+    xcrun stapler staple "$app"
+  fi
+  echo "==> $dmg"
+else
+  zip="$dist/ZP-$version-darwin-$arch.zip"
   rm -f "$zip"
   ditto -c -k --keepParent "$app" "$zip"
-fi
 
-echo "==> $zip"
+  if [[ -n "${ZP_NOTARY_PROFILE:-}" ]]; then
+    echo "==> notarizing"
+    xcrun notarytool submit "$zip" --keychain-profile "$ZP_NOTARY_PROFILE" --wait
+    xcrun stapler staple "$app"
+    rm -f "$zip"
+    ditto -c -k --keepParent "$app" "$zip"
+  fi
+  echo "==> $zip"
+fi
