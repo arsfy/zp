@@ -8,7 +8,7 @@ use gpui::{
     AnyElement, App, Context, Entity, EventEmitter, FontWeight, IntoElement, Render, Rgba,
     SharedString, Subscription, Task, Window, div, prelude::*, px,
 };
-use zp_core::changes::{ChangeLog, FileSummary, GroupKind, Scope};
+use zp_core::changes::{ChangeLog, FileSummary, GroupKind, RevertStatus, Scope};
 use zp_core::checkpoint::BlobStore;
 use zp_core::git::{GitFile, GitFileStatus, GitStatus};
 
@@ -44,6 +44,7 @@ pub struct FileRow {
     pub kind: FileKind,
     pub added: usize,
     pub removed: usize,
+    pub status: RevertStatus,
 }
 
 /// A turn (or restore) with its files.
@@ -53,6 +54,7 @@ pub struct GroupRow {
     pub index: usize,
     pub label: String,
     pub is_restore: bool,
+    pub status: RevertStatus,
     pub files: Vec<FileRow>,
 }
 
@@ -173,7 +175,11 @@ impl ChangesPanel {
         log.files(scope)
             .into_iter()
             .filter(|file| !file.is_unchanged())
-            .map(|file| self.file_row(&file, blobs))
+            .map(|file| {
+                let mut row = self.file_row(&file, blobs);
+                row.status = log.revert_status(scope, Some(&file.path));
+                row
+            })
             .collect()
     }
 
@@ -197,6 +203,7 @@ impl ChangesPanel {
             kind,
             added,
             removed,
+            status: RevertStatus::Active,
         }
     }
 
@@ -216,6 +223,7 @@ impl ChangesPanel {
                 index,
                 label: group.label(),
                 is_restore: matches!(group.kind, GroupKind::Restore { .. }),
+                status: log.revert_status(Scope::Group(index), None),
                 files: self.rows(&log, Scope::Group(index), blobs.as_ref()),
             })
             .filter(|group| !group.files.is_empty())
@@ -284,6 +292,7 @@ impl ChangesPanel {
             caption: "Working tree vs HEAD".into(),
             before,
             after,
+            status: RevertStatus::Active,
             revert: None,
         };
         cx.emit(ChangesPanelEvent::OpenDiff {
@@ -409,26 +418,38 @@ impl ChangesPanel {
                             .child(dir),
                     ),
             )
-            .when_some(on_revert, |this, on_revert| {
+            .when_some(row.status.label(), |this, label| {
                 this.child(
                     div()
-                        .id("revert")
-                        .invisible()
-                        .group_hover_style(group, |s| s.visible())
                         .flex_shrink_0()
-                        .px_1()
-                        .rounded(px(3.))
                         .text_size(px(11.))
                         .text_color(colors.text_muted)
-                        .hover_style(|s| s.text_color(colors.error).bg(colors.background))
-                        .child("Revert")
-                        .tooltip(tooltip("Undo these changes to the file"))
-                        .on_click(cx.listener(move |this, _, window, cx| {
-                            cx.stop_propagation();
-                            on_revert(this, window, cx)
-                        })),
+                        .child(label),
                 )
             })
+            .when_some(
+                on_revert.filter(|_| row.status != RevertStatus::Reverted),
+                |this, on_revert| {
+                    this.child(
+                        div()
+                            .id("revert")
+                            .invisible()
+                            .group_hover_style(group, |s| s.visible())
+                            .flex_shrink_0()
+                            .px_1()
+                            .rounded(px(3.))
+                            .text_size(px(11.))
+                            .text_color(colors.text_muted)
+                            .hover_style(|s| s.text_color(colors.error).bg(colors.background))
+                            .child("Revert")
+                            .tooltip(tooltip("Undo these changes to the file"))
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                cx.stop_propagation();
+                                on_revert(this, window, cx)
+                            })),
+                    )
+                },
+            )
             .child(stats(row.added, row.removed, cx))
             .into_any_element()
     }
@@ -523,6 +544,9 @@ impl ChangesPanel {
                             })
                             .child(group.label.clone()),
                     )
+                    .when_some(group.status.label(), |header, label| {
+                        header.child(div().flex_shrink_0().text_size(px(11.)).text_color(colors.text_muted).child(label))
+                    })
                     .when(!running, |this| {
                         this.child(
                             div()
@@ -530,7 +554,7 @@ impl ChangesPanel {
                                 .gap_0p5()
                                 .invisible()
                                 .group_hover_style(header_group, |s| s.visible())
-                                .child(
+                                .when(group.status != RevertStatus::Reverted, |actions| actions.child(
                                     small_button(
                                         ("revert-turn", index),
                                         if group.is_restore { "Undo" } else { "Revert" },
@@ -547,7 +571,7 @@ impl ChangesPanel {
                                             this.revert(Scope::Group(index), None, window, cx)
                                         },
                                     )),
-                                )
+                                ))
                                 .when(!group.is_restore, |this| {
                                     this.child(
                                         small_button(

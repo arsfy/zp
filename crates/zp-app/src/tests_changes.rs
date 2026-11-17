@@ -4,10 +4,10 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use gpui::{Entity, TestAppContext, WindowHandle};
+use gpui::{Entity, Modifiers, TestAppContext, VisualTestContext, WindowHandle};
 use serde_json::json;
 use zp_ai::{FauxProvider, FauxResponse};
-use zp_core::changes::Scope;
+use zp_core::changes::{RevertStatus, Scope};
 
 use crate::actions::CloseDiff;
 use crate::changes_panel::{ChangesMode, ChangesPanel, FileKind};
@@ -83,6 +83,384 @@ fn with_window<R>(
     window
         .update(cx, |view, window, cx| f(view, window, cx))
         .unwrap()
+}
+
+fn click(window: WindowHandle<ProjectWindow>, selector: &'static str, cx: &mut TestAppContext) {
+    wait_until(cx, |cx| {
+        VisualTestContext::from_window(window.into(), cx)
+            .debug_bounds(selector)
+            .is_some()
+    });
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    let bounds = visual.debug_bounds(selector).unwrap();
+    visual.simulate_click(bounds.center(), Modifiers::none());
+}
+
+#[gpui::test]
+fn turn_footer_counts_net_changes_opens_diffs_and_reverts_the_turn(cx: &mut TestAppContext) {
+    let faux = FauxProvider::default();
+    faux.push(edit("a.txt", "two", "TWO"));
+    faux.push(edit("a.txt", "TWO", "final"));
+    faux.push(write("new.txt", "new file\n"));
+    faux.push(FauxResponse::text("Updated both files."));
+    faux.push(FauxResponse::text("No further changes."));
+    let _data = setup_models(cx, &[&faux], false);
+    let (_dir, project) = project_dir();
+    std::fs::write(project.join("a.txt"), "one\ntwo\nthree\n").unwrap();
+    let window = open(cx, &project);
+    let conversation = active(window, cx);
+    send(window, "update the files", cx);
+    idle(&conversation, 5, cx);
+    let summary = conversation.read_with(cx, |view, _| {
+        assert!(view.turn_changes_for_row(0).is_none());
+        assert!(view.turn_changes_for_row(1).is_none());
+        view.turn_changes_for_row(4).unwrap()
+    });
+    assert_eq!((summary.files, summary.added, summary.removed), (2, 2, 1));
+    window
+        .update(cx, |_, window, _| window.remove_window())
+        .unwrap();
+    cx.run_until_parked();
+    let window = open(cx, &project);
+    let conversation = active(window, cx);
+    assert_eq!(
+        conversation.read_with(cx, |view, _| view.turn_changes_for_row(4)),
+        Some(summary)
+    );
+    click(window, "turn-changes-open", cx);
+    let diff = with_window(window, cx, |view, _, _| view.diff_view()).unwrap();
+    assert_eq!(
+        diff.read_with(cx, |view, _| view.item().unwrap().display.clone()),
+        "a.txt"
+    );
+    click(window, "diff-file-1", cx);
+    assert_eq!(
+        diff.read_with(cx, |view, _| view.item().unwrap().display.clone()),
+        "new.txt"
+    );
+    click(window, "diff-file-0", cx);
+    assert_eq!(
+        diff.read_with(cx, |view, _| view.item().unwrap().display.clone()),
+        "a.txt"
+    );
+    cx.dispatch_action(window.into(), CloseDiff);
+    let before_revert_leaf = conversation.read_with(cx, |view, _| view.leaf_id());
+    click(window, "turn-changes-revert", cx);
+    assert!(cx.has_pending_prompt());
+    assert_eq!(
+        read(&project, "a.txt").as_deref(),
+        Some("one\nfinal\nthree\n")
+    );
+    assert!(read(&project, "new.txt").is_some());
+    cx.simulate_prompt_answer("Cancel");
+    cx.run_until_parked();
+    assert!(read(&project, "new.txt").is_some());
+    assert_eq!(
+        conversation.read_with(cx, |view, _| view.transcript().len()),
+        5
+    );
+    click(window, "turn-changes-revert", cx);
+    cx.simulate_prompt_answer("Revert");
+    wait_until(cx, |_| read(&project, "new.txt").is_none());
+    assert_eq!(
+        read(&project, "a.txt").as_deref(),
+        Some("one\ntwo\nthree\n")
+    );
+    assert!(conversation.read_with(cx, |view, _| {
+        matches!(view.transcript().rows().last(), Some(Row::Notice { text, .. }) if text.starts_with("Reverted turn 1"))
+    }));
+    let saved = cx.update(|cx| crate::store::AppStore::state(cx).project(&project));
+    assert_eq!(
+        saved.tabs[0].leaf,
+        conversation.read_with(cx, |view, _| view.leaf_id())
+    );
+    assert!(saved.tabs[0].leaf_includes_restores);
+    cx.update(|cx| {
+        crate::store::AppStore::update(cx, |state| {
+            let tab = &mut state.project_mut(&project).tabs[0];
+            tab.leaf = before_revert_leaf.clone();
+            tab.leaf_includes_restores = false;
+        });
+    });
+    window
+        .update(cx, |_, window, _| window.remove_window())
+        .unwrap();
+    cx.run_until_parked();
+    let window = open(cx, &project);
+    let conversation = active(window, cx);
+    let reverted_summary =
+        conversation.read_with(cx, |view, _| view.turn_changes_for_row(4).unwrap());
+    assert_eq!(reverted_summary.status, RevertStatus::Reverted);
+    assert_eq!(
+        (
+            reverted_summary.files,
+            reverted_summary.added,
+            reverted_summary.removed
+        ),
+        (2, 2, 1)
+    );
+    wait_until(cx, |cx| {
+        VisualTestContext::from_window(window.into(), cx)
+            .debug_bounds("turn-changes-revert-status")
+            .is_some()
+    });
+    assert!(
+        VisualTestContext::from_window(window.into(), cx)
+            .debug_bounds("turn-changes-revert")
+            .is_none()
+    );
+    click(window, "turn-changes-open", cx);
+    let diff = with_window(window, cx, |view, _, _| view.diff_view()).unwrap();
+    diff.read_with(cx, |view, _| {
+        assert_eq!(view.item().unwrap().status, RevertStatus::Reverted);
+        assert!(view.item().unwrap().revert.is_none());
+    });
+    click(window, "diff-file-1", cx);
+    assert!(diff.read_with(cx, |view, _| view.item().unwrap().revert.is_none()));
+    cx.dispatch_action(window.into(), CloseDiff);
+    with_window(window, cx, |_, window, cx| {
+        conversation.update(cx, |view, cx| {
+            view.revert(Scope::Group(summary.group), None, window, cx)
+        });
+    });
+    assert!(!cx.has_pending_prompt());
+    let reverted_leaf = conversation
+        .read_with(cx, |view, _| view.leaf_id())
+        .unwrap();
+    conversation.update(cx, |view, cx| {
+        view.restore_leaf(before_revert_leaf.as_deref().unwrap(), false, cx)
+    });
+    assert_eq!(
+        conversation.read_with(cx, |view, _| view.turn_changes_for_row(4).unwrap().status),
+        RevertStatus::Active
+    );
+    conversation.update(cx, |view, cx| view.restore_leaf(&reverted_leaf, false, cx));
+    send(window, "anything else?", cx);
+    idle(&conversation, 8, cx);
+    assert!(conversation.read_with(cx, |view, _| view.turn_changes_for_row(7).is_none()));
+    assert_eq!(
+        conversation.read_with(cx, |view, _| view.turn_changes_for_row(4)),
+        Some(reverted_summary)
+    );
+}
+
+#[gpui::test]
+fn turn_diff_lists_all_three_files_and_switches_on_click(cx: &mut TestAppContext) {
+    let faux = FauxProvider::default();
+    let paths = ["a.txt", "nested/b.txt", "nested/c.txt"];
+    for path in paths {
+        faux.push(write(path, &format!("{path}\n")));
+    }
+    faux.push(FauxResponse::text("Created three files."));
+    let _data = setup_models(cx, &[&faux], false);
+    let (_dir, project) = project_dir();
+    let window = open(cx, &project);
+    let conversation = active(window, cx);
+    send(window, "create the files", cx);
+    idle(&conversation, 5, cx);
+    let summary = conversation.read_with(cx, |view, _| view.turn_changes_for_row(4).unwrap());
+    assert_eq!((summary.files, summary.added, summary.removed), (3, 3, 0));
+    click(window, "turn-changes-open", cx);
+    let diff = with_window(window, cx, |view, _, _| view.diff_view()).unwrap();
+    for (selector, path) in ["diff-file-0", "diff-file-1", "diff-file-2"]
+        .into_iter()
+        .zip(paths)
+    {
+        click(window, selector, cx);
+        diff.read_with(cx, |view, _| {
+            assert_eq!(view.item().unwrap().display, path);
+            assert_eq!(
+                view.item().unwrap().after.as_deref(),
+                Some(format!("{path}\n").as_str())
+            );
+            assert_eq!(view.diff().added, 1);
+        });
+    }
+}
+
+#[gpui::test]
+fn individual_edit_card_revert_protects_external_changes(cx: &mut TestAppContext) {
+    let faux = FauxProvider::default();
+    faux.push(edit("a.txt", "one", "ONE"));
+    faux.push(FauxResponse::text("Updated the file."));
+    let _data = setup_models(cx, &[&faux], false);
+    let (_dir, project) = project_dir();
+    std::fs::write(project.join("a.txt"), "one\n").unwrap();
+    let window = open(cx, &project);
+    let conversation = active(window, cx);
+    send(window, "update the file", cx);
+    idle(&conversation, 3, cx);
+    let call = tool_calls(&conversation, cx).remove(0);
+    conversation.update(cx, |view, cx| view.toggle_tool(&call, 1, true, cx));
+    click(window, "tool-revert", cx);
+    assert!(cx.has_pending_prompt());
+    assert_eq!(read(&project, "a.txt").as_deref(), Some("ONE\n"));
+    cx.simulate_prompt_answer("Cancel");
+    cx.run_until_parked();
+    assert_eq!(read(&project, "a.txt").as_deref(), Some("ONE\n"));
+    assert_eq!(
+        conversation.read_with(cx, |view, _| view.transcript().len()),
+        3
+    );
+    std::fs::write(project.join("a.txt"), "outside edit\n").unwrap();
+    click(window, "tool-revert", cx);
+    cx.simulate_prompt_answer("Revert");
+    cx.run_until_parked();
+    assert!(cx.has_pending_prompt());
+    cx.simulate_prompt_answer("Skip These Files");
+    cx.run_until_parked();
+    assert_eq!(read(&project, "a.txt").as_deref(), Some("outside edit\n"));
+    click(window, "tool-revert", cx);
+    cx.simulate_prompt_answer("Revert");
+    cx.run_until_parked();
+    assert!(cx.has_pending_prompt());
+    cx.simulate_prompt_answer("Overwrite");
+    cx.run_until_parked();
+    assert_eq!(read(&project, "a.txt").as_deref(), Some("one\n"));
+    assert!(conversation.read_with(cx, |view, _| {
+        matches!(view.transcript().rows().last(), Some(Row::Notice { text, .. }) if text.starts_with("Reverted edit to a.txt"))
+    }));
+    window
+        .update(cx, |_, window, _| window.remove_window())
+        .unwrap();
+    cx.run_until_parked();
+    let window = open(cx, &project);
+    let conversation = active(window, cx);
+    assert!(conversation.read_with(cx, |view, _| view.change_log().tool_reverted(&call)));
+    wait_until(cx, |cx| {
+        VisualTestContext::from_window(window.into(), cx)
+            .debug_bounds("tool-reverted")
+            .is_some()
+    });
+    assert!(
+        VisualTestContext::from_window(window.into(), cx)
+            .debug_bounds("tool-revert")
+            .is_none()
+    );
+    let item = conversation.update(cx, |view, cx| {
+        let change = zp_core::checkpoint::RecordedChange::from_details(
+            view.transcript()
+                .tool(&call)
+                .unwrap()
+                .details
+                .as_ref()
+                .unwrap(),
+        )
+        .unwrap();
+        view.tool_diff_item(&call, &change, cx).unwrap()
+    });
+    assert_eq!(item.status, RevertStatus::Reverted);
+    assert!(item.revert.is_none());
+    with_window(window, cx, |_, window, cx| {
+        conversation.update(cx, |view, cx| {
+            view.revert(Scope::Group(1), None, window, cx)
+        });
+    });
+    cx.simulate_prompt_answer("Revert");
+    wait_until(cx, |_| {
+        read(&project, "a.txt").as_deref() == Some("outside edit\n")
+    });
+    assert!(!conversation.read_with(cx, |view, _| view.change_log().tool_reverted(&call)));
+}
+
+#[gpui::test]
+fn partial_reverts_survive_reopening_and_skipped_files_remain_active(cx: &mut TestAppContext) {
+    let faux = FauxProvider::default();
+    for path in ["a.txt", "b.txt", "c.txt"] {
+        faux.push(write(path, "created\n"));
+    }
+    faux.push(FauxResponse::text("Created three files."));
+    let _data = setup_models(cx, &[&faux], false);
+    let (_dir, project) = project_dir();
+    let window = open(cx, &project);
+    let conversation = active(window, cx);
+    send(window, "create", cx);
+    idle(&conversation, 5, cx);
+    let calls = tool_calls(&conversation, cx);
+    with_window(window, cx, |_, window, cx| {
+        conversation.update(cx, |view, cx| view.revert_tool_call(&calls[0], window, cx));
+    });
+    cx.simulate_prompt_answer("Revert");
+    wait_until(cx, |_| read(&project, "a.txt").is_none());
+    std::fs::write(project.join("b.txt"), "outside\n").unwrap();
+    with_window(window, cx, |_, window, cx| {
+        conversation.update(cx, |view, cx| {
+            view.revert(Scope::Group(0), None, window, cx)
+        });
+    });
+    cx.simulate_prompt_answer("Revert");
+    cx.run_until_parked();
+    cx.simulate_prompt_answer("Skip These Files");
+    wait_until(cx, |_| read(&project, "c.txt").is_none());
+    window
+        .update(cx, |_, window, _| window.remove_window())
+        .unwrap();
+    cx.run_until_parked();
+    let window = open(cx, &project);
+    let conversation = active(window, cx);
+    conversation.update(cx, |view, cx| {
+        assert_eq!(
+            view.turn_changes_for_row(4).unwrap().status,
+            RevertStatus::Partial
+        );
+        let log = view.change_log();
+        assert!(log.tool_reverted(&calls[0]));
+        assert!(!log.tool_reverted(&calls[1]));
+        assert!(log.tool_reverted(&calls[2]));
+        let items = view.diff_items(Scope::Group(0), cx);
+        assert!(items[0].revert.is_none());
+        assert!(items[1].revert.is_some());
+        assert!(items[2].revert.is_none());
+    });
+    assert_eq!(read(&project, "b.txt").as_deref(), Some("outside\n"));
+    with_window(window, cx, |_, window, cx| {
+        conversation.update(cx, |view, cx| view.revert_tool_call(&calls[1], window, cx));
+    });
+    cx.simulate_prompt_answer("Revert");
+    cx.run_until_parked();
+    cx.simulate_prompt_answer("Overwrite");
+    wait_until(cx, |_| read(&project, "b.txt").is_none());
+    assert_eq!(
+        conversation.read_with(cx, |view, _| view.turn_changes_for_row(4).unwrap().status),
+        RevertStatus::Reverted
+    );
+}
+
+#[gpui::test]
+fn individual_diff_revert_preserves_subsequent_edits(cx: &mut TestAppContext) {
+    let (_data, _dir, project, window) = two_turns(cx);
+    let conversation = active(window, cx);
+    let calls = tool_calls(&conversation, cx);
+    let item = conversation.update(cx, |view, cx| {
+        let state = view.transcript().tool(&calls[0]).unwrap();
+        let change =
+            zp_core::checkpoint::RecordedChange::from_details(state.details.as_ref().unwrap())
+                .unwrap();
+        view.tool_diff_item(&calls[0], &change, cx).unwrap()
+    });
+    assert!(item.revert.is_some());
+    with_window(window, cx, |view, window, cx| {
+        view.open_diff(vec![item], 0, window, cx)
+    });
+    click(window, "diff-revert", cx);
+    assert!(cx.has_pending_prompt());
+    assert!(with_window(window, cx, |view, _, _| view.diff_view()).is_some());
+    cx.simulate_prompt_answer("Cancel");
+    cx.run_until_parked();
+    assert_eq!(
+        read(&project, "a.txt").as_deref(),
+        Some("one\nTWO\nTHREE\n")
+    );
+    assert!(with_window(window, cx, |view, _, _| view.diff_view()).is_some());
+    click(window, "diff-revert", cx);
+    cx.simulate_prompt_answer("Revert");
+    wait_until(cx, |_| {
+        read(&project, "a.txt").as_deref() == Some("one\ntwo\nTHREE\n")
+    });
+    assert_eq!(read(&project, "c.txt").as_deref(), Some("new file\n"));
+    assert_eq!(read(&project, "b.txt").as_deref(), Some("ALPHA\n"));
+    assert!(!cx.has_pending_prompt());
+    assert!(with_window(window, cx, |view, _, _| view.diff_view()).is_none());
 }
 
 /// A project with `a.txt` and `b.txt`, and an agent that runs two turns of edits.
@@ -161,6 +539,7 @@ fn inline_diffs_panel_and_reverts(cx: &mut TestAppContext) {
             })
         })
         .unwrap();
+    cx.simulate_prompt_answer("Revert");
     cx.run_until_parked();
     assert_eq!(
         read(&project, "a.txt").as_deref(),
@@ -194,6 +573,7 @@ fn inline_diffs_panel_and_reverts(cx: &mut TestAppContext) {
                 })
             })
             .unwrap();
+        cx.simulate_prompt_answer("Revert");
         cx.run_until_parked();
     };
     revert_b(cx);
@@ -213,6 +593,7 @@ fn inline_diffs_panel_and_reverts(cx: &mut TestAppContext) {
             panel.update(cx, |panel, cx| panel.restore_checkpoint(1, window, cx))
         })
         .unwrap();
+    cx.simulate_prompt_answer("Revert");
     cx.run_until_parked();
     assert_eq!(
         read(&project, "a.txt").as_deref(),
@@ -270,12 +651,12 @@ fn diff_view_from_the_panel_and_tool_cards(cx: &mut TestAppContext) {
     // "Open diff" on a tool card.
     let conversation = active(window, cx);
     let calls = tool_calls(&conversation, cx);
-    let item = conversation.read_with(cx, |view, _| {
+    let item = conversation.update(cx, |view, cx| {
         let state = view.transcript().tool(&calls[2]).unwrap();
         let change =
             zp_core::checkpoint::RecordedChange::from_details(state.details.as_ref().unwrap())
                 .unwrap();
-        view.tool_diff_item(&calls[2], &change).unwrap()
+        view.tool_diff_item(&calls[2], &change, cx).unwrap()
     });
     with_window(window, cx, |view, window, cx| {
         view.open_diff(vec![item], 0, window, cx)

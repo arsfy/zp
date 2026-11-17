@@ -10,6 +10,7 @@ use gpui::{
     IntoElement, Render, Rgba, SharedString, UniformListScrollHandle, Window, div, prelude::*, px,
     uniform_list,
 };
+use zp_core::changes::RevertStatus;
 use zp_core::diff::{DEFAULT_CONTEXT, DiffLine, FileDiff, LineKind, SideLine, SplitRow};
 
 use crate::actions::{CloseDiff, NextDiffFile, PreviousDiffFile, ToggleDiffLayout};
@@ -33,6 +34,7 @@ pub struct DiffItem {
     pub before: Option<Arc<str>>,
     /// `None`: the file was deleted.
     pub after: Option<Arc<str>>,
+    pub status: RevertStatus,
     /// Offered as "Revert" when set.
     pub revert: Option<RevertFn>,
 }
@@ -304,8 +306,64 @@ impl DiffView {
     fn revert(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(revert) = self.item().and_then(|item| item.revert.clone()) {
             revert(window, cx);
-            cx.emit(DiffViewEvent::Close);
         }
+    }
+
+    fn render_files(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let colors = cx.theme().colors.clone();
+        div()
+            .id("diff-files")
+            .flex_shrink_0()
+            .max_h(px(120.))
+            .overflow_y_scroll()
+            .border_b_1()
+            .border_color(colors.border)
+            .bg(colors.surface)
+            .child(
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .children(self.items.iter().enumerate().map(|(index, item)| {
+                        let selected = index == self.index;
+                        div()
+                            .id(("diff-file", index))
+                            .debug_selector(move || format!("diff-file-{index}"))
+                            .w(px(220.))
+                            .max_w_full()
+                            .min_w_0()
+                            .px_3()
+                            .py_2()
+                            .border_b_2()
+                            .border_color(if selected {
+                                colors.accent
+                            } else {
+                                colors.accent.opacity(0.)
+                            })
+                            .text_size(px(12.))
+                            .text_color(if selected {
+                                colors.text
+                            } else {
+                                colors.text_muted
+                            })
+                            .when(selected, |tab| tab.bg(colors.surface_hover))
+                            .cursor_pointer()
+                            .hover_style(|tab| tab.bg(colors.surface_hover).text_color(colors.text))
+                            .tooltip(crate::ui::tooltip(item.display.clone()))
+                            .child(div().truncate().child(item.display.clone()))
+                            .when_some(item.status.label(), |tab, label| {
+                                tab.child(
+                                    div()
+                                        .text_size(px(11.))
+                                        .text_color(colors.text_muted)
+                                        .child(label),
+                                )
+                            })
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.show(index);
+                                cx.notify();
+                            }))
+                    })),
+            )
     }
 
     fn render_header(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -314,6 +372,8 @@ impl DiffView {
         let button = |id: &'static str, label: String, active: bool| {
             div()
                 .id(id)
+                .flex_shrink_0()
+                .whitespace_nowrap()
                 .px_2()
                 .py_0p5()
                 .rounded(px(4.))
@@ -353,13 +413,16 @@ impl DiffView {
                     .gap_2()
                     .child(
                         div()
+                            .min_w_0()
                             .truncate()
                             .font_weight(FontWeight::SEMIBOLD)
                             .child(item.map(|i| i.display.clone()).unwrap_or_default()),
                     )
                     .child(
                         div()
-                            .flex_shrink_0()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
                             .text_size(px(12.))
                             .text_color(colors.text_muted)
                             .child(item.map(|i| i.caption.clone()).unwrap_or_default()),
@@ -371,6 +434,19 @@ impl DiffView {
                     .text_size(px(12.))
                     .text_color(colors.text_muted)
                     .child(stats),
+            )
+            .when_some(
+                item.and_then(|item| item.status.label()),
+                |header, label| {
+                    header.child(
+                        div()
+                            .debug_selector(|| "diff-revert-status".into())
+                            .flex_shrink_0()
+                            .text_size(px(12.))
+                            .text_color(colors.text_muted)
+                            .child(label),
+                    )
+                },
             )
             .when(self.items.len() > 1, |this| {
                 this.child(
@@ -420,6 +496,7 @@ impl DiffView {
             .when(item.is_some_and(|i| i.revert.is_some()), |this| {
                 this.child(
                     button("diff-revert", "Revert".into(), false)
+                        .debug_selector(|| "diff-revert".into())
                         .text_color(colors.error)
                         .on_click(cx.listener(|this, _, window, cx| this.revert(window, cx))),
                 )
@@ -486,6 +563,9 @@ impl Render for DiffView {
             .flex_col()
             .bg(colors.background)
             .child(self.render_header(cx))
+            .when(self.items.len() > 1, |view| {
+                view.child(self.render_files(cx))
+            })
             .child(div().flex_1().min_h_0().child(body))
     }
 }

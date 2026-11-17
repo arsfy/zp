@@ -14,7 +14,7 @@ use zp_agent::{
 use zp_ai::{Message, Model, Models, StopReason, StreamOptions, ThinkingLevel, Usage, UserContent};
 use zp_session::{COMPACTION_SUMMARY_TYPE, Session};
 
-use crate::changes::{ChangeLog, restore_message};
+use crate::changes::{ChangeLog, RestoreSource, restore_message_with_sources};
 use crate::checkpoint::{BlobStore, RecordedChange, store_tool_change};
 use crate::compaction::CompactionSettings;
 use crate::permissions::PermissionGate;
@@ -376,13 +376,19 @@ impl CodingSession {
 
     /// The file changes along the current branch.
     pub fn change_log(&self) -> ChangeLog {
-        ChangeLog::from_path(&self.session().branch_path(None))
+        let mut log = ChangeLog::from_path(&self.session().branch_path(None));
+        log.resolve_reverts(Some(&self.blobs));
+        log
     }
 
     /// The file changes along the branch ending at `leaf` (`None`: before any entry).
     pub fn change_log_at(&self, leaf: Option<&str>) -> ChangeLog {
         match leaf {
-            Some(leaf) => ChangeLog::from_path(&self.session().branch_path(Some(leaf))),
+            Some(leaf) => {
+                let mut log = ChangeLog::from_path(&self.session().branch_path(Some(leaf)));
+                log.resolve_reverts(Some(&self.blobs));
+                log
+            }
             None => ChangeLog::default(),
         }
     }
@@ -393,13 +399,27 @@ impl CodingSession {
         description: &str,
         changes: &[RecordedChange],
     ) -> anyhow::Result<()> {
+        self.record_restore_with_sources(description, changes, &[])
+    }
+
+    pub fn record_restore_with_sources(
+        &self,
+        description: &str,
+        changes: &[RecordedChange],
+        sources: &[RestoreSource],
+    ) -> anyhow::Result<()> {
         if changes.is_empty() {
             return Ok(());
         }
         if self.agent.is_streaming() {
             bail!("cannot record a restore while the agent is running");
         }
-        let message = AgentMessage::Custom(restore_message(description, changes, &self.cwd));
+        let message = AgentMessage::Custom(restore_message_with_sources(
+            description,
+            changes,
+            sources,
+            &self.cwd,
+        ));
         let messages = {
             let mut session = self.session();
             session.append_message(message)?;

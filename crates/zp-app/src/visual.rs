@@ -110,6 +110,11 @@ pub fn run(out: PathBuf) {
         models.set_provider(Arc::new(faux.clone()));
         AppModels::set(models, false, cx);
     });
+    if std::env::var("ZP_VISUAL_SCENE").as_deref() == Ok("turn-changes") {
+        turn_change_footers(&mut cx, &out);
+        println!("turn change screenshots written to {}", out.display());
+        return;
+    }
     if std::env::var("ZP_VISUAL_SCENE").as_deref() == Ok("terminal") {
         terminal_interactions(&mut cx, &root, &out);
         println!("terminal screenshots written to {}", out.display());
@@ -274,6 +279,126 @@ pub fn run(out: PathBuf) {
 
 fn data_dir_of(data: &tempfile::TempDir) -> PathBuf {
     data.path().to_path_buf()
+}
+
+fn turn_change_footers(cx: &mut VisualTestAppContext, out: &std::path::Path) {
+    cx.update(|cx| cx.set_prompt_builder(gpui::fallback_prompt_renderer));
+    for (width, suffix) in [(1100., ""), (700., "-narrow")] {
+        let project = tempfile::tempdir().unwrap();
+        let root = zp_core::project::normalize_project_path(project.path()).unwrap();
+        let original = "pub fn sum(a: i32, b: i32) -> i32 {\n    a - b\n}\n";
+        std::fs::write(root.join("math.rs"), original).unwrap();
+        let faux = FauxProvider::default();
+        faux.push(FauxResponse::tool_call(
+            "edit",
+            json!({"path": "math.rs", "edits": [{"oldText": "a - b", "newText": "a + b"}]}),
+        ));
+        faux.push(FauxResponse::tool_call("write", json!({"path": "tests/sum.rs", "content": "#[test]\nfn sums_numbers() {\n    assert_eq!(sum(2, 3), 5);\n}\n"})));
+        faux.push(FauxResponse::tool_call(
+            "write",
+            json!({"path": "README.md", "content": "Sum calculation with a regression test.\n"}),
+        ));
+        faux.push(FauxResponse::text(
+            "Updated `sum` and added a regression test.",
+        ));
+        cx.update(|cx| {
+            let mut models = Models::new();
+            models.set_provider(Arc::new(faux.clone()));
+            AppModels::set(models, false, cx);
+        });
+        let window = cx
+            .open_offscreen_window(size(px(width), px(760.)), |window, cx| {
+                cx.new(|cx| ProjectWindow::new(root.clone(), window, cx))
+            })
+            .unwrap();
+        pump(cx, Duration::from_millis(200));
+        cx.simulate_input(window.into(), "Fix the sum calculation and add a test.");
+        cx.dispatch_action(window.into(), SendMessage);
+        pump(cx, Duration::from_millis(1800));
+        let conversation = cx.update(|cx| {
+            window
+                .read(cx)
+                .unwrap()
+                .active_conversation()
+                .unwrap()
+                .clone()
+        });
+        let summary = cx.update(|cx| {
+            conversation
+                .read(cx)
+                .turn_changes_for_row(4)
+                .expect("completed turn footer")
+        });
+        assert_eq!((summary.files, summary.added, summary.removed), (3, 6, 1));
+        cx.capture_screenshot(window.into())
+            .unwrap()
+            .save(out.join(format!("42-turn-changes{suffix}.png")))
+            .unwrap();
+        window
+            .update(cx, |project, window, cx| {
+                let items = conversation.update(cx, |view, cx| {
+                    view.diff_items(zp_core::changes::Scope::Group(summary.group), cx)
+                });
+                assert_eq!(items.len(), 3);
+                project.open_diff(items, 0, window, cx);
+            })
+            .unwrap();
+        pump(cx, Duration::from_millis(100));
+        cx.capture_screenshot(window.into())
+            .unwrap()
+            .save(out.join(format!("43-turn-diff{suffix}.png")))
+            .unwrap();
+        cx.dispatch_action(window.into(), crate::actions::CloseDiff);
+        window
+            .update(cx, |_, window, cx| {
+                conversation.update(cx, |view, cx| {
+                    view.revert(
+                        zp_core::changes::Scope::Group(summary.group),
+                        None,
+                        window,
+                        cx,
+                    )
+                })
+            })
+            .unwrap();
+        pump(cx, Duration::from_millis(100));
+        cx.capture_screenshot(window.into())
+            .unwrap()
+            .save(out.join(format!("45-turn-revert-confirm{suffix}.png")))
+            .unwrap();
+        cx.simulate_click(
+            window.into(),
+            point(px(width / 2.), px(440.)),
+            Modifiers::none(),
+        );
+        pump(cx, Duration::from_millis(100));
+        assert_eq!(
+            std::fs::read_to_string(root.join("math.rs")).unwrap(),
+            original
+        );
+        assert!(!root.join("tests/sum.rs").exists());
+        assert!(!root.join("README.md").exists());
+        cx.capture_screenshot(window.into())
+            .unwrap()
+            .save(out.join(format!("44-turn-reverted{suffix}.png")))
+            .unwrap();
+        window
+            .update(cx, |project, window, cx| {
+                let items = conversation.update(cx, |view, cx| {
+                    view.diff_items(zp_core::changes::Scope::Group(summary.group), cx)
+                });
+                assert!(items.iter().all(|item| item.status
+                    == zp_core::changes::RevertStatus::Reverted
+                    && item.revert.is_none()));
+                project.open_diff(items, 0, window, cx);
+            })
+            .unwrap();
+        pump(cx, Duration::from_millis(100));
+        cx.capture_screenshot(window.into())
+            .unwrap()
+            .save(out.join(format!("46-reverted-diff{suffix}.png")))
+            .unwrap();
+    }
 }
 
 fn terminal_interactions(

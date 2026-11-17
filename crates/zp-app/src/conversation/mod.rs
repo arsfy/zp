@@ -58,8 +58,10 @@ pub enum ConversationEvent {
     Forked(SessionHandoff),
     /// Files were changed (by a tool or a restore), or another branch is shown.
     FilesChanged,
+    /// A user-confirmed restore finished; a diff can return to the conversation.
+    FilesRestored,
     /// The user asked for the full diff of a change.
-    OpenDiff(DiffItem),
+    OpenDiff(Vec<DiffItem>),
     /// The user picked a permission mode (for the whole project).
     PermissionModeChanged(zp_core::permissions::PermissionMode),
     /// A `/` command the window handles.
@@ -147,6 +149,9 @@ pub struct ConversationView {
     markdown_cache: RefCell<HashMap<u64, Rc<Vec<Block>>>>,
     /// Diffs of tool calls, by call id.
     tool_diffs: RefCell<HashMap<String, Rc<Result<files::ToolDiff, String>>>>,
+    /// Net file statistics for completed answers, by transcript row.
+    turn_changes: RefCell<HashMap<usize, Option<files::TurnChanges>>>,
+    change_log_cache: RefCell<Option<zp_core::changes::ChangeLog>>,
     /// Tool calls waiting for the user.
     approvals: Vec<permissions::Approval>,
     /// The sent message being edited, if any.
@@ -248,6 +253,8 @@ impl ConversationView {
             tool_expanded: HashMap::new(),
             markdown_cache: RefCell::default(),
             tool_diffs: RefCell::default(),
+            turn_changes: RefCell::default(),
+            change_log_cache: RefCell::default(),
             approvals: Vec::new(),
             editing: None,
             composer_height: Rc::default(),
@@ -356,6 +363,8 @@ impl ConversationView {
         });
 
         self.text_selection.clear();
+        self.turn_changes.borrow_mut().clear();
+        self.change_log_cache.borrow_mut().take();
         self.transcript = Transcript::from_messages(&coding.agent().messages());
         // One more item at the end: room for the floating composer.
         self.list_state = ListState::new(self.transcript.len() + 1, ListAlignment::Top, px(1000.));
@@ -393,6 +402,8 @@ impl ConversationView {
             matches!(event, AgentEvent::ToolExecutionEnd { result, .. } if result.details.is_some())
         });
         if files_changed {
+            self.turn_changes.borrow_mut().clear();
+            self.change_log_cache.borrow_mut().take();
             cx.emit(ConversationEvent::FilesChanged);
         }
         if changes.finished && self.running {
@@ -484,6 +495,8 @@ impl ConversationView {
     /// Rebuilds the rows from the agent's transcript (after retry or branch changes).
     fn reload_transcript(&mut self) {
         self.text_selection.clear();
+        self.turn_changes.borrow_mut().clear();
+        self.change_log_cache.borrow_mut().take();
         if let Some(coding) = &self.coding {
             self.transcript = Transcript::from_messages(&coding.agent().messages());
             self.editing = None;
@@ -686,11 +699,34 @@ impl ConversationView {
     }
 
     /// Shows the branch ending at `leaf` (when restoring a tab).
-    pub fn restore_leaf(&mut self, leaf: &str, cx: &mut Context<Self>) {
-        if let Some(coding) = &self.coding
-            && coding.session().entry(leaf).is_some()
-            && coding.branch(leaf).is_ok()
-        {
+    pub fn restore_leaf(&mut self, leaf: &str, recover_restores: bool, cx: &mut Context<Self>) {
+        let Some(coding) = &self.coding else {
+            return;
+        };
+        let leaf = {
+            let session = coding.session();
+            if session.entry(leaf).is_none() {
+                return;
+            }
+            let mut leaf = leaf.to_owned();
+            // Older tab state stopped before restores appended to the session file.
+            if recover_restores {
+                loop {
+                    let children = session.children(&leaf);
+                    let [next] = children.as_slice() else {
+                        break;
+                    };
+                    if !matches!(next.message(), Some(zp_agent::AgentMessage::Custom(message))
+                        if message.custom_type == zp_core::changes::FILE_RESTORE_TYPE)
+                    {
+                        break;
+                    }
+                    leaf = next.id.clone();
+                }
+            }
+            leaf
+        };
+        if coding.branch(&leaf).is_ok() {
             self.reload_transcript();
             cx.notify();
         }
@@ -1165,6 +1201,8 @@ impl ConversationView {
     /// Marks the run as over once its last event has been shown.
     fn finish_run(&mut self, cx: &mut Context<Self>) {
         self.running = false;
+        self.turn_changes.borrow_mut().clear();
+        self.change_log_cache.borrow_mut().take();
         self.refresh_last_row();
         self.clear_approvals();
         self.invalidate_files();

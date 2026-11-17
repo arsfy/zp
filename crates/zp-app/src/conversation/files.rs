@@ -6,11 +6,12 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use gpui::{App, Context, PromptLevel, Task, Window};
-use zp_core::changes::{ChangeLog, GroupKind, Scope};
+use zp_core::changes::{ChangeLog, GroupKind, RestoreSource, RevertStatus, Scope};
 use zp_core::checkpoint::{BlobStore, RecordedChange};
 use zp_core::diff::{DEFAULT_CONTEXT, FileDiff};
 use zp_core::restore::{FileTarget, Outcome, RestorePlan};
 
+use super::transcript::{Row, ToolStatus};
 use super::{ConversationEvent, ConversationView};
 use crate::diff_view::{DiffItem, UnifiedRow, unified_rows};
 
@@ -18,6 +19,20 @@ use crate::diff_view::{DiffItem, UnifiedRow, unified_rows};
 pub struct ToolDiff {
     pub diff: FileDiff,
     pub rows: Vec<UnifiedRow>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct TurnChanges {
+    pub group: usize,
+    pub files: usize,
+    pub added: usize,
+    pub removed: usize,
+    pub status: RevertStatus,
+}
+
+pub(super) struct RestoreRecord {
+    description: String,
+    sources: Vec<RestoreSource>,
 }
 
 /// What a branch change does after the files are dealt with.
@@ -32,10 +47,70 @@ impl ConversationView {
 
     /// The file changes along the shown branch.
     pub fn change_log(&self) -> ChangeLog {
-        self.coding
+        if let Some(log) = self.change_log_cache.borrow().as_ref() {
+            return log.clone();
+        }
+        let log = self
+            .coding
             .as_ref()
             .map(|coding| coding.change_log())
-            .unwrap_or_default()
+            .unwrap_or_default();
+        self.change_log_cache.borrow_mut().replace(log.clone());
+        log
+    }
+
+    /// Net changes for the answer ending at `row`, cached to avoid reading blobs on repaint.
+    pub(crate) fn turn_changes_for_row(&self, row: usize) -> Option<TurnChanges> {
+        if !matches!(self.transcript.rows().get(row), Some(Row::Assistant { .. }))
+            || matches!(
+                self.transcript.rows().get(row + 1),
+                Some(Row::Assistant { .. })
+            )
+            || (self.is_busy() && row + 1 == self.transcript.len())
+        {
+            return None;
+        }
+        if let Some(changes) = self.turn_changes.borrow().get(&row) {
+            return *changes;
+        }
+        let changes = self.compute_turn_changes(row);
+        self.turn_changes.borrow_mut().insert(row, changes);
+        changes
+    }
+
+    fn compute_turn_changes(&self, row: usize) -> Option<TurnChanges> {
+        let user_row = self.transcript.rows()[..=row]
+            .iter()
+            .rposition(|row| matches!(row, Row::User { .. }))?;
+        let entry = self.entry_for_row(user_row)?;
+        let log = self.change_log();
+        let group = log
+            .groups
+            .iter()
+            .position(|group| group.entry_id.as_deref() == Some(&entry))?;
+        let files = log.files(Scope::Group(group));
+        let blobs = self.blobs()?;
+        let mut changes = TurnChanges {
+            group,
+            files: 0,
+            added: 0,
+            removed: 0,
+            status: log.revert_status(Scope::Group(group), None),
+        };
+        for file in files.into_iter().filter(|file| !file.is_unchanged()) {
+            let (added, removed) = match file.stats {
+                Some(stats) => stats,
+                None => {
+                    let before = file.start.load(&blobs).ok()?;
+                    let after = file.end.load(&blobs).ok()?;
+                    zp_core::diff::line_stats(before.as_deref(), after.as_deref())
+                }
+            };
+            changes.files += 1;
+            changes.added += added;
+            changes.removed += removed;
+        }
+        (changes.files > 0).then_some(changes)
     }
 
     /// `path` relative to the project, for display.
@@ -76,16 +151,78 @@ impl ConversationView {
         &self,
         call_id: &str,
         change: &RecordedChange,
+        cx: &Context<Self>,
     ) -> Option<DiffItem> {
         let (before, after) = load_pair(self.blobs().as_ref(), change).ok()?;
+        let this = cx.entity().downgrade();
+        let id = call_id.to_owned();
+        let reverted = self.change_log().tool_reverted(call_id);
         Some(DiffItem {
             display: self.display_path(&change.path),
             path: change.path.clone(),
             caption: format!("Change by tool call {}", short_id(call_id)),
             before,
             after,
-            revert: None,
+            status: if reverted {
+                RevertStatus::Reverted
+            } else {
+                RevertStatus::Active
+            },
+            revert: (!self.is_busy() && !reverted && !change.before.same_as(&change.after)).then(
+                || {
+                    Rc::new(move |window: &mut Window, cx: &mut App| {
+                        let _ = this.update(cx, |view, cx| view.revert_tool_call(&id, window, cx));
+                    }) as crate::diff_view::RevertFn
+                },
+            ),
         })
+    }
+
+    /// Reverts one tool call, preserving subsequent non-conflicting edits to the file.
+    pub(crate) fn revert_tool_call(
+        &mut self,
+        call_id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let log = self.change_log();
+        if log.tool_reverted(call_id) {
+            return;
+        }
+        let Some(change) = self
+            .transcript
+            .tool(call_id)
+            .filter(|state| state.status == ToolStatus::Done)
+            .and_then(|state| state.details.as_ref())
+            .and_then(RecordedChange::from_details)
+        else {
+            return;
+        };
+        let description = format!("Reverted edit to {}", self.display_path(&change.path));
+        let target = FileTarget {
+            path: change.path,
+            expected: change.after,
+            target: change.before,
+        };
+        let sources = log
+            .groups
+            .iter()
+            .flat_map(|group| &group.changes)
+            .filter(|record| record.tool_call_id.as_deref() == Some(call_id))
+            .map(|record| RestoreSource {
+                entry_id: record.entry_id.clone(),
+                path: record.change.path.clone(),
+            })
+            .collect();
+        self.run_restore(
+            vec![target],
+            RestoreRecord {
+                description,
+                sources,
+            },
+            window,
+            cx,
+        );
     }
 
     /// Diffs of the files changed in `scope`, each offering a revert.
@@ -111,17 +248,21 @@ impl ConversationView {
                 let after = file.end.load(&blobs).ok()?;
                 let this = this.clone();
                 let path = file.path.clone();
+                let status = log.revert_status(scope, Some(&path));
                 Some(DiffItem {
                     display: self.display_path(&file.path),
                     path: file.path,
                     caption: caption.clone(),
                     before,
                     after,
-                    revert: Some(Rc::new(move |window: &mut Window, cx: &mut App| {
-                        let path = path.clone();
-                        let _ =
-                            this.update(cx, |view, cx| view.revert(scope, Some(path), window, cx));
-                    })),
+                    status,
+                    revert: (status != RevertStatus::Reverted).then(|| {
+                        Rc::new(move |window: &mut Window, cx: &mut App| {
+                            let path = path.clone();
+                            let _ = this
+                                .update(cx, |view, cx| view.revert(scope, Some(path), window, cx));
+                        }) as crate::diff_view::RevertFn
+                    }),
                 })
             })
             .collect()
@@ -152,7 +293,16 @@ impl ConversationView {
                 None => return,
             },
         };
-        self.run_restore(targets, Some(description), window, cx);
+        let sources = log.revert_sources(scope, path.as_deref());
+        self.run_restore(
+            targets,
+            RestoreRecord {
+                description,
+                sources,
+            },
+            window,
+            cx,
+        );
     }
 
     /// Restores every file changed in group `index` or later to its state before it.
@@ -168,18 +318,61 @@ impl ConversationView {
         };
         let description = format!("Restored the checkpoint before turn {}", group.turn.max(1));
         let targets = log.checkpoint_targets(index);
-        self.run_restore(targets, Some(description), window, cx);
+        let sources = (index..log.groups.len())
+            .flat_map(|index| log.revert_sources(Scope::Group(index), None))
+            .collect();
+        self.run_restore(
+            targets,
+            RestoreRecord {
+                description,
+                sources,
+            },
+            window,
+            cx,
+        );
     }
 
     fn run_restore(
         &mut self,
         targets: Vec<FileTarget>,
-        record: Option<String>,
+        record: RestoreRecord,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let task = self.restore_files(targets, record, window, cx);
-        cx.spawn(async move |this, cx| {
+        if targets.is_empty() || self.is_busy() || self.coding.is_none() {
+            return;
+        }
+        let files = targets
+            .iter()
+            .map(|target| {
+                let path = self.display_path(&target.path);
+                if target.target.is_absent() {
+                    format!("{path} (delete)")
+                } else {
+                    path
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let answer = window.prompt(
+            PromptLevel::Warning,
+            "Revert these changes?",
+            Some(&format!(
+                "Restore the saved versions of {} file(s):\n\n{files}",
+                targets.len()
+            )),
+            &["Revert", "Cancel"],
+            cx,
+        );
+        cx.spawn_in(window, async move |this, cx| {
+            if answer.await != Ok(0) {
+                return;
+            }
+            let Ok(task) = this.update_in(cx, |this, window, cx| {
+                this.restore_files(targets, Some(record), window, cx)
+            }) else {
+                return;
+            };
             if let Err(error) = task.await {
                 let _ = this.update(cx, |this, cx| this.report(Err(error), cx));
             }
@@ -193,7 +386,7 @@ impl ConversationView {
     pub(super) fn restore_files(
         &mut self,
         targets: Vec<FileTarget>,
-        record: Option<String>,
+        record: Option<RestoreRecord>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Task<anyhow::Result<bool>> {
@@ -242,9 +435,16 @@ impl ConversationView {
             };
             let changes = plan.apply(overwrite, &blobs)?;
             this.update(cx, |this, cx| {
-                if let Some(description) = record {
-                    coding.record_restore(&description, &changes)?;
+                if let Some(record) = record {
+                    coding.record_restore_with_sources(
+                        &record.description,
+                        &changes,
+                        &record.sources,
+                    )?;
                     this.reload_transcript();
+                    if !changes.is_empty() {
+                        cx.emit(ConversationEvent::FilesRestored);
+                    }
                 }
                 cx.emit(ConversationEvent::FilesChanged);
                 cx.notify();

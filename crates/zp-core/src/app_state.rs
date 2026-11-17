@@ -120,6 +120,9 @@ pub struct ProjectUiState {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct TabState {
+    /// The saved leaf includes file restores (older builds saved the preceding entry).
+    #[serde(default)]
+    pub leaf_includes_restores: bool,
     /// Session file; `None` for a chat that had no messages yet.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session: Option<PathBuf>,

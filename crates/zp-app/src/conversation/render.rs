@@ -10,6 +10,7 @@ use gpui::{
 };
 use gpui_elements::editable_text::{text_area, text_input};
 use zp_ai::{AssistantContent, StopReason, ToolCall};
+use zp_core::changes::{RevertStatus, Scope};
 use zp_core::checkpoint::RecordedChange;
 
 use super::permissions::permission_mode_color;
@@ -78,6 +79,7 @@ const ICON_CHECK: &[u8] = include_bytes!("../../../../assets/icons/check.svg");
 const ICON_EDIT: &[u8] = include_bytes!("../../../../assets/icons/pencil.svg");
 const ICON_BRANCH: &[u8] = include_bytes!("../../../../assets/icons/git-branch.svg");
 const ICON_FORK: &[u8] = include_bytes!("../../../../assets/icons/square-arrow-out-up-right.svg");
+const ICON_REVERT: &[u8] = include_bytes!("../../../../assets/icons/undo-2.svg");
 
 /// A small square button showing an icon, with a tooltip.
 fn icon_button(
@@ -218,7 +220,13 @@ impl ConversationView {
                     .text_size(px(12.))
                     .text_color(colors.text_muted)
                     .child(div().text_color(colors.warning).child("↺"))
-                    .child(text.clone())
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .whitespace_normal()
+                            .child(text.clone()),
+                    )
                     .into_any_element()
             }
             Some(Row::Notice { kind, text, .. }) => {
@@ -244,7 +252,8 @@ impl ConversationView {
                 .flex_col()
                 .gap_1()
                 .child(content)
-                .children(footer),
+                .children(footer)
+                .children(self.render_turn_changes(ix, cx)),
         )
         .into_any_element()
     }
@@ -254,6 +263,105 @@ impl ConversationView {
         !matches!(
             self.transcript.rows().get(ix + 1),
             Some(Row::Assistant { .. })
+        )
+    }
+
+    fn render_turn_changes(&self, row: usize, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let changes = self.turn_changes_for_row(row)?;
+        let colors = cx.theme().colors.clone();
+        let scope = Scope::Group(changes.group);
+        let count = if changes.files == 1 {
+            "1 file changed".to_owned()
+        } else {
+            format!("{} files changed", changes.files)
+        };
+        let busy = self.is_busy();
+        Some(
+            div()
+                .id(id("turn-changes", row))
+                .debug_selector(|| "turn-changes-summary".into())
+                .mt_2()
+                .flex()
+                .items_center()
+                .rounded(px(6.))
+                .border_1()
+                .border_color(colors.border)
+                .bg(colors.surface)
+                .overflow_hidden()
+                .child(
+                    div()
+                        .id(id("turn-changes-open", row))
+                        .debug_selector(|| "turn-changes-open".into())
+                        .flex_1()
+                        .min_w_0()
+                        .min_h(px(38.))
+                        .flex()
+                        .flex_wrap()
+                        .items_center()
+                        .gap_2()
+                        .px_3()
+                        .py_2()
+                        .cursor_pointer()
+                        .hover_style(|style| style.bg(colors.surface_hover))
+                        .tooltip(crate::ui::tooltip("View changes in this turn"))
+                        .text_size(px(12.))
+                        .child(div().text_color(colors.text).child(count))
+                        .child(
+                            div()
+                                .flex()
+                                .gap_2()
+                                .font_family(cx.theme().metrics.mono_font.clone())
+                                .child(
+                                    div()
+                                        .text_color(colors.success)
+                                        .child(format!("+{}", changes.added)),
+                                )
+                                .child(
+                                    div()
+                                        .text_color(colors.error)
+                                        .child(format!("-{}", changes.removed)),
+                                ),
+                        )
+                        .when_some(changes.status.label(), |summary, label| {
+                            summary.child(
+                                div()
+                                    .debug_selector(|| "turn-changes-revert-status".into())
+                                    .text_color(colors.text_muted)
+                                    .child(label),
+                            )
+                        })
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            let items = this.diff_items(scope, cx);
+                            if !items.is_empty() {
+                                cx.emit(ConversationEvent::OpenDiff(items));
+                            }
+                        })),
+                )
+                .when(changes.status != RevertStatus::Reverted, |summary| {
+                    summary.child(
+                        div().px_2().flex_shrink_0().child(
+                            icon_button(
+                                id("turn-changes-revert", row),
+                                ICON_REVERT,
+                                "Revert all changes in this turn",
+                                cx,
+                            )
+                            .debug_selector(|| "turn-changes-revert".into())
+                            .when(busy, |button| {
+                                button.opacity(0.4).cursor(gpui::CursorStyle::Arrow)
+                            })
+                            .on_click(cx.listener(
+                                move |this, _, window, cx| {
+                                    cx.stop_propagation();
+                                    if !this.is_busy() {
+                                        this.revert(scope, None, window, cx);
+                                    }
+                                },
+                            )),
+                        ),
+                    )
+                })
+                .into_any_element(),
         )
     }
 
@@ -583,6 +691,7 @@ impl ConversationView {
             .filter(|state| state.status == ToolStatus::Done)
             .and_then(|state| state.details.as_ref())
             .and_then(RecordedChange::from_details);
+        let reverted = change.is_some() && self.change_log().tool_reverted(&call.id);
         // File changes show their diff by default.
         let default_expanded = matches!(status, Some(ToolStatus::Error))
             || change.is_some()
@@ -644,6 +753,44 @@ impl ConversationView {
                     .text_size(px(12.))
                     .text_color(status_color)
                     .child(status_text),
+            )
+            .when(reverted, |header| {
+                header.child(
+                    div()
+                        .debug_selector(|| "tool-reverted".into())
+                        .flex_shrink_0()
+                        .text_size(px(12.))
+                        .text_color(colors.text_muted)
+                        .child("Reverted"),
+                )
+            })
+            .when_some(
+                change
+                    .as_ref()
+                    .filter(|change| !reverted && !change.before.same_as(&change.after)),
+                |header, _| {
+                    let call_id = call.id.clone();
+                    header.child(
+                        icon_button(
+                            ElementId::Name(format!("revert-tool-{call_id}").into()),
+                            ICON_REVERT,
+                            "Revert this edit",
+                            cx,
+                        )
+                        .debug_selector(|| "tool-revert".into())
+                        .when(self.is_busy(), |button| {
+                            button.opacity(0.4).cursor(gpui::CursorStyle::Arrow)
+                        })
+                        .on_click(cx.listener(
+                            move |this, _, window, cx| {
+                                cx.stop_propagation();
+                                if !this.is_busy() {
+                                    this.revert_tool_call(&call_id, window, cx);
+                                }
+                            },
+                        )),
+                    )
+                },
             )
             .on_click(
                 cx.listener(move |this, _, _, cx| this.toggle_tool(&call_id, row, expanded, cx)),
@@ -753,8 +900,8 @@ impl ConversationView {
                         .hover_style(|s| s.bg(colors.surface_hover).text_color(colors.text))
                         .child("Open diff")
                         .on_click(cx.listener(move |this, _, _, cx| {
-                            if let Some(item) = this.tool_diff_item(&call_id, &change) {
-                                cx.emit(ConversationEvent::OpenDiff(item));
+                            if let Some(item) = this.tool_diff_item(&call_id, &change, cx) {
+                                cx.emit(ConversationEvent::OpenDiff(vec![item]));
                             }
                         })),
                 )

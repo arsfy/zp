@@ -142,6 +142,13 @@ impl ProjectWindow {
                         }
                     }
                     ConversationEvent::FilesChanged => {}
+                    ConversationEvent::FilesRestored => {
+                        if index == this.active {
+                            this.close_diff(window, cx);
+                        }
+                        this.save_tabs(cx);
+                        this.load_sessions(cx);
+                    }
                     ConversationEvent::ApprovalRequested(summary) => {
                         let body = format!("Needs approval: {}", zp_tools::shorten(summary, 120));
                         this.notify_background(conversation, body, window, cx);
@@ -160,8 +167,8 @@ impl ProjectWindow {
                             WindowCommand::Reload => this.reload_resources(cx),
                         }
                     }
-                    ConversationEvent::OpenDiff(item) => {
-                        this.open_diff(vec![item.clone()], 0, window, cx)
+                    ConversationEvent::OpenDiff(items) => {
+                        this.open_diff(items.clone(), 0, window, cx)
                     }
                 }
                 cx.notify();
@@ -420,6 +427,7 @@ impl ProjectWindow {
             .map(|tab| {
                 let view = tab.conversation.read(cx);
                 TabState {
+                    leaf_includes_restores: true,
                     session: view.session_file(),
                     leaf: view.leaf_id(),
                     pinned: tab.pinned,
@@ -462,8 +470,9 @@ impl ProjectWindow {
             let mut tab = self.make_tab(session, false, window, cx);
             tab.pinned = state.pinned;
             if let Some(leaf) = &state.leaf {
-                tab.conversation
-                    .update(cx, |view, cx| view.restore_leaf(leaf, cx));
+                tab.conversation.update(cx, |view, cx| {
+                    view.restore_leaf(leaf, !state.leaf_includes_restores, cx)
+                });
             }
             self.tabs.push(tab);
         }
