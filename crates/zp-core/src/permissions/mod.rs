@@ -27,7 +27,7 @@ pub enum PermissionMode {
     /// Read-only commands run automatically; other commands and file changes need approval.
     #[default]
     Ask,
-    /// File changes, non-destructive Git operations and echo writes run automatically.
+    /// File changes, Python, non-destructive Git operations and echo writes run automatically.
     AutoEdit,
     /// Like `AutoEdit`, but a review model approves safe commands; destructive ones still
     /// need the user.
@@ -354,7 +354,7 @@ impl PermissionPolicy {
                         self.mode,
                         PermissionMode::AutoEdit | PermissionMode::AutoReview
                     ) {
-                        allowed.extend(["git".to_owned(), "echo".to_owned()]);
+                        allowed.extend(["git", "echo", "python", "python3"].map(str::to_owned));
                     }
                     if !shell::all_allowed(command, &allowed) {
                         offer.extend(
@@ -826,6 +826,54 @@ mod tests {
                 let evaluation = policy.evaluate(
                     "bash",
                     &json!({"command": "echo hello > file && cargo test"}),
+                    &grants,
+                );
+                assert!(matches!(
+                    evaluation,
+                    Evaluation::Ask { .. } | Evaluation::Review { .. }
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn python_commands_follow_the_edit_mode_rules() {
+        let dir = tempfile::tempdir().unwrap();
+        let grants = Grants::default();
+        for mode in PermissionMode::ALL {
+            let policy = policy(mode, dir.path());
+            for command in [
+                "python script.py",
+                "python3 script.py --output result.json",
+                "python -c 'print(1)'",
+                "python3 -m unittest",
+                "/usr/bin/python3 script.py",
+                "env PYTHONPATH=src python3 script.py",
+                "cd src && python script.py && python3 -c 'print(2)'",
+            ] {
+                let evaluation = policy.evaluate("bash", &json!({"command": command}), &grants);
+                if mode == PermissionMode::Ask {
+                    assert!(matches!(evaluation, Evaluation::Ask { .. }), "{command}");
+                } else {
+                    assert_eq!(evaluation, Evaluation::Allow, "{mode:?}: {command}");
+                }
+            }
+            if mode != PermissionMode::FullAuto {
+                for command in [
+                    "python3 script.py && git push",
+                    "python script.py; rm -rf .",
+                ] {
+                    let (reasons, offers) =
+                        ask(policy.evaluate("bash", &json!({"command": command}), &grants));
+                    assert!(
+                        matches!(&reasons[..], [AskReason::Dangerous(_)]),
+                        "{mode:?}: {command}"
+                    );
+                    assert!(offers.is_empty());
+                }
+                let evaluation = policy.evaluate(
+                    "bash",
+                    &json!({"command": "python3 script.py && cargo test"}),
                     &grants,
                 );
                 assert!(matches!(
