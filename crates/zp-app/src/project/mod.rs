@@ -305,12 +305,13 @@ impl ProjectWindow {
         let geometry_root = root.clone();
         let release_root = root.clone();
         let search = cx.new(|cx| EditableTextState::new(StringStorage::default(), cx));
-        let changes = cx.new(|_| ChangesPanel::new(root.clone()));
+        let changes = cx.new(|cx| ChangesPanel::new(root.clone(), cx));
         let subscriptions = vec![
             cx.subscribe_in(&changes, window, |this, _, event, window, cx| match event {
                 ChangesPanelEvent::OpenDiff { items, index } => {
                     this.open_diff(items.clone(), *index, window, cx)
                 }
+                ChangesPanelEvent::RepositoryChanged => this.refresh_branch(window, cx),
             }),
             cx.observe_window_appearance(window, |_, window, cx| {
                 if Theme::sync_with_appearance(window.appearance(), cx) {
@@ -382,14 +383,20 @@ impl ProjectWindow {
 
     /// Re-reads the branch (updating the title) and the session list.
     fn refresh(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.refresh_branch(window, cx);
+        self.load_sessions(cx);
+        if self.changes.read(cx).mode() == ChangesMode::Git {
+            self.changes.update(cx, |panel, cx| panel.refresh_git(cx));
+        }
+        cx.notify();
+    }
+
+    /// Re-reads the branch, updating the title.
+    fn refresh_branch(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let branch = zp_core::project::git_branch(&self.root);
         if branch != self.branch || self.branch.is_none() {
             self.branch = branch;
             window.set_window_title(&Self::title_for(&self.root));
-        }
-        self.load_sessions(cx);
-        if self.changes.read(cx).mode() == ChangesMode::Git {
-            self.changes.update(cx, |panel, cx| panel.refresh_git(cx));
         }
         cx.notify();
     }

@@ -843,15 +843,14 @@ fn git_working_tree(cx: &mut TestAppContext) {
         panel.read_with(cx, |panel, _| panel.mode()),
         ChangesMode::Git
     );
-    wait_until(cx, |cx| {
-        panel.read_with(cx, |panel, _| panel.git_files().is_some())
-    });
-    let files: Vec<String> = panel.read_with(cx, |panel, _| {
-        panel
-            .git_files()
+    let git = panel.read_with(cx, |panel, _| panel.git().clone());
+    wait_until(cx, |cx| git.read_with(cx, |git, _| git.status().is_some()));
+    let files: Vec<String> = git.read_with(cx, |git, _| {
+        git.status()
             .unwrap()
+            .files
             .iter()
-            .map(|f| format!("{} {}", f.status.letter(), f.repo_path))
+            .map(|f| format!("{} {}", f.status().letter(), f.repo_path))
             .collect()
     });
     assert_eq!(files, ["M main.rs", "U new.rs"]);
@@ -864,9 +863,10 @@ fn git_working_tree(cx: &mut TestAppContext) {
         click(window, "status-changes", cx);
         assert_eq!(panel.read_with(cx, |panel, _| panel.mode()), mode);
     }
-    let file = panel.read_with(cx, |panel, _| panel.git_files().unwrap()[0].clone());
-    panel.update(cx, |panel, cx| panel.open_git_file(&file, cx));
-    cx.run_until_parked();
+    git.update(cx, |git, cx| git.open_all(cx));
+    wait_until(cx, |cx| {
+        with_window(window, cx, |view, _, _| view.diff_view()).is_some()
+    });
     let diff = with_window(window, cx, |view, _, _| view.diff_view()).unwrap();
     let (caption, added, removed) = diff.read_with(cx, |diff, _| {
         (

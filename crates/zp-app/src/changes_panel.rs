@@ -2,18 +2,17 @@
 //! with revert actions, and the git working tree.
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
 use gpui::{
-    AnyElement, App, Context, Entity, EventEmitter, FontWeight, IntoElement, Render, Rgba,
-    SharedString, Subscription, Task, Window, div, prelude::*, px,
+    AnyElement, App, AppContext as _, Context, Entity, EventEmitter, FontWeight, IntoElement,
+    Render, Rgba, SharedString, Subscription, Window, div, prelude::*, px,
 };
 use zp_core::changes::{ChangeLog, FileSummary, GroupKind, RevertStatus, Scope};
 use zp_core::checkpoint::BlobStore;
-use zp_core::git::{GitFile, GitFileStatus, GitStatus};
 
 use crate::conversation::{ConversationEvent, ConversationView};
 use crate::diff_view::DiffItem;
+use crate::git_panel::{GitPanel, GitPanelEvent};
 use crate::theme::ActiveTheme;
 use crate::ui::tooltip;
 
@@ -24,7 +23,7 @@ pub enum ChangesMode {
     Session,
     /// Changes per turn, with checkpoints.
     Turns,
-    /// The git working tree against `HEAD`.
+    /// The git repository: staging, commits, branches and history.
     Git,
 }
 
@@ -58,20 +57,14 @@ pub struct GroupRow {
     pub files: Vec<FileRow>,
 }
 
-enum GitState {
-    Idle,
-    Loading,
-    NotRepository,
-    Loaded(GitStatus),
-    Failed(String),
-}
-
 /// A row action of the panel.
 type PanelAction = Box<dyn Fn(&mut ChangesPanel, &mut Window, &mut Context<ChangesPanel>)>;
 
 pub enum ChangesPanelEvent {
     /// Show these diffs, starting at `index`.
     OpenDiff { items: Vec<DiffItem>, index: usize },
+    /// The branch or commits changed.
+    RepositoryChanged,
 }
 
 pub struct ChangesPanel {
@@ -80,25 +73,39 @@ pub struct ChangesPanel {
     conversation: Option<Entity<ConversationView>>,
     files: Vec<FileRow>,
     groups: Vec<GroupRow>,
-    git: GitState,
-    git_task: Option<Task<()>>,
+    git: Entity<GitPanel>,
     _events: Option<Subscription>,
+    _git_events: Subscription,
 }
 
 impl EventEmitter<ChangesPanelEvent> for ChangesPanel {}
 
 impl ChangesPanel {
-    pub fn new(root: PathBuf) -> Self {
+    pub fn new(root: PathBuf, cx: &mut Context<Self>) -> Self {
+        let git = cx.new(|cx| GitPanel::new(root.clone(), cx));
+        let git_events = cx.subscribe(&git, |_, _, event: &GitPanelEvent, cx| match event {
+            GitPanelEvent::OpenDiff { items, index } => cx.emit(ChangesPanelEvent::OpenDiff {
+                items: items.clone(),
+                index: *index,
+            }),
+            GitPanelEvent::RepositoryChanged => cx.emit(ChangesPanelEvent::RepositoryChanged),
+        });
         Self {
             root,
             mode: ChangesMode::Git,
             conversation: None,
             files: Vec::new(),
             groups: Vec::new(),
-            git: GitState::Idle,
-            git_task: None,
+            git,
             _events: None,
+            _git_events: git_events,
         }
+    }
+
+    /// The Git view (tests).
+    #[cfg(any(test, feature = "visual-tests"))]
+    pub fn git(&self) -> &Entity<GitPanel> {
+        &self.git
     }
 
     /// Follows `conversation` (the active tab).
@@ -153,15 +160,6 @@ impl ChangesPanel {
     #[cfg(test)]
     pub fn groups(&self) -> &[GroupRow] {
         &self.groups
-    }
-
-    /// Files of the git view (once loaded).
-    #[cfg(test)]
-    pub fn git_files(&self) -> Option<&[GitFile]> {
-        match &self.git {
-            GitState::Loaded(status) => Some(&status.files),
-            _ => None,
-        }
     }
 
     fn display(&self, path: &Path) -> String {
@@ -231,27 +229,9 @@ impl ChangesPanel {
         cx.notify();
     }
 
-    /// Reloads `git status` in the background.
+    /// Reloads the Git view.
     pub fn refresh_git(&mut self, cx: &mut Context<Self>) {
-        if !matches!(self.git, GitState::Loaded(_)) {
-            self.git = GitState::Loading;
-        }
-        let root = self.root.clone();
-        let status = cx
-            .background_executor()
-            .spawn(async move { zp_core::git::status(&root) });
-        self.git_task = Some(cx.spawn(async move |this, cx| {
-            let result = status.await;
-            let _ = this.update(cx, |this, cx| {
-                this.git = match result {
-                    Ok(Some(status)) => GitState::Loaded(status),
-                    Ok(None) => GitState::NotRepository,
-                    Err(error) => GitState::Failed(format!("{error:#}")),
-                };
-                cx.notify();
-            });
-        }));
-        cx.notify();
+        self.git.update(cx, |git, cx| git.refresh(cx));
     }
 
     fn running(&self, cx: &App) -> bool {
@@ -270,35 +250,6 @@ impl ChangesPanel {
         if !items.is_empty() {
             cx.emit(ChangesPanelEvent::OpenDiff { items, index });
         }
-    }
-
-    /// Opens the diff of a working tree file against `HEAD`.
-    pub fn open_git_file(&mut self, file: &GitFile, cx: &mut Context<Self>) {
-        let GitState::Loaded(status) = &self.git else {
-            return;
-        };
-        let head_path = file.renamed_from.as_deref().unwrap_or(&file.repo_path);
-        let before = match zp_core::git::head_content(&status.root, head_path) {
-            Ok(content) => content.map(Arc::from),
-            Err(error) => {
-                crate::workspace::report_error("Could not read HEAD", &error, cx);
-                return;
-            }
-        };
-        let after = std::fs::read_to_string(&file.path).ok().map(Arc::from);
-        let item = DiffItem {
-            display: self.display(&file.path),
-            path: file.path.clone(),
-            caption: "Working tree vs HEAD".into(),
-            before,
-            after,
-            status: RevertStatus::Active,
-            revert: None,
-        };
-        cx.emit(ChangesPanelEvent::OpenDiff {
-            items: vec![item],
-            index: 0,
-        });
     }
 
     pub fn revert(
@@ -614,69 +565,6 @@ impl ChangesPanel {
         }
         list.into_any_element()
     }
-
-    fn render_git(&self, cx: &mut Context<Self>) -> AnyElement {
-        let colors = cx.theme().colors.clone();
-        let status = match &self.git {
-            GitState::Idle | GitState::Loading => return empty("Loading…", cx),
-            GitState::NotRepository => return empty("Not a git repository.", cx),
-            GitState::Failed(error) => return empty(error, cx),
-            GitState::Loaded(status) => status,
-        };
-        let mut list = div().flex().flex_col().child(
-            div()
-                .flex()
-                .items_center()
-                .px_3()
-                .py_1()
-                .text_size(px(12.))
-                .text_color(colors.text_muted)
-                .child(div().flex_1().child(match status.files.len() {
-                    0 => "Working tree clean".to_owned(),
-                    n => format!("{n} changed file(s) vs HEAD"),
-                }))
-                .child(
-                    small_button("git-refresh", "Refresh", colors.text_muted, cx)
-                        .on_click(cx.listener(|this, _, _, cx| this.refresh_git(cx))),
-                ),
-        );
-        for (index, file) in status.files.iter().enumerate() {
-            let (letter, color) = git_badge(file.status, cx);
-            let (name, dir) = split_path(&self.display(&file.path));
-            let open = file.clone();
-            list = list.child(
-                div()
-                    .id(("git-file", index))
-                    .flex()
-                    .items_center()
-                    .gap_1p5()
-                    .px_3()
-                    .py_0p5()
-                    .cursor_pointer()
-                    .hover_style(|s| s.bg(colors.surface_hover))
-                    .on_click(cx.listener(move |this, _, _, cx| this.open_git_file(&open, cx)))
-                    .child(
-                        div()
-                            .w(px(12.))
-                            .flex_shrink_0()
-                            .text_size(px(11.))
-                            .font_weight(FontWeight::BOLD)
-                            .text_color(color)
-                            .child(letter),
-                    )
-                    .child(div().flex_shrink_0().truncate().child(name))
-                    .child(
-                        div()
-                            .min_w_0()
-                            .truncate()
-                            .text_size(px(11.))
-                            .text_color(colors.text_muted)
-                            .child(dir),
-                    ),
-            );
-        }
-        list.into_any_element()
-    }
 }
 
 impl Render for ChangesPanel {
@@ -686,8 +574,10 @@ impl Render for ChangesPanel {
         let body = match self.mode {
             ChangesMode::Session => self.render_session(cx),
             ChangesMode::Turns => self.render_turns(cx),
-            ChangesMode::Git => self.render_git(cx),
+            // The Git view scrolls its file list and keeps its commit box in view.
+            ChangesMode::Git => self.git.clone().into_any_element(),
         };
+        let git = self.mode == ChangesMode::Git;
         div()
             .size_full()
             .flex()
@@ -708,8 +598,8 @@ impl Render for ChangesPanel {
                     .id("changes-list")
                     .flex_1()
                     .min_h_0()
-                    .pb_2()
-                    .overflow_y_scroll()
+                    .when(git, |this| this.flex().flex_col())
+                    .when(!git, |this| this.pb_2().overflow_y_scroll())
                     .child(body),
             )
     }
@@ -763,16 +653,6 @@ fn kind_badge(kind: FileKind, cx: &App) -> (&'static str, Rgba) {
         FileKind::Modified => ("M", colors.warning),
         FileKind::Deleted => ("D", colors.error),
     }
-}
-
-fn git_badge(status: GitFileStatus, cx: &App) -> (&'static str, Rgba) {
-    let colors = &cx.theme().colors;
-    let color = match status {
-        GitFileStatus::Added | GitFileStatus::Untracked => colors.success,
-        GitFileStatus::Deleted | GitFileStatus::Conflicted => colors.error,
-        GitFileStatus::Modified | GitFileStatus::Renamed => colors.warning,
-    };
-    (status.letter(), color)
 }
 
 /// `src/a/b.rs` → (`b.rs`, `src/a`).

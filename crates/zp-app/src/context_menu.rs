@@ -17,6 +17,8 @@ enum Item {
     Action {
         label: SharedString,
         destructive: bool,
+        /// A toggle: whether it is on.
+        checked: Option<bool>,
         handler: Handler,
     },
     Separator,
@@ -56,6 +58,23 @@ impl ContextMenu {
         self.items.push(Item::Action {
             label: label.into(),
             destructive: false,
+            checked: None,
+            handler: Rc::new(handler),
+        });
+        self
+    }
+
+    /// Adds an option that is on or off, drawn with a check mark when on.
+    pub fn toggle_item(
+        mut self,
+        label: impl Into<SharedString>,
+        checked: bool,
+        handler: impl Fn(&mut Window, &mut App) + 'static,
+    ) -> Self {
+        self.items.push(Item::Action {
+            label: label.into(),
+            destructive: false,
+            checked: Some(checked),
             handler: Rc::new(handler),
         });
         self
@@ -70,6 +89,7 @@ impl ContextMenu {
         self.items.push(Item::Action {
             label: label.into(),
             destructive: true,
+            checked: None,
             handler: Rc::new(handler),
         });
         self
@@ -91,6 +111,17 @@ impl ContextMenu {
                 Item::Separator => None,
             })
             .collect()
+    }
+
+    /// Whether the toggle labelled `label` is on (tests).
+    #[cfg(test)]
+    pub fn is_checked(&self, label: &str) -> Option<bool> {
+        self.items.iter().find_map(|item| match item {
+            Item::Action {
+                label: l, checked, ..
+            } if l.as_ref() == label => *checked,
+            _ => None,
+        })
     }
 
     /// The action of the item labelled `label` (tests).
@@ -117,6 +148,15 @@ impl Focusable for ContextMenu {
 impl Render for ContextMenu {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = cx.theme().colors.clone();
+        let toggles = self.items.iter().any(|item| {
+            matches!(
+                item,
+                Item::Action {
+                    checked: Some(_),
+                    ..
+                }
+            )
+        });
         let items = self
             .items
             .iter()
@@ -126,17 +166,30 @@ impl Render for ContextMenu {
                 Item::Action {
                     label,
                     destructive,
+                    checked,
                     handler,
                 } => {
                     let handler = handler.clone();
                     div()
                         .id(("menu-item", index))
+                        .flex()
+                        .items_center()
+                        .gap_2()
                         .px_2()
                         .py_1()
                         .rounded(px(4.))
                         .cursor_pointer()
                         .when(*destructive, |this| this.text_color(colors.error))
                         .hover_style(|s| s.bg(colors.surface_hover))
+                        .when(toggles, |this| {
+                            this.child(
+                                div()
+                                    .w(px(12.))
+                                    .flex_shrink_0()
+                                    .text_color(colors.accent)
+                                    .child(if *checked == Some(true) { "✓" } else { "" }),
+                            )
+                        })
                         .child(label.clone())
                         .on_click(cx.listener(move |_, _, window, cx| {
                             cx.emit(DismissEvent);

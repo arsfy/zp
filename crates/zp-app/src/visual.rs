@@ -118,6 +118,11 @@ pub fn run(out: PathBuf) {
         );
         return;
     }
+    if std::env::var("ZP_VISUAL_SCENE").as_deref() == Ok("git") {
+        git_panel(&mut cx, &out);
+        println!("git screenshots written to {}", out.display());
+        return;
+    }
     if std::env::var("ZP_VISUAL_SCENE").as_deref() == Ok("turn-changes") {
         turn_change_footers(&mut cx, &out);
         println!("turn change screenshots written to {}", out.display());
@@ -1420,5 +1425,158 @@ fn advanced(
     cx.capture_screenshot(settings.into())
         .unwrap()
         .save(out.join("29-settings-mcp.png"))
+        .unwrap();
+}
+
+/// The Git view: staged and unstaged files, history and the branch picker.
+fn git_panel(cx: &mut VisualTestAppContext, out: &std::path::Path) {
+    let project = tempfile::tempdir().unwrap();
+    let root = zp_core::project::normalize_project_path(project.path()).unwrap();
+    let git = |args: &[&str]| {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&root)
+            .args(["-c", "init.defaultBranch=main"])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+    git(&["init", "-q"]);
+    for (key, value) in [
+        ("user.name", "Ada"),
+        ("user.email", "ada@example.com"),
+        ("commit.gpgsign", "false"),
+    ] {
+        git(&["config", key, value]);
+    }
+    std::fs::create_dir_all(root.join("crates/zp-app/src")).unwrap();
+    std::fs::write(root.join("README.md"), "# calc\n").unwrap();
+    std::fs::write(
+        root.join("crates/zp-app/src/tests_advanced.rs"),
+        "fn one() {}\n".repeat(12),
+    )
+    .unwrap();
+    std::fs::write(root.join("crates/zp-app/src/main.rs"), "fn main() {}\n").unwrap();
+    git(&["add", "."]);
+    git(&["commit", "-q", "-m", "Initial commit"]);
+    let remote = tempfile::tempdir().unwrap();
+    let remote_path = zp_core::project::normalize_project_path(remote.path()).unwrap();
+    let init = std::process::Command::new("git")
+        .args(["init", "-q", "--bare"])
+        .arg(&remote_path)
+        .output()
+        .unwrap();
+    assert!(init.status.success());
+    git(&["remote", "add", "origin", remote_path.to_str().unwrap()]);
+    git(&["push", "-q", "-u", "origin", "main"]);
+    for (index, summary) in [
+        "Parse negative numbers",
+        "Add a README",
+        "Fix the IME window position",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        std::fs::write(root.join("notes.txt"), format!("{index}\n")).unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", summary]);
+    }
+    git(&["branch", "feature/history"]);
+    std::fs::write(
+        root.join("crates/zp-app/src/tests_advanced.rs"),
+        "fn two() {}\n".repeat(19),
+    )
+    .unwrap();
+    git(&["add", "crates/zp-app/src/tests_advanced.rs"]);
+    std::fs::write(
+        root.join("crates/zp-app/src/main.rs"),
+        "fn main() {\n    run();\n}\n",
+    )
+    .unwrap();
+    std::fs::write(root.join("PLAN.md"), "# Plan\n\n- git panel\n").unwrap();
+    std::fs::remove_file(root.join("README.md")).unwrap();
+
+    let window = cx
+        .open_offscreen_window(size(px(1280.), px(820.)), |window, cx| {
+            cx.new(|cx| ProjectWindow::new(root.clone(), window, cx))
+        })
+        .unwrap();
+    let any = window.into();
+    pump(cx, Duration::from_millis(200));
+    cx.dispatch_action(any, crate::actions::ToggleRightPanel);
+    pump(cx, Duration::from_millis(800));
+    cx.capture_screenshot(any)
+        .unwrap()
+        .save(out.join("40-git-changes.png"))
+        .unwrap();
+
+    let panel = cx
+        .update_window(any, |_, window, cx| {
+            let view = window.root::<ProjectWindow>().flatten().unwrap();
+            view.read(cx).changes_panel().read(cx).git().clone()
+        })
+        .unwrap();
+    cx.update_window(any, |_, window, cx| {
+        panel.update(cx, |panel, cx| {
+            panel.commit_menu(point(px(1180.), px(700.)), window, cx)
+        })
+    })
+    .unwrap();
+    pump(cx, Duration::from_millis(200));
+    cx.capture_screenshot(any)
+        .unwrap()
+        .save(out.join("43-git-commit-options.png"))
+        .unwrap();
+    cx.update_window(any, |_, window, cx| {
+        panel.update(cx, |panel, cx| {
+            panel.toggle_signoff(cx);
+            panel.toggle_amend(cx);
+        });
+        let _ = window;
+    })
+    .unwrap();
+    pump(cx, Duration::from_millis(400));
+    cx.simulate_click(any, point(px(1260.), px(641.)), Modifiers::none());
+    pump(cx, Duration::from_millis(200));
+    cx.capture_screenshot(any)
+        .unwrap()
+        .save(out.join("44-git-amend-maximized.png"))
+        .unwrap();
+    cx.simulate_click(any, point(px(1265.), px(160.)), Modifiers::none());
+    cx.update_window(any, |_, _, cx| {
+        panel.update(cx, |panel, cx| {
+            panel.toggle_signoff(cx);
+            panel.toggle_amend(cx);
+        })
+    })
+    .unwrap();
+    pump(cx, Duration::from_millis(200));
+
+    cx.update_window(any, |_, window, cx| {
+        panel.update(cx, |panel, cx| panel.open_branch_picker(window, cx))
+    })
+    .unwrap();
+    pump(cx, Duration::from_millis(500));
+    cx.capture_screenshot(any)
+        .unwrap()
+        .save(out.join("41-git-branches.png"))
+        .unwrap();
+
+    cx.update_window(any, |_, _, cx| {
+        panel.update(cx, |panel, cx| {
+            panel.close_branch_picker(cx);
+            panel.set_tab(crate::git_panel::GitTab::History, cx);
+        })
+    })
+    .unwrap();
+    pump(cx, Duration::from_millis(500));
+    cx.capture_screenshot(any)
+        .unwrap()
+        .save(out.join("42-git-history.png"))
         .unwrap();
 }

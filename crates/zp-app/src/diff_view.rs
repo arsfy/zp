@@ -280,6 +280,12 @@ impl DiffView {
         &self.diff
     }
 
+    /// The files that can be stepped through (tests).
+    #[cfg(test)]
+    pub fn items(&self) -> &[DiffItem] {
+        &self.items
+    }
+
     /// Rows in the current layout.
     pub fn row_count(&self) -> usize {
         match self.layout {

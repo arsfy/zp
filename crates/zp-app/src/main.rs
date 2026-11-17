@@ -10,6 +10,7 @@ mod command_palette;
 mod context_menu;
 mod conversation;
 mod diff_view;
+mod git_panel;
 mod markdown;
 mod mcp;
 mod notifications;
@@ -33,6 +34,8 @@ mod tests_advanced;
 mod tests_changes;
 #[cfg(test)]
 mod tests_conversation;
+#[cfg(test)]
+mod tests_git;
 #[cfg(test)]
 mod tests_permissions;
 #[cfg(test)]
