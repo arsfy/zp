@@ -39,6 +39,80 @@ pub enum ThemeChoice {
     Light,
 }
 
+/// How a kind of transcript block (thinking, tool card) is shown.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum BlockDisplay {
+    /// Collapsed until clicked.
+    Collapsed,
+    /// Expanded while in progress, collapsed once done.
+    WhileRunning,
+    /// Expanded, also when done.
+    Expanded,
+}
+
+impl BlockDisplay {
+    pub const ALL: [Self; 3] = [Self::Collapsed, Self::WhileRunning, Self::Expanded];
+
+    /// Whether a block shown this way starts expanded; `running` while it is in progress.
+    pub fn expanded(self, running: bool) -> bool {
+        match self {
+            Self::Collapsed => false,
+            Self::WhileRunning => running,
+            Self::Expanded => true,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Collapsed => "Collapsed",
+            Self::WhileRunning => "Collapse when done",
+            Self::Expanded => "Expanded",
+        }
+    }
+}
+
+/// Which transcript blocks start expanded. A block the user toggles keeps that state,
+/// and failed tool calls default to expanded.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct TranscriptSettings {
+    /// The model's reasoning (default collapsed).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<BlockDisplay>,
+    /// File writes and edits, shown as diffs (default expanded).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file_edits: Option<BlockDisplay>,
+    /// Shell command output (default collapsed when done).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub commands: Option<BlockDisplay>,
+    /// Other tool calls: reads, searches, MCP tools (default collapsed).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub other_tools: Option<BlockDisplay>,
+}
+
+impl TranscriptSettings {
+    pub fn thinking(&self) -> BlockDisplay {
+        self.thinking.unwrap_or(BlockDisplay::Collapsed)
+    }
+
+    pub fn file_edits(&self) -> BlockDisplay {
+        self.file_edits.unwrap_or(BlockDisplay::Expanded)
+    }
+
+    pub fn commands(&self) -> BlockDisplay {
+        self.commands.unwrap_or(BlockDisplay::WhileRunning)
+    }
+
+    pub fn other_tools(&self) -> BlockDisplay {
+        self.other_tools.unwrap_or(BlockDisplay::Collapsed)
+    }
+
+    fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
 /// An OpenAI-compatible (or Anthropic-compatible) endpoint added by the user.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
@@ -74,6 +148,9 @@ pub struct Settings {
     pub generate_titles: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub theme: Option<ThemeChoice>,
+    /// Which transcript blocks start expanded.
+    #[serde(skip_serializing_if = "TranscriptSettings::is_default")]
+    pub transcript: TranscriptSettings,
     pub permissions: PermissionSettings,
     /// System notifications for background conversations (default on).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -244,6 +321,7 @@ mod tests {
             "defaultThinking": "high",
             "generateTitles": false,
             "theme": "light",
+            "transcript": {"thinking": "expanded", "commands": "collapsed"},
             "providers": [{"id": "local", "name": "Local", "baseUrl": "http://localhost:1234/v1", "models": ["m1"]}],
             "keybindings": {"zp::NewChat": "cmd-k"}
         }"#;
@@ -252,6 +330,13 @@ mod tests {
         assert_eq!(settings.theme, Some(ThemeChoice::Light));
         assert_eq!(settings.providers[0].models, ["m1"]);
         assert_eq!(settings.keybindings["zp::NewChat"], "cmd-k");
+        let transcript = settings.transcript;
+        assert_eq!(transcript.thinking(), BlockDisplay::Expanded);
+        assert_eq!(transcript.commands(), BlockDisplay::Collapsed);
+        assert_eq!(transcript.file_edits(), BlockDisplay::Expanded);
+        assert_eq!(transcript.other_tools(), BlockDisplay::Collapsed);
+        assert!(BlockDisplay::WhileRunning.expanded(true));
+        assert!(!BlockDisplay::WhileRunning.expanded(false));
         let back: Settings =
             serde_json::from_str(&serde_json::to_string(&settings).unwrap()).unwrap();
         assert_eq!(back, settings);

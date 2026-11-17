@@ -1,11 +1,13 @@
 //! The displayed transcript: rows built from agent messages and kept current from agent
 //! events, independent of rendering.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use serde_json::Value;
 use zp_agent::{AgentEvent, AgentMessage};
-use zp_ai::{AssistantMessage, Message, StopReason, StreamAccumulator, UserContent};
+use zp_ai::{
+    AssistantMessage, AssistantMessageEvent, Message, StopReason, StreamAccumulator, UserContent,
+};
 use zp_core::UsageTotals;
 
 /// Execution state of a tool call.
@@ -81,6 +83,7 @@ pub struct Transcript {
     tools: HashMap<String, ToolState>,
     tool_rows: HashMap<String, usize>,
     streaming: Option<(usize, StreamAccumulator)>,
+    active_thinking: HashSet<usize>,
     usage: UsageTotals,
     /// Ordinal of the next finished message.
     next_ordinal: usize,
@@ -161,6 +164,11 @@ impl Transcript {
             .is_some_and(|(index, _)| *index == row)
     }
 
+    /// Whether this reasoning block is still receiving content.
+    pub fn thinking_is_running(&self, row: usize, block: usize) -> bool {
+        self.is_streaming(row) && self.active_thinking.contains(&block)
+    }
+
     /// The last row if it is a failed or aborted response.
     pub fn failed_response(&self) -> Option<usize> {
         let last = self.rows.len().checked_sub(1)?;
@@ -207,6 +215,7 @@ impl Transcript {
                 );
             }
             AgentMessage::Llm(Message::Assistant(assistant)) => {
+                self.active_thinking.clear();
                 let row = match self.streaming.take() {
                     Some((row, _)) => {
                         self.rows[row] = Row::Assistant {
@@ -271,6 +280,7 @@ impl Transcript {
             AgentEvent::MessageStart {
                 message: AgentMessage::Llm(Message::Assistant(message)),
             } => {
+                self.active_thinking.clear();
                 let row = self.push(
                     Row::Assistant {
                         message: message.clone(),
@@ -282,6 +292,15 @@ impl Transcript {
             }
             AgentEvent::MessageUpdate { event } => {
                 if let Some((row, accumulator)) = &mut self.streaming {
+                    match event {
+                        AssistantMessageEvent::ThinkingStart { index, .. } => {
+                            self.active_thinking.insert(*index);
+                        }
+                        AssistantMessageEvent::ThinkingEnd { index, .. } => {
+                            self.active_thinking.remove(index);
+                        }
+                        _ => {}
+                    }
                     accumulator.apply(event);
                     changes.dirty.insert(*row);
                 }
@@ -329,6 +348,7 @@ impl Transcript {
                 self.touch_tool(tool_call_id, changes);
             }
             AgentEvent::AgentEnd { .. } => {
+                self.active_thinking.clear();
                 // A run that ended mid-stream (should not happen) leaves no live row.
                 if let Some((row, accumulator)) = self.streaming.take() {
                     let ordinal = self.rows[row].ordinal();
@@ -402,6 +422,81 @@ mod tests {
         assert_eq!(transcript.tool("c1").unwrap().status, ToolStatus::Done);
         assert_eq!(transcript.usage().output, 10);
         assert_eq!(transcript.failed_response(), None);
+    }
+
+    #[test]
+    fn thinking_finishes_independently_of_the_response() {
+        let skeleton = AssistantMessage::empty("faux", "faux", "m");
+        let mut transcript = Transcript::default();
+        let mut changes = Changes::default();
+        transcript.apply(
+            &AgentEvent::MessageStart {
+                message: skeleton.clone().into(),
+            },
+            &mut changes,
+        );
+        transcript.apply(
+            &AgentEvent::MessageUpdate {
+                event: AssistantMessageEvent::ThinkingStart {
+                    index: 0,
+                    redacted: false,
+                },
+            },
+            &mut changes,
+        );
+        assert!(transcript.thinking_is_running(0, 0));
+        assert!(!transcript.thinking_is_running(1, 0));
+        assert!(!transcript.thinking_is_running(0, 1));
+        changes.dirty.clear();
+        transcript.apply(
+            &AgentEvent::MessageUpdate {
+                event: AssistantMessageEvent::ThinkingEnd {
+                    index: 0,
+                    signature: None,
+                },
+            },
+            &mut changes,
+        );
+        assert!(!transcript.thinking_is_running(0, 0));
+        assert!(transcript.is_streaming(0));
+        assert!(changes.dirty.contains(&0));
+
+        // Missing ThinkingEnd events must not leave a completed block active.
+        for end in [
+            AgentEvent::MessageEnd {
+                message: skeleton.clone().into(),
+            },
+            AgentEvent::AgentEnd {
+                messages: Vec::new(),
+            },
+        ] {
+            let mut transcript = Transcript::default();
+            transcript.apply(
+                &AgentEvent::MessageStart {
+                    message: skeleton.clone().into(),
+                },
+                &mut changes,
+            );
+            transcript.apply(
+                &AgentEvent::MessageUpdate {
+                    event: AssistantMessageEvent::ThinkingStart {
+                        index: 0,
+                        redacted: false,
+                    },
+                },
+                &mut changes,
+            );
+            assert!(transcript.thinking_is_running(0, 0));
+            transcript.apply(&end, &mut changes);
+            assert!(!transcript.thinking_is_running(0, 0));
+            transcript.apply(
+                &AgentEvent::MessageStart {
+                    message: skeleton.clone().into(),
+                },
+                &mut changes,
+            );
+            assert!(!transcript.thinking_is_running(1, 0));
+        }
     }
 
     #[test]

@@ -15,7 +15,7 @@ use gpui::{
 use gpui_elements::editable_text::{EditableTextState, StringStorage, text_area, text_input};
 use zp_ai::ThinkingLevel;
 use zp_core::permissions::PermissionMode;
-use zp_core::settings::ThemeChoice;
+use zp_core::settings::{BlockDisplay, ThemeChoice, TranscriptSettings};
 
 use crate::review_model_picker::{ReviewModelEvent, ReviewModelPicker};
 use crate::store::{AppModels, AppSettings};
@@ -61,6 +61,61 @@ impl Page {
             Self::Keybindings => "Keybindings",
             Self::Mcp => "MCP Servers",
         }
+    }
+}
+
+/// A kind of transcript block whose expansion is configurable.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TranscriptBlock {
+    Thinking,
+    FileEdits,
+    Commands,
+    OtherTools,
+}
+
+impl TranscriptBlock {
+    pub const ALL: [Self; 4] = [
+        Self::Thinking,
+        Self::FileEdits,
+        Self::Commands,
+        Self::OtherTools,
+    ];
+
+    fn id(self) -> &'static str {
+        match self {
+            Self::Thinking => "transcript-thinking",
+            Self::FileEdits => "transcript-file-edits",
+            Self::Commands => "transcript-commands",
+            Self::OtherTools => "transcript-other-tools",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Thinking => "Thinking",
+            Self::FileEdits => "File edits",
+            Self::Commands => "Commands",
+            Self::OtherTools => "Other tools",
+        }
+    }
+
+    fn get(self, settings: &TranscriptSettings) -> BlockDisplay {
+        match self {
+            Self::Thinking => settings.thinking(),
+            Self::FileEdits => settings.file_edits(),
+            Self::Commands => settings.commands(),
+            Self::OtherTools => settings.other_tools(),
+        }
+    }
+
+    fn set(self, settings: &mut TranscriptSettings, display: BlockDisplay) {
+        let slot = match self {
+            Self::Thinking => &mut settings.thinking,
+            Self::FileEdits => &mut settings.file_edits,
+            Self::Commands => &mut settings.commands,
+            Self::OtherTools => &mut settings.other_tools,
+        };
+        *slot = Some(display);
     }
 }
 
@@ -370,6 +425,18 @@ impl SettingsWindow {
         self.notice = None;
     }
 
+    /// Sets whether `block`s start expanded and collapse when done.
+    pub fn set_transcript_display(
+        &mut self,
+        block: TranscriptBlock,
+        display: BlockDisplay,
+        cx: &mut Context<Self>,
+    ) {
+        let result = AppSettings::update(cx, |s| block.set(&mut s.transcript, display))
+            .map(|()| format!("{}: {}", block.label(), display.label()));
+        self.report(result, cx);
+    }
+
     // ----- rendering -------------------------------------------------------------------
 
     fn render_nav(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -581,6 +648,7 @@ impl SettingsWindow {
 
     fn render_appearance(&self, cx: &mut Context<Self>) -> AnyElement {
         let current = AppSettings::get(cx).theme.unwrap_or_default();
+        let transcript = AppSettings::transcript(cx);
         let themes = [
             (
                 ThemeChoice::System,
@@ -601,6 +669,29 @@ impl SettingsWindow {
                             .on_click(cx.listener(move |this, _, _, cx| this.set_theme(theme, cx)))
                     }),
             )
+            .child(section(
+                "Conversation details",
+                "Default visibility of thinking and tool details. Failed tools start expanded.",
+                cx,
+            ))
+            .children(TranscriptBlock::ALL.into_iter().map(|block| {
+                let current = block.get(&transcript);
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_3()
+                    .child(div().w(px(110.)).flex_shrink_0().child(block.label()))
+                    .child(segmented(
+                        block.id(),
+                        BlockDisplay::ALL
+                            .iter()
+                            .map(|display| (display.label().to_owned(), *display == current)),
+                        cx,
+                        move |this, index, cx| {
+                            this.set_transcript_display(block, BlockDisplay::ALL[index], cx)
+                        },
+                    ))
+            }))
             .into_any_element()
     }
 }

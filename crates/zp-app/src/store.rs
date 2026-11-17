@@ -120,6 +120,13 @@ impl AppSettings {
         &cx.global::<Self>().settings
     }
 
+    /// Which transcript blocks start expanded.
+    pub fn transcript(cx: &App) -> zp_core::settings::TranscriptSettings {
+        cx.try_global::<Self>()
+            .map(|this| this.settings.transcript)
+            .unwrap_or_default()
+    }
+
     /// Changes the settings, saves them and applies them to the running app.
     pub fn update(cx: &mut App, change: impl FnOnce(&mut Settings)) -> anyhow::Result<()> {
         let this = cx.global_mut::<Self>();

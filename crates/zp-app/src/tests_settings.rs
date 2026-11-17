@@ -6,9 +6,9 @@ use std::sync::Arc;
 use gpui::{Modifiers, TestAppContext, VisualTestContext, WindowHandle};
 use zp_ai::{FauxProvider, Models, ThinkingLevel};
 use zp_core::permissions::PermissionMode;
-use zp_core::settings::{Settings, ThemeChoice};
+use zp_core::settings::{BlockDisplay, Settings, ThemeChoice, TranscriptSettings};
 
-use crate::settings::{Page, SettingsWindow};
+use crate::settings::{Page, SettingsWindow, TranscriptBlock};
 use crate::store::{AppModels, AppSettings};
 use crate::tests::project_dir;
 use crate::tests_conversation::{active, open, setup_models, tab_count, wait_until};
@@ -23,6 +23,30 @@ fn settings_window(page: Page, cx: &mut TestAppContext) -> WindowHandle<Settings
 
 fn saved(data: &tempfile::TempDir) -> Settings {
     Settings::load(&zp_core::paths::settings_file(data.path())).unwrap()
+}
+
+#[gpui::test]
+fn transcript_display_settings_are_saved_and_applied(cx: &mut TestAppContext) {
+    let faux = FauxProvider::default();
+    let data = setup_models(cx, &[&faux], false);
+    let window = settings_window(Page::Appearance, cx);
+    for display in BlockDisplay::ALL {
+        for block in TranscriptBlock::ALL {
+            window
+                .update(cx, |view, _, cx| {
+                    view.set_transcript_display(block, display, cx);
+                })
+                .unwrap();
+        }
+        let expected = TranscriptSettings {
+            thinking: Some(display),
+            file_edits: Some(display),
+            commands: Some(display),
+            other_tools: Some(display),
+        };
+        assert_eq!(saved(&data).transcript, expected);
+        assert_eq!(cx.update(|cx| AppSettings::transcript(cx)), expected);
+    }
 }
 
 #[gpui::test]

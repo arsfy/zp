@@ -18,6 +18,7 @@ use crate::actions::KEY_SEND;
 use crate::diff_view::{DiffColors, render_unified_row};
 use crate::markdown::{IdGen, MarkdownStyle, render_markdown};
 use crate::selectable_text::SelectableText;
+use crate::store::AppSettings;
 use crate::theme::ActiveTheme;
 use crate::ui::model_display_name;
 
@@ -548,7 +549,6 @@ impl ConversationView {
         let colors = cx.theme().colors.clone();
         let style = MarkdownStyle::from_theme(cx);
         let mut column = div().flex().flex_col().gap_2();
-        let last_block = message.content.len().saturating_sub(1);
         for (block, content) in message.content.iter().enumerate() {
             column = match content {
                 AssistantContent::Text(text) if text.text.trim().is_empty() => column,
@@ -565,7 +565,7 @@ impl ConversationView {
                     row,
                     block,
                     &thinking.thinking,
-                    streaming && block == last_block,
+                    self.transcript.thinking_is_running(row, block),
                     cx,
                 )),
                 AssistantContent::ToolCall(call) => column.child(self.render_tool(row, call, cx)),
@@ -621,7 +621,7 @@ impl ConversationView {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let colors = cx.theme().colors.clone();
-        let expanded = self.expanded_thinking.contains(&(row, block));
+        let expanded = self.thinking_is_expanded(row, block, cx);
         div()
             .flex()
             .flex_col()
@@ -640,7 +640,7 @@ impl ConversationView {
                     .child(if expanded { "▾" } else { "▸" })
                     .child(if live { "Thinking…" } else { "Thinking" })
                     .on_click(cx.listener(move |this, _, _, cx| {
-                        this.toggle_thinking_block(row, block, cx)
+                        this.toggle_thinking_block(row, block, expanded, cx)
                     })),
             )
             .when(expanded, |this| {
@@ -656,6 +656,48 @@ impl ConversationView {
             .into_any_element()
     }
 
+    /// Whether a thinking block is expanded: the user's choice, else the settings.
+    pub(crate) fn thinking_is_expanded(&self, row: usize, block: usize, cx: &App) -> bool {
+        self.thinking_expanded
+            .get(&(row, block))
+            .copied()
+            .unwrap_or_else(|| {
+                AppSettings::transcript(cx)
+                    .thinking()
+                    .expanded(self.transcript.thinking_is_running(row, block))
+            })
+    }
+
+    /// Whether a tool card is expanded: the user's choice, else failed calls and what the
+    /// settings say for its kind (file edit, command, other).
+    pub(crate) fn tool_is_expanded(
+        &self,
+        row: usize,
+        call: &ToolCall,
+        changed_file: bool,
+        cx: &App,
+    ) -> bool {
+        if let Some(expanded) = self.tool_expanded.get(&call.id) {
+            return *expanded;
+        }
+        let status = self.transcript.tool(&call.id).map(|state| state.status);
+        let running = match status {
+            Some(ToolStatus::Running) => true,
+            // Arguments still streaming in.
+            None => self.transcript.is_streaming(row),
+            Some(ToolStatus::Done | ToolStatus::Error) => false,
+        };
+        let display = AppSettings::transcript(cx);
+        let kind = if changed_file || matches!(call.name.as_str(), "write" | "edit") {
+            display.file_edits()
+        } else if call.name == "bash" {
+            display.commands()
+        } else {
+            display.other_tools()
+        };
+        matches!(status, Some(ToolStatus::Error)) || kind.expanded(running)
+    }
+
     fn render_tool(&self, row: usize, call: &ToolCall, cx: &mut Context<Self>) -> AnyElement {
         let colors = cx.theme().colors.clone();
         let mono = cx.theme().metrics.mono_font.clone();
@@ -666,15 +708,7 @@ impl ConversationView {
             .and_then(|state| state.details.as_ref())
             .and_then(RecordedChange::from_details);
         let reverted = change.is_some() && self.change_log().tool_reverted(&call.id);
-        // File changes show their diff by default.
-        let default_expanded = matches!(status, Some(ToolStatus::Error))
-            || change.is_some()
-            || (call.name == "bash" && matches!(status, Some(ToolStatus::Running)));
-        let expanded = self
-            .tool_expanded
-            .get(&call.id)
-            .copied()
-            .unwrap_or(default_expanded);
+        let expanded = self.tool_is_expanded(row, call, change.is_some(), cx);
 
         let approval = self.render_approval(&call.id, cx);
         let (status_text, status_color) = match status {
@@ -1639,6 +1673,12 @@ impl ConversationView {
 impl Render for ConversationView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.text_selection.begin_frame();
+        let display = AppSettings::transcript(cx);
+        if display != self.display {
+            // Blocks may have opened or closed: measure the rows again.
+            self.display = display;
+            self.list_state.remeasure();
+        }
         let transcript = if self.transcript.is_empty() {
             self.render_empty(cx)
         } else {

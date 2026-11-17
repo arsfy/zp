@@ -165,10 +165,12 @@ pub struct ConversationView {
     /// When a popover was last closed by clicking outside it; a click on its own toggle
     /// button right after must not reopen it.
     picker_closed_at: Option<std::time::Instant>,
-    /// Thinking blocks the user expanded, by (row, block).
-    expanded_thinking: HashSet<(usize, usize)>,
+    /// Thinking blocks the user toggled, by (row, block) (overrides the default).
+    thinking_expanded: HashMap<(usize, usize), bool>,
     /// Tool cards the user toggled, by call id (overrides the default).
     tool_expanded: HashMap<String, bool>,
+    /// The transcript display settings rows were last measured with.
+    display: zp_core::settings::TranscriptSettings,
     markdown_cache: RefCell<HashMap<u64, Rc<Vec<Block>>>>,
     /// Diffs of tool calls, by call id.
     tool_diffs: RefCell<HashMap<String, Rc<Result<files::ToolDiff, String>>>>,
@@ -274,8 +276,9 @@ impl ConversationView {
             review_model_picker: None,
             review_model_subscription: None,
             picker_closed_at: None,
-            expanded_thinking: HashSet::new(),
+            thinking_expanded: HashMap::new(),
             tool_expanded: HashMap::new(),
+            display: crate::store::AppSettings::transcript(cx),
             markdown_cache: RefCell::default(),
             tool_diffs: RefCell::default(),
             turn_changes: RefCell::default(),
@@ -1524,11 +1527,10 @@ impl ConversationView {
         &mut self,
         row: usize,
         block: usize,
+        expanded: bool,
         cx: &mut Context<Self>,
     ) {
-        if !self.expanded_thinking.remove(&(row, block)) {
-            self.expanded_thinking.insert((row, block));
-        }
+        self.thinking_expanded.insert((row, block), !expanded);
         self.list_state.splice(row..row + 1, 1);
         cx.notify();
     }
@@ -1566,7 +1568,193 @@ impl Focusable for ConversationView {
 mod tests {
     use super::*;
     use gpui::TestAppContext;
-    use zp_ai::{AssistantMessage, AssistantMessageEvent, FauxProvider, Usage};
+    use zp_agent::AgentToolResult;
+    use zp_ai::{AssistantMessage, AssistantMessageEvent, FauxProvider, ToolCall, Usage};
+    use zp_core::settings::{BlockDisplay, TranscriptSettings};
+
+    use crate::store::AppSettings;
+
+    #[gpui::test]
+    fn transcript_visibility_follows_settings_and_manual_choices(cx: &mut TestAppContext) {
+        let faux = FauxProvider::default();
+        let _data = crate::tests_conversation::setup_models(cx, &[&faux], false);
+        let (_dir, project) = crate::tests::project_dir();
+        let window = crate::tests_conversation::open(cx, &project);
+        let conversation = crate::tests_conversation::active(window, cx);
+        let apply = |view: &mut ConversationView, event, cx: &mut Context<ConversationView>| {
+            view.apply_events(vec![(Instant::now(), event)], cx);
+        };
+        let calls = ["write", "edit", "bash", "read", "custom-tool"].map(|name| ToolCall {
+            id: name.into(),
+            name: name.into(),
+            arguments: serde_json::json!({}),
+        });
+        cx.update(|cx| {
+            AppSettings::update(cx, |settings| {
+                settings.transcript = TranscriptSettings {
+                    thinking: Some(BlockDisplay::WhileRunning),
+                    file_edits: Some(BlockDisplay::WhileRunning),
+                    commands: Some(BlockDisplay::WhileRunning),
+                    other_tools: Some(BlockDisplay::WhileRunning),
+                };
+            })
+            .unwrap();
+        });
+        conversation.update(cx, |view, cx| {
+            let mut message = AssistantMessage::empty("faux", "faux", "faux-1");
+            apply(
+                view,
+                AgentEvent::MessageStart {
+                    message: message.clone().into(),
+                },
+                cx,
+            );
+            apply(
+                view,
+                AgentEvent::MessageUpdate {
+                    event: AssistantMessageEvent::ThinkingStart {
+                        index: 0,
+                        redacted: false,
+                    },
+                },
+                cx,
+            );
+            assert!(view.thinking_is_expanded(0, 0, cx));
+            apply(
+                view,
+                AgentEvent::MessageUpdate {
+                    event: AssistantMessageEvent::ThinkingEnd {
+                        index: 0,
+                        signature: None,
+                    },
+                },
+                cx,
+            );
+            assert!(!view.thinking_is_expanded(0, 0, cx));
+            assert!(view.transcript.is_streaming(0));
+            view.toggle_thinking_block(0, 0, false, cx);
+            assert!(view.thinking_is_expanded(0, 0, cx));
+
+            for (index, call) in calls.iter().enumerate() {
+                apply(
+                    view,
+                    AgentEvent::MessageUpdate {
+                        event: AssistantMessageEvent::ToolCallStart {
+                            index: index + 1,
+                            id: call.id.clone(),
+                            name: call.name.clone(),
+                        },
+                    },
+                    cx,
+                );
+                apply(
+                    view,
+                    AgentEvent::MessageUpdate {
+                        event: AssistantMessageEvent::ToolCallEnd {
+                            index: index + 1,
+                            tool_call: call.clone(),
+                        },
+                    },
+                    cx,
+                );
+                assert!(view.tool_is_expanded(0, call, false, cx));
+            }
+            message.content = view.transcript.assistant(0).unwrap().content.clone();
+            apply(
+                view,
+                AgentEvent::MessageEnd {
+                    message: message.into(),
+                },
+                cx,
+            );
+            for call in &calls {
+                apply(
+                    view,
+                    AgentEvent::ToolExecutionStart {
+                        tool_call_id: call.id.clone(),
+                        tool_name: call.name.clone(),
+                        args: call.arguments.clone(),
+                    },
+                    cx,
+                );
+                assert!(view.tool_is_expanded(0, call, false, cx));
+                if call.name == "edit" {
+                    view.toggle_tool(&call.id, 0, true, cx);
+                    assert!(!view.tool_is_expanded(0, call, false, cx));
+                    view.toggle_tool(&call.id, 0, false, cx);
+                }
+                apply(
+                    view,
+                    AgentEvent::ToolExecutionEnd {
+                        tool_call_id: call.id.clone(),
+                        tool_name: call.name.clone(),
+                        result: AgentToolResult::text("done"),
+                        is_error: false,
+                        duration_ms: Some(1),
+                    },
+                    cx,
+                );
+                assert_eq!(
+                    view.tool_is_expanded(0, call, false, cx),
+                    call.name == "edit"
+                );
+            }
+        });
+        cx.update(|cx| {
+            AppSettings::update(cx, |settings| {
+                settings.transcript = TranscriptSettings {
+                    thinking: Some(BlockDisplay::Collapsed),
+                    file_edits: Some(BlockDisplay::Collapsed),
+                    commands: Some(BlockDisplay::Expanded),
+                    other_tools: Some(BlockDisplay::Expanded),
+                };
+            })
+            .unwrap();
+        });
+        conversation.update(cx, |view, cx| {
+            assert!(
+                view.thinking_is_expanded(0, 0, cx),
+                "manual choice survives settings changes"
+            );
+            for call in &calls {
+                assert_eq!(
+                    view.tool_is_expanded(0, call, false, cx),
+                    call.name != "write"
+                );
+            }
+            let failed = &calls[0];
+            apply(
+                view,
+                AgentEvent::ToolExecutionEnd {
+                    tool_call_id: failed.id.clone(),
+                    tool_name: failed.name.clone(),
+                    result: AgentToolResult::error("failed"),
+                    is_error: true,
+                    duration_ms: Some(1),
+                },
+                cx,
+            );
+            assert!(
+                view.tool_is_expanded(0, failed, false, cx),
+                "errors default to expanded"
+            );
+            view.toggle_tool(&failed.id, 0, true, cx);
+            assert!(!view.tool_is_expanded(0, failed, false, cx));
+            view.toggle_thinking_block(0, 0, true, cx);
+        });
+        cx.update(|cx| {
+            AppSettings::update(cx, |settings| {
+                settings.transcript.thinking = Some(BlockDisplay::Expanded);
+            })
+            .unwrap();
+        });
+        conversation.update(cx, |view, cx| {
+            assert!(
+                !view.thinking_is_expanded(0, 0, cx),
+                "manual close survives settings changes"
+            );
+        });
+    }
 
     #[gpui::test]
     fn live_usage_includes_cache_and_recalibrates_to_provider_counts(cx: &mut TestAppContext) {

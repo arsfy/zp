@@ -110,6 +110,14 @@ pub fn run(out: PathBuf) {
         models.set_provider(Arc::new(faux.clone()));
         AppModels::set(models, false, cx);
     });
+    if std::env::var("ZP_VISUAL_SCENE").as_deref() == Ok("transcript-display") {
+        transcript_display_settings(&mut cx, &out);
+        println!(
+            "transcript display screenshots written to {}",
+            out.display()
+        );
+        return;
+    }
     if std::env::var("ZP_VISUAL_SCENE").as_deref() == Ok("turn-changes") {
         turn_change_footers(&mut cx, &out);
         println!("turn change screenshots written to {}", out.display());
@@ -1156,6 +1164,29 @@ fn approvals(cx: &mut VisualTestAppContext, faux: &FauxProvider, out: &std::path
         .unwrap()
         .save(out.join("17-permission-modes.png"))
         .unwrap();
+}
+
+fn transcript_display_settings(cx: &mut VisualTestAppContext, out: &std::path::Path) {
+    use crate::settings::{Page, SettingsWindow};
+    use zp_core::settings::ThemeChoice;
+
+    for (name, theme) in [("dark", ThemeChoice::Dark), ("light", ThemeChoice::Light)] {
+        cx.update(|cx| {
+            crate::store::AppSettings::update(cx, |settings| settings.theme = Some(theme)).unwrap();
+        });
+        for width in [980., 720.] {
+            let window = cx
+                .open_offscreen_window(size(px(width), px(700.)), |window, cx| {
+                    cx.new(|cx| SettingsWindow::new_on(Page::Appearance, window, cx))
+                })
+                .unwrap();
+            pump(cx, Duration::from_millis(150));
+            cx.capture_screenshot(window.into())
+                .unwrap()
+                .save(out.join(format!("transcript-display-{name}-{width}.png")))
+                .unwrap();
+        }
+    }
 }
 
 /// M9: every settings page, with a few real providers registered.
