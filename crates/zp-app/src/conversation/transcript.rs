@@ -144,6 +144,23 @@ impl Transcript {
         self.tools.get(id)
     }
 
+    /// The result details of the last successful call of `tool` (e.g. the current task
+    /// list).
+    pub fn latest_tool_details(&self, tool: &str) -> Option<&Value> {
+        self.rows.iter().rev().find_map(|row| match row {
+            Row::Assistant { message, .. } => {
+                let calls: Vec<_> = message.tool_calls().collect();
+                calls.into_iter().rev().find_map(|call| {
+                    let state = self.tools.get(&call.id)?;
+                    (call.name == tool && state.status == ToolStatus::Done)
+                        .then_some(state.details.as_ref())
+                        .flatten()
+                })
+            }
+            _ => None,
+        })
+    }
+
     /// The assistant message of `row`, including in-flight content.
     pub fn assistant(&self, row: usize) -> Option<&AssistantMessage> {
         if let Some((index, accumulator)) = &self.streaming

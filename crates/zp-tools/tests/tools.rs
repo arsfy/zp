@@ -51,12 +51,27 @@ fn write(dir: &Path, name: &str, content: &str) {
 #[test]
 fn every_tool_has_a_valid_declaration() {
     let dir = tempfile::tempdir().unwrap();
-    let tools = coding_tools(dir.path());
+    struct Nobody;
+    impl zp_tools::Asker for Nobody {
+        fn ask(
+            &self,
+            _: &str,
+            _: zp_tools::AskRequest,
+        ) -> futures::future::BoxFuture<'static, Option<Vec<zp_tools::Answer>>> {
+            Box::pin(async { None })
+        }
+    }
+    let mut tools = coding_tools(dir.path());
     let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
     assert_eq!(
         names,
-        ["read", "bash", "edit", "write", "grep", "find", "ls"]
+        [
+            "read", "bash", "edit", "write", "grep", "find", "ls", "todo"
+        ]
     );
+    tools.push(std::sync::Arc::new(zp_tools::AskTool::new(
+        std::sync::Arc::new(Nobody),
+    )));
     for tool in &tools {
         let schema = tool.parameters();
         assert_eq!(schema["type"], "object", "{}", tool.name());

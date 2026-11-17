@@ -24,6 +24,24 @@ pub fn describe_call(tool: &str, args: &Value, max_chars: usize) -> String {
                 format!("{} in {path}", field("pattern"))
             }
         }
+        "todo" => {
+            let todos = args.get("todos").and_then(Value::as_array);
+            let count = todos.map_or(0, Vec::len);
+            let current = todos
+                .and_then(|todos| todos.iter().find(|item| item["status"] == "in_progress"))
+                .and_then(|item| item["content"].as_str());
+            match current {
+                Some(current) => format!("{count} tasks · {current}"),
+                None => format!("{count} tasks"),
+            }
+        }
+        "ask" => args
+            .get("questions")
+            .and_then(Value::as_array)
+            .and_then(|questions| questions.first())
+            .and_then(|question| question["question"].as_str())
+            .unwrap_or_default()
+            .to_owned(),
         _ => args.to_string(),
     };
     shorten(&summary, max_chars)

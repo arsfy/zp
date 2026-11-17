@@ -52,9 +52,9 @@ impl ConversationView {
         self.approvals.iter().map(|approval| &approval.request)
     }
 
-    /// Whether the conversation waits for the user.
+    /// Whether the conversation waits for the user (an approval or a question).
     pub fn needs_attention(&self) -> bool {
-        !self.approvals.is_empty()
+        !self.approvals.is_empty() || !self.questions.is_empty()
     }
 
     /// The mode of this conversation's permission checks.
@@ -185,7 +185,7 @@ impl ConversationView {
             return;
         };
         let mut approval = self.approvals.remove(index);
-        if self.approvals.is_empty() && self.is_busy() {
+        if !self.needs_attention() && self.is_busy() {
             self.progress
                 .update(cx, |progress, cx| progress.set_paused(false, cx));
         }
@@ -250,7 +250,7 @@ impl ConversationView {
         }
     }
 
-    fn refresh_tool_row(&mut self, call_id: &str) {
+    pub(super) fn refresh_tool_row(&mut self, call_id: &str) {
         if let Some(row) = self.transcript.row_of_tool(call_id) {
             self.list_state.splice(row..row + 1, 1);
         }
@@ -386,7 +386,7 @@ impl ConversationView {
             ToolKind::Edit if outside => "Change a file outside the project?",
             ToolKind::Edit => "Apply this change?",
             ToolKind::Read => "Read outside the project?",
-            ToolKind::Other => "Allow this tool call?",
+            ToolKind::Interaction | ToolKind::Other => "Allow this tool call?",
         };
         let accent = if dangerous {
             colors.error

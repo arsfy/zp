@@ -46,6 +46,49 @@ impl Approver for ChannelApprover {
     }
 }
 
+/// Questions of an `ask` call waiting for the user, with the channel for the answers.
+pub struct PendingQuestions {
+    pub call_id: String,
+    pub request: zp_tools::AskRequest,
+    pub reply: oneshot::Sender<Option<Vec<zp_tools::Answer>>>,
+}
+
+/// Sends the agent's questions to the conversation view; a dropped request counts as
+/// dismissed.
+pub struct ChannelAsker {
+    sender: mpsc::UnboundedSender<PendingQuestions>,
+}
+
+impl ChannelAsker {
+    pub fn new(sender: mpsc::UnboundedSender<PendingQuestions>) -> Self {
+        Self { sender }
+    }
+}
+
+impl zp_tools::Asker for ChannelAsker {
+    fn ask(
+        &self,
+        call_id: &str,
+        request: zp_tools::AskRequest,
+    ) -> BoxFuture<'static, Option<Vec<zp_tools::Answer>>> {
+        let (reply, answer) = oneshot::channel();
+        let sent = self
+            .sender
+            .unbounded_send(PendingQuestions {
+                call_id: call_id.to_owned(),
+                request,
+                reply,
+            })
+            .is_ok();
+        Box::pin(async move {
+            if !sent {
+                return None;
+            }
+            answer.await.ok().flatten()
+        })
+    }
+}
+
 /// Whether the user trusts the project at `root` (`false` until they said so).
 pub fn is_trusted(root: &Path, cx: &App) -> bool {
     AppStore::state(cx).project(root).trusted == Some(true)

@@ -87,6 +87,8 @@ pub enum ToolKind {
     Edit,
     /// Runs commands (`bash`).
     Execute,
+    /// Talks to the user or tracks progress (`ask`, `todo`); never needs approval.
+    Interaction,
     /// Anything else (extensions).
     Other,
 }
@@ -97,6 +99,7 @@ impl ToolKind {
             "read" | "grep" | "find" | "ls" => Self::Read,
             "write" | "edit" => Self::Edit,
             "bash" => Self::Execute,
+            "ask" | "todo" => Self::Interaction,
             _ => Self::Other,
         }
     }
@@ -325,7 +328,7 @@ impl PermissionPolicy {
         }
 
         match kind {
-            ToolKind::Read => {}
+            ToolKind::Read | ToolKind::Interaction => {}
             ToolKind::Edit => {
                 if self.mode == PermissionMode::Ask && !grants.edits {
                     reasons.push(AskReason::Mode(self.mode));

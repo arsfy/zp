@@ -129,6 +129,8 @@ pub struct CodingSessionOptions {
     pub thinking_level: Option<ThinkingLevel>,
     /// Tools; `None` uses all built-in tools.
     pub tools: Option<Vec<Arc<dyn AgentTool>>>,
+    /// Puts the agent's questions to the user; adds the `ask` tool.
+    pub asker: Option<Arc<dyn zp_tools::Asker>>,
     /// Directory with a global `AGENTS.md` (usually the data directory).
     pub global_context_dir: Option<PathBuf>,
     /// Replaces the default system prompt body.
@@ -159,6 +161,7 @@ impl CodingSessionOptions {
             model: None,
             thinking_level: None,
             tools: None,
+            asker: None,
             global_context_dir: None,
             custom_system_prompt: None,
             append_system_prompt: None,
@@ -219,8 +222,22 @@ pub struct CodingSession {
     prompt_inputs: Mutex<PromptInputs>,
     blobs: BlobStore,
     permissions: Option<Arc<PermissionGate>>,
+    asker: Option<Arc<dyn zp_tools::Asker>>,
     compaction: CompactionSettings,
     _persistence: Subscription,
+}
+
+/// `tools` plus `ask` when someone can answer.
+fn with_ask(
+    mut tools: Vec<Arc<dyn AgentTool>>,
+    asker: Option<&Arc<dyn zp_tools::Asker>>,
+) -> Vec<Arc<dyn AgentTool>> {
+    if let Some(asker) = asker
+        && !tools.iter().any(|tool| tool.name() == "ask")
+    {
+        tools.push(Arc::new(zp_tools::AskTool::new(asker.clone())));
+    }
+    tools
 }
 
 /// What the system prompt is built from (to rebuild it when trust, resources or tools
@@ -263,6 +280,7 @@ impl CodingSession {
             model,
             thinking_level,
             tools,
+            asker,
             global_context_dir,
             custom_system_prompt,
             append_system_prompt,
@@ -289,7 +307,10 @@ impl CodingSession {
             session.append_thinking_level_change(thinking)?;
         }
 
-        let tools = tools.unwrap_or_else(|| zp_tools::coding_tools(&cwd));
+        let tools = with_ask(
+            tools.unwrap_or_else(|| zp_tools::coding_tools(&cwd)),
+            asker.as_ref(),
+        );
         let context_files = context_files(&cwd, global_context_dir.as_deref(), trusted);
         let skills = resources.skills_prompt();
         let system_prompt = build_system_prompt(&SystemPromptOptions {
@@ -344,6 +365,7 @@ impl CodingSession {
             }),
             blobs,
             permissions,
+            asker,
             compaction,
             _persistence: persistence,
         })
@@ -470,9 +492,10 @@ impl CodingSession {
             .clone()
     }
 
-    /// Replaces the tools (e.g. MCP servers connected) and updates the system prompt.
+    /// Replaces the tools (e.g. MCP servers connected) and updates the system prompt;
+    /// `ask` stays when there is an asker.
     pub fn set_tools(&self, tools: Vec<Arc<dyn AgentTool>>) {
-        self.agent.set_tools(tools);
+        self.agent.set_tools(with_ask(tools, self.asker.as_ref()));
         self.rebuild_system_prompt();
     }
 

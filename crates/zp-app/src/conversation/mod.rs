@@ -8,6 +8,7 @@ pub mod composer;
 mod files;
 mod permissions;
 mod progress;
+mod questions;
 mod render;
 pub mod transcript;
 pub mod tree;
@@ -71,6 +72,8 @@ pub enum ConversationEvent {
     Command(composer::WindowCommand),
     /// A tool call waits for the user (its summary).
     ApprovalRequested(String),
+    /// The agent asks the user something (the first question).
+    QuestionAsked(String),
 }
 
 /// What runs after a compaction finishes.
@@ -179,6 +182,10 @@ pub struct ConversationView {
     change_log_cache: RefCell<Option<zp_core::changes::ChangeLog>>,
     /// Tool calls waiting for the user.
     approvals: Vec<permissions::Approval>,
+    /// Questions of `ask` calls waiting for the user.
+    questions: Vec<questions::QuestionCard>,
+    /// Whether the task list above the composer shows every item.
+    todos_open: bool,
     /// The sent message being edited, if any.
     editing: Option<MessageEdit>,
     /// Measured height of the floating composer.
@@ -221,6 +228,7 @@ pub struct ConversationView {
     _agent_events: Option<zp_agent::Subscription>,
     _pump: Option<Task<()>>,
     _approvals: Option<Task<()>>,
+    _questions: Option<Task<()>>,
     run_task: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
 }
@@ -284,6 +292,8 @@ impl ConversationView {
             turn_changes: RefCell::default(),
             change_log_cache: RefCell::default(),
             approvals: Vec::new(),
+            questions: Vec::new(),
+            todos_open: false,
             editing: None,
             composer_height: Rc::default(),
             composer_input_width: Rc::default(),
@@ -309,6 +319,7 @@ impl ConversationView {
             _agent_events: None,
             _pump: None,
             _approvals: None,
+            _questions: None,
             run_task: None,
             _subscriptions: subscriptions,
         };
@@ -358,6 +369,10 @@ impl ConversationView {
             Arc::new(crate::approvals::ChannelApprover::new(approval_sender)),
             options.models.clone(),
         )));
+        let (question_sender, mut question_receiver) = futures::channel::mpsc::unbounded();
+        options.asker = Some(Arc::new(crate::approvals::ChannelAsker::new(
+            question_sender,
+        )));
         let coding = Arc::new(CodingSession::new(options)?);
         let approvals = cx.spawn(async move |this, cx| {
             while let Some(pending) = approval_receiver.next().await {
@@ -370,6 +385,17 @@ impl ConversationView {
             }
         });
         self._approvals = Some(approvals);
+        let questions = cx.spawn(async move |this, cx| {
+            while let Some(pending) = question_receiver.next().await {
+                if this
+                    .update(cx, |this, cx| this.add_questions(pending, cx))
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+        self._questions = Some(questions);
 
         // Events carry their arrival time: batches are applied up to a frame later.
         let (sender, mut receiver) = futures::channel::mpsc::unbounded::<(Instant, AgentEvent)>();
@@ -1316,6 +1342,7 @@ impl ConversationView {
         self.change_log_cache.borrow_mut().take();
         self.refresh_last_row();
         self.clear_approvals();
+        self.clear_questions();
         self.invalidate_files();
         // A request too large for the context: compact once and try again.
         if !self.overflow_retried && self.coding.as_ref().is_some_and(|c| c.overflowed()) {

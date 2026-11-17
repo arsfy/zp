@@ -37,6 +37,8 @@ mod tests_conversation;
 mod tests_permissions;
 #[cfg(test)]
 mod tests_settings;
+#[cfg(test)]
+mod tests_tools;
 #[cfg(feature = "visual-tests")]
 mod visual;
 

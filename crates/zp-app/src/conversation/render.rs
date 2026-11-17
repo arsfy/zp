@@ -711,8 +711,10 @@ impl ConversationView {
         let expanded = self.tool_is_expanded(row, call, change.is_some(), cx);
 
         let approval = self.render_approval(&call.id, cx);
+        let question = self.render_questions(&call.id, cx);
         let (status_text, status_color) = match status {
             _ if approval.is_some() => ("awaiting approval".to_owned(), colors.warning),
+            _ if question.is_some() => ("waiting for you".to_owned(), colors.accent),
             None => ("pending".to_owned(), colors.text_muted),
             Some(ToolStatus::Running) => ("running…".to_owned(), colors.accent),
             Some(ToolStatus::Done) => ("done".to_owned(), colors.success),
@@ -813,7 +815,16 @@ impl ConversationView {
             .as_ref()
             .filter(|_| expanded)
             .map(|change| self.render_inline_diff(&call.id, change, cx));
-        let body = (expanded && diff_body.is_none() && approval.is_none()).then(|| {
+        let details_body = state
+            .filter(|state| state.status == ToolStatus::Done && expanded && question.is_none())
+            .and_then(|state| state.details.as_ref())
+            .and_then(|details| self.render_tool_details(&call.name, details, cx));
+        let body = (expanded
+            && diff_body.is_none()
+            && details_body.is_none()
+            && approval.is_none()
+            && question.is_none())
+        .then(|| {
             let output = state.map(|state| state.output.as_str()).unwrap_or_default();
             let lines: Vec<&str> = output.lines().collect();
             let (shown, note) = if lines.len() <= OUTPUT_PREVIEW_LINES {
@@ -875,9 +886,12 @@ impl ConversationView {
             .bg(colors.surface)
             .overflow_hidden()
             .when(approval.is_some(), |this| this.border_color(colors.warning))
+            .when(question.is_some(), |this| this.border_color(colors.accent))
             .child(header)
             .children(approval)
+            .children(question)
             .children(diff_body)
+            .children(details_body)
             .children(body)
             .into_any_element()
     }
@@ -1213,10 +1227,12 @@ impl ConversationView {
                 }))
         };
 
+        let todos = self.render_todo_panel(cx);
         let notes = div()
                 .flex()
                 .flex_col()
                 .gap_1()
+                .children(todos)
                 .when_some(self.run_error.clone(), |this, error| {
                     this.child(
                         div()
@@ -1733,6 +1749,7 @@ impl Render for ConversationView {
             .on_action(cx.listener(Self::close_picker))
             .on_action(cx.listener(Self::pick_first_model))
             .on_action(cx.listener(Self::deny_focused_approval))
+            .on_action(cx.listener(Self::submit_focused_answers))
             .on_action(
                 cx.listener(|this, _: &crate::actions::CompletionNext, _, cx| {
                     this.move_completion(1, cx)

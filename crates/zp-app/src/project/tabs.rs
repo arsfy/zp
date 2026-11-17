@@ -153,6 +153,10 @@ impl ProjectWindow {
                         let body = format!("Needs approval: {}", zp_tools::shorten(summary, 120));
                         this.notify_background(conversation, body, window, cx);
                     }
+                    ConversationEvent::QuestionAsked(question) => {
+                        let body = format!("Question: {}", zp_tools::shorten(question, 120));
+                        this.notify_background(conversation, body, window, cx);
+                    }
                     ConversationEvent::Command(command) => {
                         use crate::conversation::composer::WindowCommand;
                         match command {

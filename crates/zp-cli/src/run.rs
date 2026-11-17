@@ -44,7 +44,8 @@ pub(crate) struct RunArgs {
     /// Do not save the conversation.
     #[arg(long)]
     no_session: bool,
-    /// Comma-separated tools to enable (default: read,bash,edit,write,grep,find,ls).
+    /// Comma-separated tools to enable (default: read,bash,edit,write,grep,find,ls,todo,
+    /// and ask when stdin is a terminal).
     #[arg(long, value_delimiter = ',', conflicts_with = "no_tools")]
     tools: Option<Vec<String>>,
     /// Disable all tools.
@@ -167,14 +168,21 @@ pub(crate) async fn run(models: &Models, args: RunArgs) -> Result<()> {
         chosen.base_url.clone_from(base_url);
         model = Some(chosen);
     }
+    // `ask` is added below when there is a terminal to answer on.
+    let mut ask = !args.no_tools;
     let tools = if args.no_tools {
         Some(Vec::new())
     } else if let Some(names) = &args.tools {
         let mut tools = Vec::new();
+        ask = false;
         for name in names.iter().map(|n| n.trim()).filter(|n| !n.is_empty()) {
+            if name == "ask" {
+                ask = true;
+                continue;
+            }
             tools.push(zp_tools::create_tool(name, &cwd).with_context(|| {
                 format!(
-                    "unknown tool `{name}` (available: {})",
+                    "unknown tool `{name}` (available: {}, ask)",
                     zp_tools::ALL_TOOLS.join(", ")
                 )
             })?);
@@ -215,6 +223,12 @@ pub(crate) async fn run(models: &Models, args: RunArgs) -> Result<()> {
         ))
     });
     let approver = Arc::new(TerminalApprover::new(input.clone(), Style::detect()));
+    if ask && let Some(input) = &input {
+        options.asker = Some(Arc::new(crate::ask::TerminalAsker::new(
+            input.clone(),
+            Style::detect(),
+        )));
+    }
     options.permissions = Some(Arc::new(PermissionGate::new(
         policy,
         approver,
@@ -747,6 +761,13 @@ fn summarize_result(tool: &str, result: &AgentToolResult, is_error: bool) -> Str
     }
     match tool {
         "read" => format!("  {} lines", lines.len()),
+        // The whole list: it is the progress report.
+        "todo" => result
+            .details
+            .as_ref()
+            .and_then(zp_tools::TodoList::from_details)
+            .map(|list| indent(&list.render().lines().collect::<Vec<_>>()))
+            .unwrap_or_default(),
         "bash" => {
             let mut shown = indent(&lines[lines.len().saturating_sub(PREVIEW_LINES)..]);
             if lines.len() > PREVIEW_LINES {

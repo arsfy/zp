@@ -418,6 +418,83 @@ async fn review_model_reads_project_files_before_deciding() {
     );
 }
 
+/// Answers every question with its first option.
+struct FirstOption;
+
+impl zp_tools::Asker for FirstOption {
+    fn ask(
+        &self,
+        _call_id: &str,
+        request: zp_tools::AskRequest,
+    ) -> BoxFuture<'static, Option<Vec<zp_tools::Answer>>> {
+        let answers = request
+            .questions
+            .iter()
+            .map(|question| zp_tools::Answer {
+                selected: question
+                    .options
+                    .first()
+                    .map(|option| vec![option.label.clone()])
+                    .unwrap_or_default(),
+                text: String::new(),
+            })
+            .collect();
+        Box::pin(async move { Some(answers) })
+    }
+}
+
+#[tokio::test]
+async fn ask_and_todo_need_no_approval() {
+    let project = tempfile::tempdir().unwrap();
+    let root = project.path().canonicalize().unwrap();
+    let faux = FauxProvider::default();
+    faux.push(call(
+        "todo",
+        json!({"todos": [{"content": "Decide", "status": "in_progress"}]}),
+    ));
+    faux.push(call(
+        "ask",
+        json!({"questions": [{"question": "Which?", "options": [{"label": "This one"}]}]}),
+    ));
+    faux.push(FauxResponse::text("done"));
+    // No scripted answers: any approval request would panic.
+    let approver = Arc::new(Scripted::default());
+    let mut models = Models::new();
+    models.set_provider(Arc::new(faux.clone()));
+    let policy = PermissionPolicy {
+        mode: PermissionMode::Ask,
+        root: root.clone(),
+        ..PermissionPolicy::default()
+    };
+    let gate = Arc::new(PermissionGate::new(policy, approver, models.clone()));
+    let mut options = CodingSessionOptions::new(models, &root, Session::in_memory(&root));
+    options.model = Some(faux.model());
+    options.permissions = Some(gate);
+    options.asker = Some(Arc::new(FirstOption));
+    let coding = CodingSession::new(options).unwrap();
+    assert!(coding.system_prompt().contains("- ask: Ask the user"));
+    assert!(
+        coding
+            .system_prompt()
+            .contains("- todo: Plan multi-step work")
+    );
+
+    let output = results(&coding.prompt("choose").await.unwrap());
+    assert_eq!(output.len(), 2);
+    assert!(!output[0].0 && output[0].1.contains("[>] Decide"));
+    assert_eq!(output[1], (false, "Q: Which?\nA: This one".to_owned()));
+
+    // Replacing the tools (MCP servers changed) keeps `ask`.
+    coding.set_tools(zp_tools::coding_tools(&root));
+    let names: Vec<String> = coding
+        .agent()
+        .tools()
+        .iter()
+        .map(|tool| tool.name().to_owned())
+        .collect();
+    assert!(names.iter().any(|name| name == "ask") && names.iter().any(|name| name == "todo"));
+}
+
 #[tokio::test]
 async fn untrusted_projects_do_not_instruct_the_agent() {
     let project = tempfile::tempdir().unwrap();

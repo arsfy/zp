@@ -114,7 +114,7 @@ async fn read_edit_test_then_resume() {
         "<cwd>\n{}\n</cwd>",
         cwd.to_string_lossy().replace('\\', "/")
     )));
-    assert_eq!(request.tools.len(), 7);
+    assert_eq!(request.tools.len(), zp_tools::ALL_TOOLS.len());
 
     // Everything was persisted as it happened.
     let reopened = manager.open(&session_file).unwrap();
