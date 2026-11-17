@@ -762,8 +762,12 @@ impl ProjectWindow {
             .and_then(|s| s.model.clone().map(|m| (s, m)))
         {
             let usage = &status.usage;
+            let estimate = if status.output_estimated { "~" } else { "" };
             let input = usage.input + usage.cache_read + usage.cache_write;
-            right.push(format!("{} tokens", format_tokens(input + usage.output)));
+            right.push(format!(
+                "{estimate}{} tokens",
+                format_tokens(input + usage.output)
+            ));
             if input > 0 {
                 right.push(format!(
                     "cache {:.0}%",
@@ -771,9 +775,9 @@ impl ProjectWindow {
                 ));
             }
             if let Some(speed) = status.tokens_per_second {
-                right.push(format!("{speed:.0} tok/s"));
+                right.push(format!("{estimate}{speed:.0} tok/s"));
             }
-            right.push(format!("${:.4}", usage.cost));
+            right.push(format!("{estimate}${:.4}", usage.cost));
             if model.context_window > 0 {
                 let context_tokens = |tokens| match tokens {
                     1_000..1_000_000 => format!("{:.0}k", tokens as f64 / 1_000.0),

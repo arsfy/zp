@@ -785,6 +785,7 @@ impl ConversationView {
             return;
         }
         self.compacting = true;
+        self.start_status_updates(cx);
         self.refresh_last_row();
         self.run_error = None;
         cx.emit(ConversationEvent::StatusChanged);
@@ -817,6 +818,8 @@ impl ConversationView {
                     && this.run_error.is_none()
                 {
                     this.run_followup(then, cx);
+                } else {
+                    this.stop_status_updates(cx);
                 }
                 cx.notify();
             });

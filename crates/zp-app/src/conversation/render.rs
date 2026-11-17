@@ -1,12 +1,10 @@
 //! Rendering of the conversation: transcript rows, tool cards and the composer.
 
-use std::time::Duration;
-
 use gpui::{
-    Anchor, Animation, AnimationExt as _, AnyElement, App, ClipboardItem, ColorExt as _, Context,
-    DispatchPhase, ElementId, FontWeight, IntoElement, MouseButton, Render, SharedString, Window,
-    anchored, canvas, deferred, div, linear_color_stop, linear_gradient, list, point, prelude::*,
-    px, relative, rgb_to_hsla, svg,
+    Anchor, AnyElement, App, ClipboardItem, ColorExt as _, Context, DispatchPhase, ElementId,
+    FontWeight, IntoElement, MouseButton, Render, SharedString, Window, anchored, canvas, deferred,
+    div, linear_color_stop, linear_gradient, list, point, prelude::*, px, relative, rgb_to_hsla,
+    svg,
 };
 use gpui_elements::editable_text::{text_area, text_input};
 use zp_ai::{AssistantContent, StopReason, ToolCall};
@@ -44,30 +42,6 @@ fn centered(content: impl IntoElement) -> gpui::Div {
         .justify_center()
         .px_4()
         .child(div().w_full().max_w(px(CONTENT_WIDTH)).child(content))
-}
-
-/// Three dots pulsing in turn: the agent is working.
-fn loading_dots(cx: &App) -> AnyElement {
-    let color = cx.theme().colors.text_muted;
-    div()
-        .id("loading")
-        .h(px(20.))
-        .flex()
-        .items_center()
-        .gap(px(5.))
-        .children((0..3usize).map(|index| {
-            div().size(px(6.)).rounded_full().bg(color).with_animation(
-                ("loading-dot", index),
-                Animation::new(Duration::from_millis(1200)).repeat_synced(),
-                move |dot, t| {
-                    // Each dot peaks a third of a cycle after the previous one.
-                    let phase = (t - index as f32 / 3.0).rem_euclid(1.0);
-                    let wave = (phase * std::f32::consts::TAU).cos() * 0.5 + 0.5;
-                    dot.opacity(0.25 + 0.75 * wave)
-                },
-            )
-        }))
-        .into_any_element()
 }
 
 /// Height of the fade above the floating composer.
@@ -366,7 +340,7 @@ impl ConversationView {
     }
 
     /// The line under a message: the working indicator on the last row while busy,
-    /// otherwise its actions. It has a fixed height so rows never move when it changes;
+    /// otherwise its actions. The working indicator reserves room for elapsed time;
     /// assistant messages in the middle of an answer have none.
     fn render_row_footer(
         &self,
@@ -389,7 +363,7 @@ impl ConversationView {
         }
         if self.is_busy() {
             return Some(
-                slot.when(last, |this| this.child(loading_dots(cx)))
+                slot.when(last, |this| this.h(px(38.)).child(self.progress.clone()))
                     .into_any_element(),
             );
         }

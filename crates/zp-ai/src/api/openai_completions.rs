@@ -794,6 +794,7 @@ impl<'a> Decoder<'a> {
         if let Some(cost) = usage.get("cost").and_then(Value::as_f64) {
             message.usage.cost.total = cost;
         }
+        sink.emit_usage();
     }
 
     /// Ends all open blocks in content order.

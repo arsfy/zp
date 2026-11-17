@@ -1,6 +1,8 @@
 //! M8: approval cards, session grants, the permission mode picker, stopping while waiting
 //! and project trust — with real tools in a temp project.
 
+use std::time::Duration;
+
 use gpui::{Entity, Modifiers, TestAppContext, VisualTestContext};
 use serde_json::json;
 use zp_ai::{FauxProvider, FauxResponse};
@@ -51,6 +53,54 @@ fn tool_results(
             })
             .collect()
     })
+}
+
+#[gpui::test]
+fn task_clock_pauses_for_approval_and_resets_for_the_next_task(cx: &mut TestAppContext) {
+    let faux = FauxProvider::default().with_chunk_delay(Duration::from_millis(30));
+    faux.push(FauxResponse::tool_call(
+        "write",
+        json!({"path": "a.txt", "content": "new"}),
+    ));
+    faux.push(FauxResponse::text("done"));
+    faux.push(FauxResponse::text("another answer"));
+    let data = setup_models(cx, &[&faux], false);
+    set_permission_mode(&data, PermissionMode::Ask);
+    let (_dir, project) = project_dir();
+    let window = open(cx, &project);
+    let conversation = active(window, cx);
+    send(window, "write the file", cx);
+    let call = wait_for_approval(&conversation, cx);
+    let paused = conversation.read_with(cx, |view, cx| view.task_elapsed(cx));
+    cx.executor().advance_clock(Duration::from_secs(10));
+    cx.run_until_parked();
+    assert_eq!(
+        conversation.read_with(cx, |view, cx| view.task_elapsed(cx)),
+        paused
+    );
+
+    conversation.update(cx, |view, cx| {
+        view.answer_approval(&call, Decision::Allow, cx)
+    });
+    cx.executor().advance_clock(Duration::from_secs(3));
+    cx.run_until_parked();
+    assert!(conversation.read_with(cx, |view, cx| view.task_elapsed(cx)) > paused);
+    wait_until(cx, |cx| {
+        conversation.read_with(cx, |view, _| !view.is_running())
+    });
+    let finished = conversation.read_with(cx, |view, cx| view.task_elapsed(cx));
+    cx.executor().advance_clock(Duration::from_secs(10));
+    cx.run_until_parked();
+    assert_eq!(
+        conversation.read_with(cx, |view, cx| view.task_elapsed(cx)),
+        finished
+    );
+
+    send(window, "next task", cx);
+    assert!(conversation.read_with(cx, |view, cx| view.task_elapsed(cx)) < Duration::from_secs(1));
+    wait_until(cx, |cx| {
+        conversation.read_with(cx, |view, _| !view.is_running())
+    });
 }
 
 #[gpui::test]

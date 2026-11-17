@@ -15,7 +15,7 @@ use serde_json::Value;
 
 use crate::partial_json::parse_partial_json;
 use crate::types::{
-    AssistantContent, AssistantMessage, StopReason, TextContent, ThinkingContent, ToolCall,
+    AssistantContent, AssistantMessage, StopReason, TextContent, ThinkingContent, ToolCall, Usage,
 };
 
 /// One step of a streaming response.
@@ -26,6 +26,8 @@ pub enum AssistantMessageEvent {
         /// Message skeleton without content.
         message: AssistantMessage,
     },
+    /// The provider's latest cumulative usage for this response.
+    Usage { usage: Usage },
     /// A text block opened at `index`.
     TextStart {
         /// Content index.
@@ -149,6 +151,7 @@ impl StreamAccumulator {
                 self.message = message.clone();
                 self.raw_arguments.clear();
             }
+            E::Usage { usage } => self.message.usage = usage.clone(),
             E::TextStart { index } => self.insert(
                 *index,
                 AssistantContent::Text(TextContent {
@@ -254,6 +257,13 @@ impl EventSink {
     pub fn emit(&mut self, event: AssistantMessageEvent) -> bool {
         self.accumulator.apply(&event);
         self.sender.unbounded_send(event).is_ok()
+    }
+
+    /// Forwards usage metadata as soon as the provider reports it.
+    pub(crate) fn emit_usage(&mut self) {
+        self.emit(AssistantMessageEvent::Usage {
+            usage: self.message().usage.clone(),
+        });
     }
 
     /// Emits `Done` with the current message.

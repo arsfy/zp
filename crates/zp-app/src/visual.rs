@@ -125,6 +125,42 @@ pub fn run(out: PathBuf) {
         println!("review model screenshots written to {}", out.display());
         return;
     }
+    if std::env::var("ZP_VISUAL_SCENE").as_deref() == Ok("live-status") {
+        for (name, width, height) in [("desktop", 1280., 820.), ("compact", 800., 620.)] {
+            let window = cx
+                .open_offscreen_window(size(px(width), px(height)), |window, cx| {
+                    let session = zp_session::Session::in_memory(&root);
+                    cx.new(|cx| ProjectWindow::new_with_session(root.clone(), session, window, cx))
+                })
+                .unwrap();
+            cx.update_window(window.into(), |view, _, cx| {
+                let conversation = view.downcast::<ProjectWindow>().unwrap();
+                let conversation = conversation.read(cx).active_conversation().unwrap().clone();
+                conversation.update(cx, |view, cx| {
+                    let mut events = streaming_text_events();
+                    events.push(AgentEvent::MessageUpdate {
+                        event: AssistantMessageEvent::Usage {
+                            usage: zp_ai::Usage {
+                                input: 3500,
+                                cache_read: 6500,
+                                total_tokens: 10000,
+                                ..Default::default()
+                            },
+                        },
+                    });
+                    view.inject(events, true, cx);
+                });
+            })
+            .unwrap();
+            pump(&mut cx, Duration::from_millis(1200));
+            cx.capture_screenshot(window.into())
+                .unwrap()
+                .save(out.join(format!("live-status-{name}.png")))
+                .unwrap();
+        }
+        println!("live status screenshots written to {}", out.display());
+        return;
+    }
     inline_code_layout(&mut cx, &root, &out);
     if std::env::var("ZP_VISUAL_SCENE").as_deref() == Ok("inline-code") {
         println!("inline code screenshots written to {}", out.display());

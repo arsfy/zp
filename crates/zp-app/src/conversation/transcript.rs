@@ -121,6 +121,13 @@ impl Transcript {
         &self.usage
     }
 
+    /// Usage of the unfinished response, excluded from the completed totals.
+    pub fn streaming_usage(&self) -> Option<&zp_ai::Usage> {
+        self.streaming
+            .as_ref()
+            .map(|(_, accumulator)| &accumulator.message().usage)
+    }
+
     /// The tool call `id`.
     /// The row of the assistant message that made tool call `id`.
     pub fn row_of_tool(&self, id: &str) -> Option<usize> {
@@ -395,6 +402,51 @@ mod tests {
         assert_eq!(transcript.tool("c1").unwrap().status, ToolStatus::Done);
         assert_eq!(transcript.usage().output, 10);
         assert_eq!(transcript.failed_response(), None);
+    }
+
+    #[test]
+    fn streaming_usage_is_replaced_by_final_usage_without_double_counting() {
+        let first = assistant(Vec::new(), StopReason::Stop);
+        let mut transcript = Transcript::from_messages(&[first.clone().into()]);
+        let mut changes = Changes::default();
+        transcript.apply(
+            &AgentEvent::MessageStart {
+                message: AssistantMessage::empty("faux", "faux", "m").into(),
+            },
+            &mut changes,
+        );
+        let usage = Usage {
+            input: 10,
+            cache_read: 90,
+            output: 2,
+            total_tokens: 102,
+            ..Usage::default()
+        };
+        transcript.apply(
+            &AgentEvent::MessageUpdate {
+                event: AssistantMessageEvent::Usage {
+                    usage: usage.clone(),
+                },
+            },
+            &mut changes,
+        );
+        assert_eq!(transcript.streaming_usage(), Some(&usage));
+        assert_eq!(transcript.usage().output, 5);
+        let mut final_message = first;
+        final_message.usage = Usage {
+            output: 20,
+            total_tokens: 120,
+            ..usage
+        };
+        transcript.apply(
+            &AgentEvent::MessageEnd {
+                message: final_message.into(),
+            },
+            &mut changes,
+        );
+        assert!(transcript.streaming_usage().is_none());
+        assert_eq!(transcript.usage().output, 25);
+        assert_eq!(transcript.usage().cache_read, 90);
     }
 
     #[test]

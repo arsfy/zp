@@ -508,6 +508,7 @@ impl<'a> Decoder<'a> {
         }
         message.usage.update_total();
         self.model.calculate_cost(&mut message.usage);
+        sink.emit_usage();
     }
 
     /// Handles one SSE event.
@@ -995,6 +996,8 @@ data: {"type":"message_stop"}
         let (events, message) = decode(&model, TOOL_STREAM).await;
 
         assert!(matches!(events[0], AssistantMessageEvent::Start { .. }));
+        assert!(matches!(&events[1], AssistantMessageEvent::Usage { usage }
+            if usage.input == 100 && usage.cache_read == 1000 && usage.output == 1));
         assert!(matches!(
             events.last(),
             Some(AssistantMessageEvent::Done { .. })
@@ -1024,6 +1027,7 @@ data: {"type":"message_stop"}
             accumulator.apply(event);
         }
         assert_eq!(accumulator.message().content, message.content);
+        assert_eq!(accumulator.message().usage, message.usage);
     }
 
     #[tokio::test]

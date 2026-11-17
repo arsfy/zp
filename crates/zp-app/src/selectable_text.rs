@@ -380,7 +380,7 @@ impl TextSelection {
                 assert_eq!(painted.size.height, native.bounds.size.height);
                 let interaction = geometry.interaction_point(native.bounds.center());
                 assert_eq!(
-                    f32::from(interaction.y / geometry.line_height) as usize,
+                    (interaction.y / geometry.line_height) as usize,
                     native.visual_line_index
                 );
             }

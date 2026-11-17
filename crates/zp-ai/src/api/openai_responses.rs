@@ -709,6 +709,7 @@ impl<'a> Decoder<'a> {
             message.usage.reasoning = read("/output_tokens_details/reasoning_tokens");
             message.usage.update_total();
             self.model.calculate_cost(&mut message.usage);
+            sink.emit_usage();
         }
         let reason = response
             .pointer("/incomplete_details/reason")

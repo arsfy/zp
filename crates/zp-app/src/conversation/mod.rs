@@ -7,6 +7,7 @@
 pub mod composer;
 mod files;
 mod permissions;
+mod progress;
 mod render;
 pub mod transcript;
 pub mod tree;
@@ -39,6 +40,8 @@ use crate::store::{AppModels, AppPaths};
 
 /// Minimum time between applying event batches.
 const FRAME_INTERVAL: Duration = Duration::from_millis(33);
+/// Status updates are less frequent than streamed text and stop when the task ends.
+const STATUS_INTERVAL: Duration = Duration::from_millis(250);
 
 /// A session handed over to the window (e.g. a fork to open in a new tab).
 pub type SessionHandoff = Rc<RefCell<Option<Session>>>;
@@ -102,7 +105,9 @@ pub struct ConversationStatus {
     pub thinking: ThinkingLevel,
     pub usage: UsageTotals,
     pub running: bool,
-    /// Output speed of the last streamed response.
+    /// Whether the in-flight output usage is estimated until provider usage arrives.
+    pub output_estimated: bool,
+    /// Output speed of the current or last streamed response.
     pub tokens_per_second: Option<f64>,
 }
 
@@ -111,6 +116,24 @@ pub struct ConversationStatus {
 struct ResponseTimer {
     started: Option<Instant>,
     first_output: Option<Instant>,
+    output_bytes: u64,
+    reported_output: u64,
+    reported_bytes: u64,
+}
+
+impl ResponseTimer {
+    fn estimated_output(&self) -> u64 {
+        // Match the existing rough token estimate, counting only new bytes after a
+        // provider update so that reported counts recalibrate the live estimate.
+        self.reported_output + (self.output_bytes - self.reported_bytes).div_ceil(4)
+    }
+
+    fn speed(&self, at: Instant, output: u64) -> Option<f64> {
+        let seconds = at
+            .duration_since(self.first_output.or(self.started)?)
+            .as_secs_f64();
+        (output > 0 && seconds >= 0.05).then(|| output as f64 / seconds)
+    }
 }
 
 /// A model offered by the model picker.
@@ -166,6 +189,8 @@ pub struct ConversationView {
     response_timer: ResponseTimer,
     /// Output tokens per second of the last streamed response.
     tokens_per_second: Option<f64>,
+    progress: Entity<progress::RunProgress>,
+    status_task: Option<Task<()>>,
     /// The `/` or `@` completion menu.
     completion: Option<composer::Completion>,
     /// Scrolls the selected completion item into view.
@@ -262,6 +287,8 @@ impl ConversationView {
             copied_row: None,
             response_timer: ResponseTimer::default(),
             tokens_per_second: None,
+            progress: cx.new(|_| progress::RunProgress::default()),
+            status_task: None,
             completion: None,
             completion_scroll: ScrollHandle::new(),
             suppress_completion: None,
@@ -421,15 +448,25 @@ impl ConversationView {
             } => {
                 self.response_timer = ResponseTimer {
                     started: Some(at),
-                    first_output: None,
+                    ..ResponseTimer::default()
                 };
-                false
+                self.tokens_per_second = None;
+                true
             }
             AgentEvent::MessageUpdate { event } => {
-                if !matches!(event, AssistantMessageEvent::Start { .. })
-                    && self.response_timer.first_output.is_none()
+                if let AssistantMessageEvent::Usage { usage } = event
+                    && usage.output > 0
                 {
-                    self.response_timer.first_output = Some(at);
+                    self.response_timer.reported_output = usage.output;
+                    self.response_timer.reported_bytes = self.response_timer.output_bytes;
+                }
+                if let AssistantMessageEvent::TextDelta { delta, .. }
+                | AssistantMessageEvent::ThinkingDelta { delta, .. }
+                | AssistantMessageEvent::ToolCallDelta { delta, .. } = event
+                    && !delta.is_empty()
+                {
+                    self.response_timer.first_output.get_or_insert(at);
+                    self.response_timer.output_bytes += delta.len() as u64;
                 }
                 false
             }
@@ -437,19 +474,17 @@ impl ConversationView {
                 message: zp_agent::AgentMessage::Llm(Message::Assistant(message)),
             } => {
                 let timer = std::mem::take(&mut self.response_timer);
-                let Some(from) = timer.first_output.or(timer.started) else {
-                    return false;
-                };
-                let seconds = at.duration_since(from).as_secs_f64();
-                let output = message.usage.output;
-                if matches!(message.stop_reason, StopReason::Error | StopReason::Aborted)
-                    || output == 0
-                    || seconds < 0.05
-                {
-                    return false;
-                }
-                self.tokens_per_second = Some(output as f64 / seconds);
+                self.tokens_per_second =
+                    if matches!(message.stop_reason, StopReason::Error | StopReason::Aborted) {
+                        None
+                    } else {
+                        timer.speed(at, message.usage.output)
+                    };
                 true
+            }
+            AgentEvent::AgentEnd { .. } => {
+                self.response_timer = ResponseTimer::default();
+                false
             }
             _ => false,
         }
@@ -600,6 +635,11 @@ impl ConversationView {
     #[cfg(feature = "visual-tests")]
     pub fn inject(&mut self, events: Vec<AgentEvent>, running: bool, cx: &mut Context<Self>) {
         self.running = running;
+        if running {
+            self.start_status_updates(cx);
+        } else {
+            self.stop_status_updates(cx);
+        }
         self.refresh_last_row();
         let now = Instant::now();
         self.apply_events(events.into_iter().map(|e| (now, e)).collect(), cx);
@@ -949,13 +989,75 @@ impl ConversationView {
 
     pub fn status(&self) -> ConversationStatus {
         let agent = self.coding.as_ref().map(|coding| coding.agent());
-        ConversationStatus {
-            model: agent.and_then(|agent| agent.model()),
-            thinking: agent.map_or(ThinkingLevel::Off, |agent| agent.thinking_level()),
-            usage: self.transcript.usage().clone(),
-            running: self.running,
-            tokens_per_second: self.tokens_per_second,
+        let model = agent.and_then(|agent| agent.model());
+        let mut usage = self.transcript.usage().clone();
+        let mut output_estimated = false;
+        let mut tokens_per_second = self.tokens_per_second;
+        if let Some(partial) = self.transcript.streaming_usage() {
+            let mut partial = partial.clone();
+            let estimated = self.response_timer.estimated_output();
+            if estimated > partial.output {
+                partial.output = estimated;
+                partial.update_total();
+                output_estimated = true;
+                if let Some(model) = &model {
+                    model.calculate_cost(&mut partial);
+                }
+            }
+            tokens_per_second = self
+                .response_timer
+                .first_output
+                .and_then(|_| self.response_timer.speed(Instant::now(), partial.output));
+            usage.add(&partial);
+            if partial.total_input() > 0 {
+                usage.last_context_tokens = partial.total_tokens;
+            }
         }
+        ConversationStatus {
+            model,
+            thinking: agent.map_or(ThinkingLevel::Off, |agent| agent.thinking_level()),
+            usage,
+            running: self.running,
+            output_estimated,
+            tokens_per_second,
+        }
+    }
+
+    fn start_status_updates(&mut self, cx: &mut Context<Self>) {
+        if self.status_task.is_some() {
+            return;
+        }
+        self.progress.update(cx, |progress, cx| progress.start(cx));
+        self.status_task = Some(cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(STATUS_INTERVAL).await;
+                if this
+                    .update(cx, |this, cx| {
+                        this.progress
+                            .update(cx, |progress, cx| progress.refresh(cx));
+                        // The progress entity redraws only when its displayed second changes.
+                        // Do not invalidate transcript layout for status ticks.
+                        if this.transcript.streaming_usage().is_some() {
+                            cx.emit(ConversationEvent::StatusChanged);
+                        }
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        }));
+    }
+
+    fn stop_status_updates(&mut self, cx: &mut Context<Self>) {
+        self.status_task = None;
+        self.progress
+            .update(cx, |progress, cx| progress.set_paused(true, cx));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn task_elapsed(&self, cx: &App) -> Duration {
+        self.progress.read(cx).elapsed(cx)
     }
 
     /// The selected model; `None` until the user picks one when no provider was usable.
@@ -1174,6 +1276,9 @@ impl ConversationView {
             return;
         };
         self.running = true;
+        self.tokens_per_second = None;
+        self.response_timer = ResponseTimer::default();
+        self.start_status_updates(cx);
         self.run_error = None;
         self.refresh_last_row();
         self.list_state.set_follow_mode(gpui::FollowMode::Tail);
@@ -1214,6 +1319,7 @@ impl ConversationView {
             return;
         }
         let failed = self.has_failed();
+        self.stop_status_updates(cx);
         cx.emit(ConversationEvent::StatusChanged);
         cx.emit(ConversationEvent::RunFinished);
         if !failed {
@@ -1448,5 +1554,108 @@ fn fork_session(coding: &CodingSession, entry: &str, cx: &App) -> anyhow::Result
 impl Focusable for ConversationView {
     fn focus_handle(&self, _: &App) -> FocusHandle {
         self.focus_handle.clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui::TestAppContext;
+    use zp_ai::{AssistantMessage, AssistantMessageEvent, FauxProvider, Usage};
+
+    #[gpui::test]
+    fn live_usage_includes_cache_and_recalibrates_to_provider_counts(cx: &mut TestAppContext) {
+        let faux = FauxProvider::default();
+        let _data = crate::tests_conversation::setup_models(cx, &[&faux], false);
+        let (_dir, project) = crate::tests::project_dir();
+        let window = crate::tests_conversation::open(cx, &project);
+        let conversation = crate::tests_conversation::active(window, cx);
+        let at = Instant::now() - Duration::from_secs(2);
+        let mut message = AssistantMessage::empty("faux", "faux", "faux-1");
+        let usage = Usage {
+            input: 10,
+            cache_read: 90,
+            output: 1,
+            total_tokens: 101,
+            ..Usage::default()
+        };
+        conversation.update(cx, |view, cx| {
+            view.apply_events(
+                vec![
+                    (
+                        at,
+                        AgentEvent::MessageStart {
+                            message: message.clone().into(),
+                        },
+                    ),
+                    (
+                        at,
+                        AgentEvent::MessageUpdate {
+                            event: AssistantMessageEvent::Usage {
+                                usage: usage.clone(),
+                            },
+                        },
+                    ),
+                    (
+                        at,
+                        AgentEvent::MessageUpdate {
+                            event: AssistantMessageEvent::TextStart { index: 0 },
+                        },
+                    ),
+                    (
+                        at,
+                        AgentEvent::MessageUpdate {
+                            event: AssistantMessageEvent::TextDelta {
+                                index: 0,
+                                delta: "x".repeat(400),
+                            },
+                        },
+                    ),
+                ],
+                cx,
+            );
+        });
+        let live = conversation.read_with(cx, |view, _| view.status());
+        assert_eq!(
+            (live.usage.input, live.usage.cache_read, live.usage.output),
+            (10, 90, 101)
+        );
+        assert!(live.output_estimated);
+        assert!(live.tokens_per_second.is_some_and(|speed| speed > 0.));
+
+        message.usage = Usage {
+            output: 20,
+            total_tokens: 120,
+            ..usage
+        };
+        conversation.update(cx, |view, cx| {
+            view.apply_events(
+                vec![(
+                    at,
+                    AgentEvent::MessageUpdate {
+                        event: AssistantMessageEvent::Usage {
+                            usage: message.usage.clone(),
+                        },
+                    },
+                )],
+                cx,
+            );
+        });
+        let calibrated = conversation.read_with(cx, |view, _| view.status());
+        assert_eq!(calibrated.usage.output, 20);
+        assert!(!calibrated.output_estimated);
+        conversation.update(cx, |view, cx| {
+            view.apply_events(
+                vec![(
+                    at,
+                    AgentEvent::MessageEnd {
+                        message: message.into(),
+                    },
+                )],
+                cx,
+            );
+        });
+        let finished = conversation.read_with(cx, |view, _| view.status());
+        assert_eq!(finished.usage, calibrated.usage);
     }
 }

@@ -132,6 +132,8 @@ impl ConversationView {
             reason,
             preview,
         });
+        self.progress
+            .update(cx, |progress, cx| progress.set_paused(true, cx));
         self.refresh_tool_row(&call_id);
         cx.emit(ConversationEvent::StatusChanged);
         cx.notify();
@@ -183,6 +185,10 @@ impl ConversationView {
             return;
         };
         let mut approval = self.approvals.remove(index);
+        if self.approvals.is_empty() && self.is_busy() {
+            self.progress
+                .update(cx, |progress, cx| progress.set_paused(false, cx));
+        }
         if let Some(reply) = approval.reply.take() {
             let _ = reply.send(decision);
         }

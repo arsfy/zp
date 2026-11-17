@@ -349,6 +349,7 @@ mod tests {
             .iter()
             .map(|event| match event {
                 AssistantMessageEvent::Start { .. } => "start",
+                AssistantMessageEvent::Usage { .. } => "usage",
                 AssistantMessageEvent::TextStart { .. } => "text_start",
                 AssistantMessageEvent::TextDelta { .. } => "text_delta",
                 AssistantMessageEvent::TextEnd { .. } => "text_end",
