@@ -91,7 +91,7 @@ impl ChangesPanel {
     pub fn new(root: PathBuf) -> Self {
         Self {
             root,
-            mode: ChangesMode::Session,
+            mode: ChangesMode::Git,
             conversation: None,
             files: Vec::new(),
             groups: Vec::new(),

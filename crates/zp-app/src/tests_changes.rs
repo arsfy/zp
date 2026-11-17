@@ -835,7 +835,14 @@ fn git_working_tree(cx: &mut TestAppContext) {
 
     let window = open(cx, &project);
     let panel = panel(window, cx);
-    panel.update(cx, |panel, cx| panel.set_mode(ChangesMode::Git, cx));
+    click(window, "status-changes", cx);
+    assert!(with_window(window, cx, |view, _, _| view
+        .layout()
+        .right_panel_visible));
+    assert_eq!(
+        panel.read_with(cx, |panel, _| panel.mode()),
+        ChangesMode::Git
+    );
     wait_until(cx, |cx| {
         panel.read_with(cx, |panel, _| panel.git_files().is_some())
     });
@@ -848,6 +855,15 @@ fn git_working_tree(cx: &mut TestAppContext) {
             .collect()
     });
     assert_eq!(files, ["M main.rs", "U new.rs"]);
+    for mode in [ChangesMode::Session, ChangesMode::Turns, ChangesMode::Git] {
+        panel.update(cx, |panel, cx| panel.set_mode(mode, cx));
+        click(window, "status-changes", cx);
+        assert!(!with_window(window, cx, |view, _, _| view
+            .layout()
+            .right_panel_visible));
+        click(window, "status-changes", cx);
+        assert_eq!(panel.read_with(cx, |panel, _| panel.mode()), mode);
+    }
     let file = panel.read_with(cx, |panel, _| panel.git_files().unwrap()[0].clone());
     panel.update(cx, |panel, cx| panel.open_git_file(&file, cx));
     cx.run_until_parked();

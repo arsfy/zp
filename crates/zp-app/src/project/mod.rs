@@ -822,6 +822,7 @@ impl ProjectWindow {
                             .child(
                                 div()
                                     .id("status-changes")
+                                    .debug_selector(|| "status-changes".into())
                                     .size(px(20.))
                                     .flex()
                                     .items_center()
