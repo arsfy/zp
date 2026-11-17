@@ -250,7 +250,7 @@ fn code_block(
                 .pt_1()
                 .text_size(px(11.))
                 .text_color(style.muted)
-                .child(language.unwrap_or_default().to_owned())
+                .child(language.unwrap_or("text").to_owned())
                 .child(
                     div()
                         .id(ids.next())
