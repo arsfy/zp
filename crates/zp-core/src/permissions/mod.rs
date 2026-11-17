@@ -24,7 +24,7 @@ use zp_ai::{Message, Model, Models, UserContent};
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum PermissionMode {
-    /// Commands and file changes need approval.
+    /// Read-only commands run automatically; other commands and file changes need approval.
     #[default]
     Ask,
     /// File changes, non-destructive Git operations and echo writes run automatically.
@@ -51,7 +51,7 @@ impl PermissionMode {
     pub fn description(self) -> &'static str {
         match self {
             Self::Ask => {
-                "Approve commands and file changes; navigation and echo output run automatically"
+                "Approve commands and file changes; read-only commands and echo output run automatically"
             }
             Self::AutoEdit => {
                 "Auto-approve file changes, echo writes and non-destructive Git operations"
@@ -719,6 +719,50 @@ mod tests {
                 ));
                 assert!(matches!(&reasons[..], [AskReason::Dangerous(_)]));
                 assert!(grants.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn read_only_commands_skip_approval_and_review_in_every_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let grants = Grants::default();
+        for mode in PermissionMode::ALL {
+            let policy = PermissionPolicy {
+                mode,
+                root: dir.path().to_owned(),
+                ..Default::default()
+            };
+            for command in [
+                "head -n 20 file.txt",
+                "tail -n 10 file.txt",
+                "cat file.txt | grep pattern | sort | uniq -c",
+                "rg --files -g '*.rs' && wc -l src/main.rs",
+                "find . -type f -name '*.rs'",
+                "head < file.txt 2>/dev/null",
+            ] {
+                assert_eq!(
+                    policy.evaluate("bash", &json!({"command": command}), &grants),
+                    Evaluation::Allow,
+                    "{mode:?}: {command}"
+                );
+            }
+            if mode != PermissionMode::FullAuto {
+                for command in [
+                    "head file.txt > output.txt",
+                    "sort -o output.txt file.txt",
+                    "uniq file.txt output.txt",
+                    "find . -exec touch output.txt ';'",
+                    "rg --pre=sh pattern",
+                    "head file.txt && cargo test",
+                    "head file.txt && git push",
+                ] {
+                    assert_ne!(
+                        policy.evaluate("bash", &json!({"command": command}), &grants),
+                        Evaluation::Allow,
+                        "{mode:?}: {command}"
+                    );
+                }
             }
         }
     }

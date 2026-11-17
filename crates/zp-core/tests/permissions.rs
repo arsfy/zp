@@ -144,6 +144,34 @@ async fn ask_mode_denials_grants_and_scope() {
 }
 
 #[tokio::test]
+async fn read_only_commands_run_without_user_or_model_review_in_every_mode() {
+    for mode in PermissionMode::ALL {
+        let project = tempfile::tempdir().unwrap();
+        let root = project.path().canonicalize().unwrap();
+        std::fs::write(root.join("note.txt"), "alpha\nbeta\nalpha\n").unwrap();
+        let faux = FauxProvider::default();
+        faux.push(call(
+            "bash",
+            json!({"command": "head -n 1 note.txt && tail -n 1 note.txt && cat note.txt | grep alpha | sort | uniq"}),
+        ));
+        faux.push(FauxResponse::text("done"));
+        let approver = Arc::new(Scripted::default());
+        let coding = session(&faux, &root, mode, approver.clone());
+        assert_eq!(
+            results(&coding.prompt("inspect the file").await.unwrap()),
+            [(false, "alpha\nalpha\nalpha".to_owned())],
+            "{mode:?}"
+        );
+        assert!(approver.requests.lock().unwrap().is_empty());
+        assert_eq!(
+            faux.requests().len(),
+            2,
+            "{mode:?}: must not call the review model"
+        );
+    }
+}
+
+#[tokio::test]
 async fn echo_output_runs_without_approval_in_every_mode() {
     for mode in PermissionMode::ALL {
         let project = tempfile::tempdir().unwrap();

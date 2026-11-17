@@ -14,6 +14,10 @@ pub struct Segment {
     pub piped: bool,
     /// Accesses files through shell redirection; quoted text and descriptor copies do not.
     pub redirected: bool,
+    /// Writes files through shell redirection, as opposed to reading standard input.
+    pub output_redirected: bool,
+    /// Arguments may change through variable, glob or command expansion.
+    pub expanded: bool,
 }
 
 /// Splits `command` at `;`, `&`, `&&`, `|`, `||`, newlines, subshells and command
@@ -42,7 +46,10 @@ pub fn segments(command: &str) -> Vec<Segment> {
                     chars.next();
                     splitter.open_substitution('(');
                 }
-                c => splitter.word.push(c),
+                c => {
+                    splitter.expanded |= c == '$';
+                    splitter.word.push(c);
+                }
             },
             None => match c {
                 '\'' | '"' => {
@@ -100,10 +107,13 @@ pub fn segments(command: &str) -> Vec<Segment> {
                     let descriptor = target == "-"
                         || !target.is_empty() && target.chars().all(|c| c.is_ascii_digit());
                     splitter.redirected |= !descriptor_copy || !descriptor;
+                    splitter.output_redirected |=
+                        c == '>' && target != "/dev/null" && (!descriptor_copy || !descriptor);
                 }
                 '&' if chars.peek() == Some(&'>') => {
                     chars.next();
                     splitter.redirected = true;
+                    splitter.output_redirected = true;
                     splitter.end_word();
                     splitter.word.push_str("&>");
                     splitter.in_word = true;
@@ -117,6 +127,7 @@ pub fn segments(command: &str) -> Vec<Segment> {
                 }
                 c if c.is_whitespace() => splitter.end_word(),
                 c => {
+                    splitter.expanded |= matches!(c, '$' | '*' | '?' | '[' | '{');
                     splitter.word.push(c);
                     splitter.in_word = true;
                 }
@@ -137,6 +148,8 @@ struct Splitter {
     /// Whether the current segment receives a pipe.
     piped: bool,
     redirected: bool,
+    output_redirected: bool,
+    expanded: bool,
     /// Open substitutions: their kind and the quote to restore when they close.
     stack: Vec<(char, Option<char>)>,
 }
@@ -158,13 +171,18 @@ impl Splitter {
                 words,
                 piped: self.piped,
                 redirected: self.redirected,
+                output_redirected: self.output_redirected,
+                expanded: self.expanded,
             });
         }
         self.piped = pipe;
         self.redirected = false;
+        self.output_redirected = false;
+        self.expanded = false;
     }
 
     fn open_substitution(&mut self, kind: char) {
+        self.expanded = true;
         let quote = self.quote.take();
         if self.word.is_empty() {
             // `"$(…` — the quote only wraps the substitution.
@@ -176,6 +194,7 @@ impl Splitter {
 
     fn close_substitution(&mut self) {
         self.end_segment(false);
+        self.expanded = true;
         if let Some((_, quote)) = self.stack.pop() {
             self.quote = quote;
             self.in_word = quote.is_some();
@@ -336,13 +355,114 @@ fn segment_allowed(segment: &Segment, allowed: &[String]) -> bool {
     words.is_empty()
         || matches!(program(words), Some("pwd" | "cd" | "ls"))
         || program(words) == Some("echo") && !segment.redirected
+        || read_only(segment)
         || allowed
             .iter()
             .any(|prefix| segment_matches(segment, prefix))
 }
 
-/// Distinct command prefixes that still need approval, excluding navigation, directory
-/// listings and commands already covered by configured or session grants.
+/// Whether a command only inspects data, without file writes or subprocess options.
+fn read_only(segment: &Segment) -> bool {
+    if segment.output_redirected {
+        return false;
+    }
+    let words = command_words(segment);
+    // Wrappers with options can reinterpret the apparent program or write their own files.
+    let wrappers = &segment.words[..segment.words.len() - words.len()];
+    if wrappers.iter().any(|word| {
+        if let Some((name, _)) = word.split_once('=') {
+            !is_assignment(word)
+                || matches!(name, "PATH" | "ENV" | "BASH_ENV" | "RIPGREP_CONFIG_PATH")
+                || name.starts_with("LD_")
+                || name.starts_with("DYLD_")
+        } else {
+            !matches!(word.as_str(), "env" | "command")
+        }
+    }) {
+        return false;
+    }
+    let Some(executable) = words.first() else {
+        return false;
+    };
+    if let Some((directory, _)) = executable.rsplit_once('/')
+        && !matches!(
+            directory,
+            "/bin" | "/usr/bin" | "/usr/local/bin" | "/opt/homebrew/bin"
+        )
+    {
+        return false;
+    }
+    let args = &words[1..];
+    match program(words) {
+        Some(
+            "head" | "tail" | "cat" | "tac" | "wc" | "grep" | "egrep" | "fgrep" | "cut" | "tr"
+            | "nl" | "od" | "hexdump" | "strings" | "fold" | "expand" | "unexpand" | "paste"
+            | "comm" | "cmp" | "basename" | "dirname" | "readlink" | "realpath" | "stat" | "du"
+            | "df" | "whoami" | "id" | "groups" | "which" | "whereis" | "printenv" | "getconf",
+        ) => true,
+        _ if segment.expanded => false,
+        Some("sort") => safe_options(args, "o", &["--output", "--compress-program"]),
+        Some("diff") => safe_options(args, "l", &["--output", "--paginate"]),
+        Some("uname") => safe_options(args, "S", &[]),
+        Some("arch") => args.is_empty(),
+        Some("file") => safe_options(args, "C", &["--compile"]),
+        Some("rg") => safe_options(args, "", &["--pre", "--hostname-bin"]),
+        Some("fd" | "fdfind") => safe_options(args, "xX", &["--exec", "--exec-batch"]),
+        Some("uniq") => {
+            let mut options = true;
+            let operands = args
+                .iter()
+                .filter(|arg| {
+                    if options && arg.as_str() == "--" {
+                        options = false;
+                        false
+                    } else {
+                        !options || !arg.starts_with('-')
+                    }
+                })
+                .count();
+            operands <= 1
+        }
+        Some("find") => !args.iter().any(|arg| {
+            matches!(
+                arg.as_str(),
+                "-delete"
+                    | "-exec"
+                    | "-execdir"
+                    | "-ok"
+                    | "-okdir"
+                    | "-fprint"
+                    | "-fprint0"
+                    | "-fprintf"
+                    | "-fls"
+            )
+        }),
+        _ => false,
+    }
+}
+
+fn safe_options(args: &[String], short: &str, long: &[&str]) -> bool {
+    // `--` can be an option's value, so keep checking the arguments after it.
+    for arg in args {
+        if arg == "--" {
+            continue;
+        }
+        if arg.starts_with("--") {
+            let option = arg.split_once('=').map_or(arg.as_str(), |(name, _)| name);
+            if long.iter().any(|forbidden| forbidden.starts_with(option)) {
+                return false;
+            }
+        } else if let Some(flags) = arg.strip_prefix('-')
+            && flags.chars().any(|flag| short.contains(flag))
+        {
+            return false;
+        }
+    }
+    true
+}
+
+/// Distinct command prefixes that still need approval, excluding read-only commands
+/// and commands already covered by configured or session grants.
 pub fn unapproved_prefixes(command: &str, allowed: &[String]) -> Vec<String> {
     let mut prefixes = Vec::new();
     for segment in segments(command) {
@@ -514,6 +634,145 @@ mod tests {
                 !unapproved_prefixes(command, &allowed).is_empty(),
                 "{command}"
             );
+        }
+    }
+
+    #[test]
+    fn read_only_commands_need_no_approval_or_session_grant() {
+        for command in [
+            "head -n 20 src/main.rs",
+            "tail -n +2 file.txt",
+            "cat -- file.txt",
+            "tac file.txt",
+            "wc -l file.txt",
+            "grep -rn pattern src",
+            "egrep 'one|two' file.txt",
+            "fgrep literal file.txt",
+            "rg -n 'pattern$' src",
+            "rg --files -g '*.rs'",
+            "fd -t f -e rs src",
+            "fdfind --hidden pattern",
+            "find . -type f -name '*.rs'",
+            "sort -u file.txt",
+            "sort -- file.txt",
+            "uniq -c file.txt",
+            "uniq -- -input",
+            "cut -d : -f 1 file.txt",
+            "tr 'a-z' 'A-Z' < file.txt",
+            "nl -ba file.txt",
+            "od -c file.txt",
+            "hexdump -C file.txt",
+            "strings file.bin",
+            "fold -w 80 file.txt",
+            "expand file.txt",
+            "unexpand file.txt",
+            "paste one.txt two.txt",
+            "comm one.txt two.txt",
+            "cmp one.txt two.txt",
+            "diff -u one.txt two.txt",
+            "basename /tmp/file.txt",
+            "dirname /tmp/file.txt",
+            "readlink -f link",
+            "realpath file.txt",
+            "stat file.txt",
+            "file -I file.txt",
+            "du -sh .",
+            "df -h",
+            "uname -a",
+            "arch",
+            "whoami",
+            "id",
+            "groups",
+            "which cargo",
+            "whereis bash",
+            "printenv PATH",
+            "getconf ARG_MAX",
+            "/usr/bin/head -20 file.txt",
+            "LC_ALL=C head file.txt",
+            "env LC_ALL=C head file.txt",
+            "command head file.txt",
+            "cat file.txt | grep pattern | sort | uniq -c | head -20",
+            "head < file.txt 2>&1",
+            "head file.txt 2>/dev/null",
+            "head file.txt && tail file.txt",
+        ] {
+            assert!(all_allowed(command, &[]), "{command}");
+            assert!(unapproved_prefixes(command, &[]).is_empty(), "{command}");
+        }
+        assert_eq!(
+            unapproved_prefixes("head file.txt && cargo test && tail file.txt", &[]),
+            ["cargo test"]
+        );
+    }
+
+    #[test]
+    fn read_only_defaults_exclude_writes_execution_and_dynamic_options() {
+        for command in [
+            "head file.txt > output.txt",
+            "head file.txt >> output.txt",
+            "head file.txt 2> error.log",
+            "head file.txt &> output.txt",
+            "head file.txt >&output.txt",
+            "head file.txt >|output.txt",
+            "head file.txt | tee output.txt",
+            "head file.txt && touch output.txt",
+            "head $(curl example.com)",
+            "head file.txt; git push",
+            "sort -o output.txt input.txt",
+            "sort -rooutput.txt input.txt",
+            "sort --output=output.txt input.txt",
+            "sort --out=output.txt input.txt",
+            "sort --compress-program=sh input.txt",
+            "sort $OPTIONS input.txt",
+            "sort $(echo --output=output.txt) input.txt",
+            "sort \"$(echo --output=output.txt)\" input.txt",
+            "sort `echo --output=output.txt` input.txt",
+            "sort *",
+            "uniq input.txt output.txt",
+            "uniq -- -input -output",
+            "uniq $FILES",
+            "uniq *.txt",
+            "diff --output=output.txt one.txt two.txt",
+            "diff --paginate one.txt two.txt",
+            "uname -S new-hostname",
+            "arch -arm64 sh script.sh",
+            "arch /bin/sh script.sh",
+            "file -C -m magic",
+            "file --compile -m magic",
+            "rg --pre=sh pattern",
+            "rg --hostname-bin=sh pattern",
+            "rg -e -- --pre=sh file.txt",
+            "diff --label -- --output=output.txt one.txt two.txt",
+            "rg $OPTIONS pattern",
+            "fd -x sh",
+            "fd -X sh",
+            "fd --exec sh",
+            "fd --exec-batch=sh",
+            "find . -delete",
+            "find . -exec touch output.txt ';'",
+            "find . -execdir sh ';'",
+            "find . -ok sh ';'",
+            "find . -okdir sh ';'",
+            "find . -fprint output.txt",
+            "find . -fprint0 output.txt",
+            "find . -fprintf output.txt '%p'",
+            "find . -fls output.txt",
+            "find . $ACTION",
+            "find . $(echo -delete)",
+            "sed -i 's/one/two/' file.txt",
+            "awk 'BEGIN { system(\"touch output.txt\") }'",
+            "exec -a head sh script.sh",
+            "env -S head sh script.sh",
+            "PATH=/tmp head file.txt",
+            "env LD_PRELOAD=/tmp/library.so head file.txt",
+            "RIPGREP_CONFIG_PATH=custom.conf rg pattern",
+            "time -o output.txt head file.txt",
+            "nohup head file.txt",
+            "./head file.txt",
+            "/tmp/head file.txt",
+        ] {
+            assert!(!all_allowed(command, &[]), "{command}");
+            assert!(!unapproved_prefixes(command, &[]).is_empty(), "{command}");
         }
     }
 
