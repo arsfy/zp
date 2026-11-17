@@ -66,6 +66,75 @@ fn staged(panel: &Entity<GitPanel>, cx: &mut TestAppContext) -> Vec<String> {
 }
 
 #[gpui::test]
+fn staging_keeps_controls_and_file_rows_in_place(cx: &mut TestAppContext) {
+    let _data = setup_models(cx, &[&FauxProvider::default()], false);
+    let (_dir, project) = project_dir();
+    git(&project, &["init", "-q"]);
+    git(&project, &["config", "user.name", "Tester"]);
+    git(&project, &["config", "user.email", "t@example.com"]);
+    git(&project, &["config", "commit.gpgsign", "false"]);
+    for name in ["a.txt", "b.txt"] {
+        std::fs::write(project.join(name), "before\n").unwrap();
+    }
+    git(&project, &["add", "."]);
+    git(&project, &["commit", "-q", "-m", "init"]);
+    for name in ["a.txt", "b.txt"] {
+        std::fs::write(project.join(name), "after\n").unwrap();
+    }
+    let window = open(cx, &project);
+    let panel = window
+        .update(cx, |view, _, cx| {
+            view.changes_panel().read(cx).git().clone()
+        })
+        .unwrap();
+    click(window, "status-changes", cx);
+    settle(&panel, cx, |s| s.unstaged().count() == 2);
+    panel.update(cx, |panel, cx| panel.toggle_signoff(cx));
+    cx.run_until_parked();
+    for (all, staging, expected) in [
+        (false, true, 1),
+        (false, false, 0),
+        (true, true, 2),
+        (true, false, 0),
+    ] {
+        let selectors = [
+            "git-commit",
+            "git-commit-maximize",
+            "git-uncommit",
+            "git-show-last-commit",
+        ];
+        let before: Vec<_> = selectors
+            .iter()
+            .map(|selector| {
+                VisualTestContext::from_window(window.into(), cx)
+                    .debug_bounds(selector)
+                    .unwrap()
+            })
+            .collect();
+        panel.update(cx, |panel, cx| {
+            if all {
+                panel.set_all_staged(staging, cx);
+            } else {
+                panel.set_staged(vec!["a.txt".into()], staging, cx);
+            }
+            assert!(panel.is_busy());
+            // A second request is still blocked while staging is in progress.
+            panel.set_staged(vec!["b.txt".into()], staging, cx);
+        });
+        VisualTestContext::from_window(window.into(), cx)
+            .update(|window, cx| window.draw(cx).clear(cx));
+        for (selector, before) in selectors.into_iter().zip(before) {
+            assert_eq!(
+                VisualTestContext::from_window(window.into(), cx).debug_bounds(selector),
+                Some(before),
+                "{selector} moved or disappeared while staging"
+            );
+        }
+        settle(&panel, cx, |s| s.staged().count() == expected);
+    }
+}
+
+#[gpui::test]
 fn stage_commit_push_uncommit_history_branches_and_discard(cx: &mut TestAppContext) {
     let _data = setup_models(cx, &[&FauxProvider::default()], false);
     let remote_dir = tempfile::tempdir().unwrap();

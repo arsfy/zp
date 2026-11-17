@@ -66,6 +66,18 @@ enum Load {
     Failed(String),
 }
 
+#[derive(Clone, Copy)]
+enum Operation {
+    Staging,
+    Other(&'static str),
+}
+
+#[derive(Clone, Copy)]
+struct ControlState {
+    disabled: bool,
+    dimmed: bool,
+}
+
 pub enum GitPanelEvent {
     /// Show these diffs, starting at `index`.
     OpenDiff { items: Vec<DiffItem>, index: usize },
@@ -102,8 +114,8 @@ pub struct GitPanel {
     /// `None` until the History tab is shown.
     history: Option<Vec<Commit>>,
     message: Entity<EditableTextState>,
-    /// The operation running, shown instead of the actions.
-    busy: Option<SharedString>,
+    /// Staging blocks overlapping operations without changing the controls' appearance.
+    busy: Option<Operation>,
     /// Feedback of the last operation: text and whether it is an error.
     notice: Option<(String, bool)>,
     staged_open: bool,
@@ -222,6 +234,20 @@ impl GitPanel {
         self.status().map(|status| status.root.clone())
     }
 
+    fn busy_label(&self) -> Option<&'static str> {
+        match self.busy {
+            Some(Operation::Other(label)) => Some(label),
+            _ => None,
+        }
+    }
+
+    fn control_state(&self, unavailable: bool) -> ControlState {
+        ControlState {
+            disabled: unavailable || self.busy.is_some(),
+            dimmed: unavailable || self.busy_label().is_some(),
+        }
+    }
+
     /// What a commit takes: the staged files, or else the changed tracked files.
     fn commit_files(&self) -> Vec<&GitFile> {
         let Some(status) = self.status() else {
@@ -323,7 +349,7 @@ impl GitPanel {
     /// Runs `op` (given the repository root) in the background, then reloads.
     fn run(
         &mut self,
-        label: &str,
+        operation: Operation,
         op: impl FnOnce(&Path) -> anyhow::Result<()> + Send + 'static,
         on_success: impl FnOnce(&mut Self, &mut Context<Self>) + 'static,
         cx: &mut Context<Self>,
@@ -334,7 +360,7 @@ impl GitPanel {
         let Some(root) = self.repo_root() else {
             return;
         };
-        self.busy = Some(label.to_owned().into());
+        self.busy = Some(operation);
         self.notice = None;
         self.menu = None;
         let task = cx.background_executor().spawn(async move { op(&root) });
@@ -356,12 +382,17 @@ impl GitPanel {
 
     /// Stages or unstages `paths` (relative to the repository root).
     pub fn set_staged(&mut self, paths: Vec<String>, staged: bool, cx: &mut Context<Self>) {
-        let (label, op): (&str, PathsOp) = if staged {
-            ("Staging…", zp_core::git::stage)
+        let op: PathsOp = if staged {
+            zp_core::git::stage
         } else {
-            ("Unstaging…", zp_core::git::unstage)
+            zp_core::git::unstage
         };
-        self.run(label, move |root| op(root, &paths), |_, _| {}, cx);
+        self.run(
+            Operation::Staging,
+            move |root| op(root, &paths),
+            |_, _| {},
+            cx,
+        );
     }
 
     /// Stages or unstages everything under the project.
@@ -369,14 +400,14 @@ impl GitPanel {
         let dir = self.root.clone();
         if staged {
             self.run(
-                "Staging…",
+                Operation::Staging,
                 move |_| zp_core::git::stage_all(&dir),
                 |_, _| {},
                 cx,
             );
         } else {
             self.run(
-                "Unstaging…",
+                Operation::Staging,
                 move |_| zp_core::git::unstage_all(&dir),
                 |_, _| {},
                 cx,
@@ -405,11 +436,11 @@ impl GitPanel {
         }
         let dir = self.root.clone();
         self.run(
-            if options.amend {
+            Operation::Other(if options.amend {
                 "Amending…"
             } else {
                 "Committing…"
-            },
+            }),
             move |root| {
                 if stage_tracked {
                     zp_core::git::stage_tracked(&dir)?;
@@ -509,7 +540,7 @@ impl GitPanel {
 
     fn run_uncommit(&mut self, summary: String, cx: &mut Context<Self>) {
         self.run(
-            "Uncommitting…",
+            Operation::Other("Uncommitting…"),
             zp_core::git::uncommit,
             move |this, cx| {
                 if this.message.read(cx).as_str().trim().is_empty() {
@@ -557,7 +588,7 @@ impl GitPanel {
             }
             let _ = this.update(cx, |this, cx| {
                 this.run(
-                    "Discarding…",
+                    Operation::Other("Discarding…"),
                     move |root| {
                         let (new, tracked): (Vec<GitFile>, Vec<GitFile>) =
                             files.into_iter().partition(GitFile::is_untracked);
@@ -576,15 +607,30 @@ impl GitPanel {
     }
 
     pub fn push(&mut self, cx: &mut Context<Self>) {
-        self.run("Pushing…", zp_core::git::push, |_, _| {}, cx);
+        self.run(
+            Operation::Other("Pushing…"),
+            zp_core::git::push,
+            |_, _| {},
+            cx,
+        );
     }
 
     pub fn pull(&mut self, cx: &mut Context<Self>) {
-        self.run("Pulling…", zp_core::git::pull, |_, _| {}, cx);
+        self.run(
+            Operation::Other("Pulling…"),
+            zp_core::git::pull,
+            |_, _| {},
+            cx,
+        );
     }
 
     pub fn fetch(&mut self, cx: &mut Context<Self>) {
-        self.run("Fetching…", zp_core::git::fetch, |_, _| {}, cx);
+        self.run(
+            Operation::Other("Fetching…"),
+            zp_core::git::fetch,
+            |_, _| {},
+            cx,
+        );
     }
 
     // ----- branches --------------------------------------------------------------------
@@ -666,7 +712,7 @@ impl GitPanel {
             return;
         }
         self.run(
-            "Switching…",
+            Operation::Other("Switching…"),
             move |root| zp_core::git::switch_branch(root, &branch),
             |_, _| {},
             cx,
@@ -676,7 +722,7 @@ impl GitPanel {
     pub fn create_branch(&mut self, name: String, cx: &mut Context<Self>) {
         self.branch_picker = None;
         self.run(
-            "Creating branch…",
+            Operation::Other("Creating branch…"),
             move |root| zp_core::git::create_branch(root, &name),
             |_, _| {},
             cx,
@@ -1021,7 +1067,6 @@ impl GitPanel {
 
     fn render_changes(&self, status: &GitStatus, cx: &mut Context<Self>) -> AnyElement {
         let colors = cx.theme().colors.clone();
-        let busy = self.busy.is_some();
         let (added, removed) = status.files.iter().fold((0, 0), |(a, r), f| {
             (
                 a + f.staged_stats.0 + f.unstaged_stats.0,
@@ -1059,7 +1104,7 @@ impl GitPanel {
                 } else {
                     "Unstage All"
                 }),
-                busy,
+                self.control_state(false),
                 cx,
                 cx.listener(move |this, _, _, cx| this.set_all_staged(has_unstaged, cx)),
                 cx.listener(|this, event: &ClickEvent, window, cx| {
@@ -1164,7 +1209,7 @@ impl GitPanel {
                 checkbox(
                     format!("{id}-check"),
                     side == Side::Staged,
-                    self.busy.is_some(),
+                    self.control_state(false),
                     cx,
                 )
                 .debug_selector(move || format!("{id}-check"))
@@ -1195,7 +1240,6 @@ impl GitPanel {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let colors = cx.theme().colors.clone();
-        let busy = self.busy.is_some();
         let status = match side {
             Side::Staged => file.staged,
             Side::Unstaged => file.unstaged,
@@ -1258,30 +1302,35 @@ impl GitPanel {
                             .child(dir),
                     ),
             )
-            .when(side == Side::Unstaged && !busy, |this| {
-                this.child(
-                    div()
-                        .id(("discard", index))
-                        .debug_selector(move || format!("git-discard-{index}"))
-                        .invisible()
-                        .group_hover_style(group, |s| s.visible())
-                        .flex_shrink_0()
-                        .p_0p5()
-                        .rounded(px(3.))
-                        .hover_style(|s| s.bg(colors.background))
-                        .tooltip(tooltip("Discard changes"))
-                        .child(
-                            svg()
-                                .data(ICON_DISCARD)
-                                .size(px(12.))
-                                .text_color(colors.text_muted),
-                        )
-                        .on_click(cx.listener(move |this, _, window, cx| {
-                            cx.stop_propagation();
-                            this.discard(vec![discard.clone()], window, cx);
-                        })),
-                )
-            })
+            .when(
+                side == Side::Unstaged && self.busy_label().is_none(),
+                |this| {
+                    this.child(
+                        div()
+                            .id(("discard", index))
+                            .debug_selector(move || format!("git-discard-{index}"))
+                            .invisible()
+                            .group_hover_style(group, |s| s.visible())
+                            .flex_shrink_0()
+                            .p_0p5()
+                            .rounded(px(3.))
+                            .hover_style(|s| s.bg(colors.background))
+                            .tooltip(tooltip("Discard changes"))
+                            .child(
+                                svg()
+                                    .data(ICON_DISCARD)
+                                    .size(px(12.))
+                                    .text_color(colors.text_muted),
+                            )
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                cx.stop_propagation();
+                                if this.busy.is_none() {
+                                    this.discard(vec![discard.clone()], window, cx);
+                                }
+                            })),
+                    )
+                },
+            )
             .when(added + removed > 0, |this| {
                 this.child(stats(added, removed, cx))
             })
@@ -1289,7 +1338,7 @@ impl GitPanel {
                 checkbox(
                     format!("git-{prefix}-check-{index}"),
                     side == Side::Staged,
-                    busy,
+                    self.control_state(false),
                     cx,
                 )
                 .debug_selector(move || format!("git-{prefix}-check-{index}"))
@@ -1304,7 +1353,6 @@ impl GitPanel {
 
     fn render_branch_bar(&self, status: &GitStatus, cx: &mut Context<Self>) -> AnyElement {
         let colors = cx.theme().colors.clone();
-        let busy = self.busy.is_some();
         let branch = status.branch.clone().unwrap_or_else(|| {
             status.head.as_deref().map_or_else(
                 || "no branch".to_owned(),
@@ -1382,7 +1430,7 @@ impl GitPanel {
                 this.child(split_button(
                     "git-remote",
                     content,
-                    busy,
+                    self.control_state(false),
                     cx,
                     cx.listener(move |this, _, _, cx| match label {
                         "Push" | "Publish" => this.push(cx),
@@ -1400,8 +1448,7 @@ impl GitPanel {
     /// The commit message (unless collapsed) with the commit controls under it.
     fn render_commit_box(&self, cx: &mut Context<Self>) -> AnyElement {
         let colors = cx.theme().colors.clone();
-        let busy = self.busy.is_some();
-        let disabled = busy || (!self.options.amend && self.commit_files().is_empty());
+        let state = self.control_state(!self.options.amend && self.commit_files().is_empty());
         let maximized = self.commit_maximized;
         let suggestion = self.suggested_message();
         let placeholder = if suggestion.is_empty() {
@@ -1523,15 +1570,15 @@ impl GitPanel {
                             .truncate()
                             .text_size(px(12.))
                             .text_color(colors.text_muted)
-                            .when_some(self.busy.clone(), |this, busy| this.child(busy))
-                            .when(self.busy.is_none() && !options.is_empty(), |this| {
+                            .when_some(self.busy_label(), |this, label| this.child(label))
+                            .when(self.busy_label().is_none() && !options.is_empty(), |this| {
                                 this.child(options.join(" · "))
                             }),
                     )
                     .child(split_button(
                         "git-commit",
                         div().child(self.commit_label()),
-                        disabled,
+                        state,
                         cx,
                         cx.listener(|this, _, _, cx| this.commit(cx)),
                         cx.listener(|this, event: &ClickEvent, window, cx| {
@@ -1571,14 +1618,18 @@ impl GitPanel {
                 .bg(colors.surface)
                 .text_size(px(13.))
                 .child(div().flex_1().min_w_0().truncate().child(summary))
-                .when(!busy, |this| {
+                .when(self.busy_label().is_none(), |this| {
                     this.child(
                         icon_button(
                             "git-uncommit",
                             ICON_UNDO,
                             "Undo the last commit (its changes stay staged)",
                         )
-                        .on_click(cx.listener(|this, _, window, cx| this.uncommit(window, cx))),
+                        .when(!busy, |this| {
+                            this.on_click(
+                                cx.listener(|this, _, window, cx| this.uncommit(window, cx)),
+                            )
+                        }),
                     )
                 })
                 .child(
@@ -1939,7 +1990,7 @@ fn status_badge(status: GitFileStatus, cx: &App) -> impl IntoElement {
 fn checkbox(
     id: impl Into<gpui::ElementId>,
     checked: bool,
-    disabled: bool,
+    state: ControlState,
     cx: &App,
 ) -> gpui::Stateful<gpui::Div> {
     let colors = &cx.theme().colors;
@@ -1966,8 +2017,8 @@ fn checkbox(
                     .text_color(colors.accent),
             )
         })
-        .when(disabled, |this| this.opacity(0.5))
-        .when(!disabled, |this| {
+        .when(state.dimmed, |this| this.opacity(0.5))
+        .when(!state.dimmed, |this| {
             let hover = colors.text_muted;
             this.cursor_pointer()
                 .hover_style(move |s| s.border_color(hover))
@@ -1978,7 +2029,7 @@ fn checkbox(
 fn split_button(
     id: &'static str,
     content: impl IntoElement,
-    disabled: bool,
+    state: ControlState,
     cx: &App,
     on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
     on_more: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
@@ -1990,7 +2041,7 @@ fn split_button(
             .h_full()
             .flex()
             .items_center()
-            .when(!disabled, |this| {
+            .when(!state.dimmed, |this| {
                 this.cursor_pointer().hover_style(|s| s.bg(colors.border))
             })
     };
@@ -2005,13 +2056,13 @@ fn split_button(
         .bg(colors.surface_hover)
         .text_size(px(13.))
         .text_color(colors.text)
-        .when(disabled, |this| this.opacity(0.5))
+        .when(state.dimmed, |this| this.opacity(0.5))
         .child(
             part(id.into())
                 .debug_selector(move || id.to_owned())
                 .px_2()
                 .child(content)
-                .when(!disabled, |this| this.on_click(on_click)),
+                .when(!state.disabled, |this| this.on_click(on_click)),
         )
         .child(
             part(format!("{id}-more").into())
@@ -2025,6 +2076,6 @@ fn split_button(
                         .size(px(12.))
                         .text_color(colors.text_muted),
                 )
-                .when(!disabled, |this| this.on_click(on_more)),
+                .when(!state.disabled, |this| this.on_click(on_more)),
         )
 }

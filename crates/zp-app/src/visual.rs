@@ -118,7 +118,10 @@ pub fn run(out: PathBuf) {
         );
         return;
     }
-    if std::env::var("ZP_VISUAL_SCENE").as_deref() == Ok("git") {
+    if matches!(
+        std::env::var("ZP_VISUAL_SCENE").as_deref(),
+        Ok("git" | "git-stage")
+    ) {
         git_panel(&mut cx, &out);
         println!("git screenshots written to {}", out.display());
         return;
@@ -1525,6 +1528,37 @@ fn git_panel(cx: &mut VisualTestAppContext, out: &std::path::Path) {
             view.read(cx).changes_panel().read(cx).git().clone()
         })
         .unwrap();
+    if std::env::var("ZP_VISUAL_SCENE").as_deref() == Ok("git-stage") {
+        let baseline = cx.capture_screenshot(any).unwrap();
+        baseline.save(out.join("stage-before.png")).unwrap();
+        let scale = baseline.width() / 1280;
+        let left = baseline.width() - 320 * scale;
+        let bottom = baseline.height() - 24 * scale;
+        cx.update_window(any, |_, window, cx| {
+            panel.update(cx, |panel, cx| {
+                panel.set_staged(vec!["PLAN.md".into()], true, cx)
+            });
+            window.draw(cx).clear(cx);
+        })
+        .unwrap();
+        let image = cx.capture_screenshot(any).unwrap();
+        let changed = (30 * scale..bottom)
+            .flat_map(|y| (left..image.width()).map(move |x| (x, y)))
+            .filter(|&(x, y)| image.get_pixel(x, y) != baseline.get_pixel(x, y))
+            .count();
+        println!("staging: {changed} right-panel pixels changed before status refresh");
+        image.save(out.join("stage-pending.png")).unwrap();
+        assert_eq!(
+            changed, 0,
+            "staging changed the panel before the status refresh"
+        );
+        pump(cx, Duration::from_millis(800));
+        cx.capture_screenshot(any)
+            .unwrap()
+            .save(out.join("stage-after.png"))
+            .unwrap();
+        return;
+    }
     cx.update_window(any, |_, window, cx| {
         panel.update(cx, |panel, cx| {
             panel.commit_menu(point(px(1180.), px(700.)), window, cx)
