@@ -456,7 +456,8 @@ impl PermissionGate {
         cancel: &CancellationToken,
     ) -> ToolCallDecision {
         let policy = self.policy();
-        let evaluation = policy.evaluate(&call.name, args, &self.grants());
+        let current_grants = self.grants();
+        let evaluation = policy.evaluate(&call.name, args, &current_grants);
         let (reasons, grants) = match evaluation {
             Evaluation::Allow => return ToolCallDecision::Allow,
             Evaluation::Ask { reasons, grants } => (reasons, grants),
@@ -474,7 +475,8 @@ impl PermissionGate {
                         let review = review::review_tool_call(
                             &self.models,
                             &model,
-                            &policy.root,
+                            &policy,
+                            &current_grants,
                             intent.as_deref(),
                             &call.name,
                             args,
