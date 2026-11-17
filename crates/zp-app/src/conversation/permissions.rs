@@ -17,7 +17,7 @@ use super::{ConversationEvent, ConversationView};
 use crate::approvals::PendingApproval;
 use crate::diff_view::{DiffColors, Gutters, render_unified_row, unified_rows};
 use crate::review_model_picker::{ReviewModelEvent, ReviewModelPicker};
-use crate::store::AppStore;
+use crate::store::{AppModels, AppStore};
 use crate::theme::ActiveTheme;
 
 /// Diff rows shown in an approval card.
@@ -263,11 +263,20 @@ impl ConversationView {
         cx: &mut Context<Self>,
     ) {
         if mode == PermissionMode::AutoReview {
-            let current = self
-                .coding
-                .as_ref()
-                .and_then(|coding| coding.permissions())
-                .and_then(|gate| gate.policy().review_model);
+            let policy = crate::approvals::project_policy(&self.root, cx);
+            let current = policy.review_model.clone();
+            let models = &cx.global::<AppModels>().models;
+            if current.as_deref().is_some_and(|spec| {
+                models
+                    .find(spec)
+                    .is_some_and(|model| models.resolve_auth(&model.provider).is_some())
+            }) {
+                self.review_model_picker = None;
+                self.review_model_subscription = None;
+                self.set_permission_policy(policy, cx);
+                self.apply_permission_mode(mode, window, cx);
+                return;
+            }
             let picker = cx.new(|cx| ReviewModelPicker::new(current, window, cx));
             self.review_model_subscription = Some(cx.subscribe_in(
                 &picker,

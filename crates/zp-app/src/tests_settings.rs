@@ -496,7 +496,61 @@ fn review_model_is_chosen_from_settings_dialog(cx: &mut TestAppContext) {
         Some(PermissionMode::FullAuto)
     );
 
-    // Switching mode still asks for a model, with the saved model marked.
+    // Switching mode reuses the saved model without opening the picker.
+    window
+        .update(cx, |view, window, cx| {
+            view.set_permission_mode(PermissionMode::AutoReview, window, cx)
+        })
+        .unwrap();
+    cx.run_until_parked();
+    assert!(
+        window
+            .update(cx, |view, _, _| view.review_model_picker().is_none())
+            .unwrap()
+    );
+    assert_eq!(
+        saved(&data).permissions.mode,
+        Some(PermissionMode::AutoReview)
+    );
+    assert_eq!(
+        conversation.read_with(cx, |view, _| view.permission_mode()),
+        PermissionMode::AutoReview
+    );
+
+    for mode in [PermissionMode::Ask, PermissionMode::AutoReview] {
+        window
+            .update(cx, |view, window, cx| {
+                view.set_permission_mode(mode, window, cx)
+            })
+            .unwrap();
+        cx.run_until_parked();
+        assert!(
+            window
+                .update(cx, |view, _, _| view.review_model_picker().is_none())
+                .unwrap()
+        );
+        assert_eq!(saved(&data).permissions.mode, Some(mode));
+        assert_eq!(
+            saved(&data).permissions.review_model,
+            Some(faux.model().qualified_id())
+        );
+    }
+}
+
+#[gpui::test]
+fn review_mode_in_settings_prompts_again_if_the_saved_model_is_unavailable(
+    cx: &mut TestAppContext,
+) {
+    let faux = FauxProvider::default();
+    let data = setup_models(cx, &[&faux], false);
+    cx.update(|cx| {
+        AppSettings::update(cx, |settings| {
+            settings.permissions.mode = Some(PermissionMode::Ask);
+            settings.permissions.review_model = Some("unavailable/model".into());
+        })
+        .unwrap();
+    });
+    let window = settings_window(Page::Permissions, cx);
     window
         .update(cx, |view, window, cx| {
             view.set_permission_mode(PermissionMode::AutoReview, window, cx)
@@ -508,16 +562,7 @@ fn review_model_is_chosen_from_settings_dialog(cx: &mut TestAppContext) {
             .update(cx, |view, _, _| view.review_model_picker().is_some())
             .unwrap()
     );
-    cx.simulate_keystrokes(window.into(), "enter");
-    cx.run_until_parked();
-    assert_eq!(
-        saved(&data).permissions.mode,
-        Some(PermissionMode::AutoReview)
-    );
-    assert_eq!(
-        conversation.read_with(cx, |view, _| view.permission_mode()),
-        PermissionMode::AutoReview
-    );
+    assert_eq!(saved(&data).permissions.mode, Some(PermissionMode::Ask));
 }
 
 #[gpui::test]

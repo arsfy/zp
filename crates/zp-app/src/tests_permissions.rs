@@ -349,6 +349,25 @@ fn review_mode_requires_a_model_and_restores_the_choice(cx: &mut TestAppContext)
     assert_eq!(state.review_model, Some(reviewer.model().qualified_id()));
 
     window
+        .update(cx, |_, window, cx| {
+            conversation.update(cx, |view, cx| {
+                view.select_permission_mode(PermissionMode::Ask, window, cx)
+            })
+        })
+        .unwrap();
+    cx.run_until_parked();
+    select_review(cx);
+    assert!(conversation.read_with(cx, |v, _| v.review_model_picker.is_none()));
+    assert_eq!(
+        conversation.read_with(cx, |v, _| v.permission_mode()),
+        PermissionMode::AutoReview
+    );
+    assert_eq!(
+        saved_state(cx, &data).project(&project).review_model,
+        Some(reviewer.model().qualified_id())
+    );
+
+    window
         .update(cx, |_, window, _| window.remove_window())
         .unwrap();
     cx.run_until_parked();
@@ -371,8 +390,7 @@ fn review_mode_requires_a_model_and_restores_the_choice(cx: &mut TestAppContext)
         })
         .unwrap();
     cx.run_until_parked();
-    cx.simulate_keystrokes(reopened.into(), "enter");
-    cx.run_until_parked();
+    assert!(active(reopened, cx).read_with(cx, |v, _| v.review_model_picker.is_none()));
     let policy = cx.update(|cx| crate::approvals::project_policy(&project, cx));
     assert_eq!(policy.review_model, Some(reviewer.model().qualified_id()));
 }
@@ -397,6 +415,54 @@ fn review_mode_without_an_available_model_falls_back_to_ask(cx: &mut TestAppCont
         let policy = crate::approvals::project_policy(&project, cx);
         assert_eq!(policy.mode, PermissionMode::Ask);
     });
+    let conversation = active(window, cx);
+    window
+        .update(cx, |_, window, cx| {
+            conversation.update(cx, |view, cx| {
+                view.select_permission_mode(PermissionMode::AutoReview, window, cx)
+            })
+        })
+        .unwrap();
+    cx.run_until_parked();
+    assert!(conversation.read_with(cx, |v, _| v.review_model_picker.is_some()));
+    assert_eq!(
+        conversation.read_with(cx, |v, _| v.permission_mode()),
+        PermissionMode::Ask
+    );
+}
+
+#[gpui::test]
+fn review_mode_reuses_the_model_from_global_settings(cx: &mut TestAppContext) {
+    let faux = FauxProvider::default();
+    let data = setup_models(cx, &[&faux], false);
+    cx.update(|cx| {
+        crate::store::AppSettings::update(cx, |settings| {
+            settings.permissions.mode = Some(PermissionMode::Ask);
+            settings.permissions.review_model = Some(faux.model().qualified_id());
+        })
+        .unwrap();
+    });
+    let (_dir, project) = project_dir();
+    let window = open(cx, &project);
+    let conversation = active(window, cx);
+    window
+        .update(cx, |_, window, cx| {
+            conversation.update(cx, |view, cx| {
+                view.select_permission_mode(PermissionMode::AutoReview, window, cx)
+            })
+        })
+        .unwrap();
+    cx.run_until_parked();
+    assert!(conversation.read_with(cx, |v, _| v.review_model_picker.is_none()));
+    assert_eq!(
+        conversation.read_with(cx, |v, _| v.permission_mode()),
+        PermissionMode::AutoReview
+    );
+    let state = saved_state(cx, &data).project(&project);
+    assert_eq!(state.permission_mode, Some(PermissionMode::AutoReview));
+    assert_eq!(state.review_model, None);
+    let policy = cx.update(|cx| crate::approvals::project_policy(&project, cx));
+    assert_eq!(policy.review_model, Some(faux.model().qualified_id()));
 }
 
 #[gpui::test]

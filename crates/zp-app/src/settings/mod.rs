@@ -326,7 +326,18 @@ impl SettingsWindow {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if mode == PermissionMode::AutoReview {
+        if mode == PermissionMode::AutoReview
+            && !AppSettings::get(cx)
+                .permissions
+                .review_model
+                .as_deref()
+                .is_some_and(|spec| {
+                    let models = &cx.global::<AppModels>().models;
+                    models
+                        .find(spec)
+                        .is_some_and(|model| models.resolve_auth(&model.provider).is_some())
+                })
+        {
             self.open_review_model_picker(true, window, cx);
             return;
         }
