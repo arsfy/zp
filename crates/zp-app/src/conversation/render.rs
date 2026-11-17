@@ -681,14 +681,25 @@ impl ConversationView {
             _ if approval.is_some() => ("awaiting approval".to_owned(), colors.warning),
             None => ("pending".to_owned(), colors.text_muted),
             Some(ToolStatus::Running) => ("running…".to_owned(), colors.accent),
-            Some(ToolStatus::Done) => match &change {
-                Some(change) => (
-                    format!("+{} −{}", change.added, change.removed),
-                    colors.success,
-                ),
-                None => ("done".to_owned(), colors.success),
-            },
+            Some(ToolStatus::Done) => ("done".to_owned(), colors.success),
             Some(ToolStatus::Error) => ("failed".to_owned(), colors.error),
+        };
+        let status_label = if let Some(change) = change.as_ref().filter(|_| approval.is_none()) {
+            div()
+                .flex()
+                .gap_1()
+                .child(
+                    div()
+                        .text_color(colors.success)
+                        .child(format!("+{}", change.added)),
+                )
+                .child(
+                    div()
+                        .text_color(colors.error)
+                        .child(format!("−{}", change.removed)),
+                )
+        } else {
+            div().text_color(status_color).child(status_text)
         };
 
         let call_id = call.id.clone();
@@ -721,13 +732,7 @@ impl ConversationView {
                     .text_color(colors.text_muted)
                     .child(zp_tools::describe_call(&call.name, &call.arguments, 160)),
             )
-            .child(
-                div()
-                    .flex_shrink_0()
-                    .text_size(px(12.))
-                    .text_color(status_color)
-                    .child(status_text),
-            )
+            .child(div().flex_shrink_0().text_size(px(12.)).child(status_label))
             .when(reverted, |header| {
                 header.child(
                     div()
