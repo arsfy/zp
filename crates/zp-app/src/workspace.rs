@@ -191,8 +191,12 @@ pub fn open_project(
     AppStore::update(cx, |state| state.touch_recent(&root));
 
     if let Some(existing) = Workspaces::project_window(&root, cx) {
+        let replaced = replace.filter(|window| Workspaces::is_welcome(*window, cx));
         cx.defer(move |cx| {
             let _ = existing.update(cx, |_, window, _| window.activate());
+            if let Some(replaced) = replaced {
+                let _ = replaced.update(cx, |_, window, _| window.remove_window());
+            }
         });
         return Ok(existing);
     }
@@ -244,6 +248,22 @@ pub fn open_welcome(cx: &mut App) -> Result<WindowHandle<WelcomeView>> {
 pub fn open_welcome_or_report(cx: &mut App) {
     if let Err(error) = open_welcome(cx) {
         tracing::error!(?error, "failed to open a window");
+    }
+}
+
+/// Opens a recent folder, replacing an active welcome window when possible.
+pub fn open_recent_folder(path: &Path, cx: &mut App) {
+    let replace = cx.active_window().or_else(|| {
+        cx.global::<Workspaces>()
+            .welcomes
+            .last()
+            .map(|window| (*window).into())
+    });
+    if let Err(error) = open_project(path, replace, cx) {
+        AppStore::update(cx, |state| state.remove_recent(path));
+        report_error("Could not open folder", &error, cx);
+    } else {
+        cx.activate(true);
     }
 }
 

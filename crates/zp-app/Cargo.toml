@@ -38,6 +38,11 @@ tempfile = { workspace = true, optional = true }
 [target.'cfg(unix)'.dependencies]
 rustix = { version = "1", features = ["termios"] }
 
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSDocumentController"] }
+url = "2"
+
 [features]
 # `zp --visual-tests DIR`: render scripted scenarios off-screen and save screenshots.
 visual-tests = ["gpui/test-support", "gpui_platform/test-support", "dep:tempfile"]

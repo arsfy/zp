@@ -11,6 +11,8 @@ mod context_menu;
 mod conversation;
 mod diff_view;
 mod git_panel;
+#[cfg(target_os = "macos")]
+mod macos;
 mod markdown;
 mod mcp;
 mod notifications;
@@ -66,12 +68,30 @@ fn main() {
         return;
     }
 
-    gpui_platform::application().run(move |cx: &mut App| {
+    let application = gpui_platform::application();
+    #[cfg(target_os = "macos")]
+    let mut open_urls = {
+        let (sender, receiver) = futures::channel::mpsc::unbounded();
+        application.on_open_urls(move |urls| {
+            let _ = sender.unbounded_send(urls);
+        });
+        receiver
+    };
+    application.run(move |cx: &mut App| {
         gpui_tokio::init(cx);
         let data_dir = zp_core::paths::data_dir()
             .inspect_err(|error| tracing::warn!(%error, "no data directory; state is not saved"))
             .ok();
         init(data_dir, cx);
+        #[cfg(target_os = "macos")]
+        cx.spawn(async move |cx| {
+            use futures::StreamExt as _;
+
+            while let Some(urls) = open_urls.next().await {
+                cx.update(|cx| macos::open_folders(urls, cx));
+            }
+        })
+        .detach();
         // Refresh stale model catalog layers in the background.
         AppModels::sync(cx, Vec::new(), false);
         updates::check_on_startup(cx);
