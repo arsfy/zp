@@ -2465,7 +2465,6 @@ dependencies = [
 [[package]]
 name = "gpui_ce_elements"
 version = "0.4.0"
-source = "git+https://github.com/gpui-ce/gpui-ce?rev=f388375d03e63d75811fa1cca3a563203b920d98#f388375d03e63d75811fa1cca3a563203b920d98"
 dependencies = [
  "derive_setters",
  "gpui-ce",

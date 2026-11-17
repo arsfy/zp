@@ -1,6 +1,7 @@
 [workspace]
 resolver = "3"
 members = ["crates/*"]
+exclude = ["third_party"]
 default-members = ["crates/zp-app"]
 
 [workspace.package]
@@ -58,3 +59,7 @@ unsafe_code = "deny"
 [workspace.lints.clippy]
 dbg_macro = "warn"
 todo = "warn"
+
+# gpui-ce's text input with a local fix for IME window placement (see the README there).
+[patch."https://github.com/gpui-ce/gpui-ce"]
+gpui_ce_elements = { path = "third_party/gpui_ce_elements" }

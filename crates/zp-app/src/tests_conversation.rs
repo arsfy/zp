@@ -930,3 +930,51 @@ fn measures_the_output_speed(cx: &mut TestAppContext) {
     let speed = final_status.tokens_per_second;
     assert!(speed.is_some_and(|speed| speed > 0.0), "{speed:?}");
 }
+
+#[gpui::test]
+fn ime_composition_has_bounds_before_the_next_frame(cx: &mut TestAppContext) {
+    use gpui::{Bounds, EntityInputHandler as _};
+
+    let faux = FauxProvider::default();
+    setup_models(cx, &[&faux], false);
+    let (_dir, project) = project_dir();
+    let window = open(cx, &project);
+    let conversation = active(window, cx);
+    conversation.update(cx, |view, cx| view.set_draft("hello", cx));
+    cx.run_until_parked();
+    let composer = conversation.read_with(cx, |view, _| view.composer_input());
+    let marked_bounds = |cx: &mut TestAppContext| {
+        window
+            .update(cx, |_, window, cx| {
+                composer.update(cx, |input, cx| {
+                    let marked = input.marked_text_range(window, cx)?;
+                    input.bounds_for_range(marked, Bounds::default(), window, cx)
+                })
+            })
+            .unwrap()
+    };
+
+    // The IME inserts marked text and asks where it is before anything is laid out
+    // again; without an answer macOS shows its window at the screen's corner.
+    let stale = window
+        .update(cx, |_, window, cx| {
+            composer.update(cx, |input, cx| {
+                input.replace_and_mark_text_in_range(None, "ni", None, window, cx);
+                let marked = input.marked_text_range(window, cx).unwrap();
+                input.bounds_for_range(marked, Bounds::default(), window, cx)
+            })
+        })
+        .unwrap()
+        .expect("bounds right after the edit");
+    cx.run_until_parked();
+    let fresh = marked_bounds(cx).expect("bounds after layout");
+    assert!(stale.origin.x > px(0.), "after `hello`: {stale:?}");
+    assert!(
+        (stale.origin.x - fresh.origin.x).abs() < px(1.),
+        "{stale:?} vs {fresh:?}"
+    );
+    assert!(
+        (stale.origin.y - fresh.origin.y).abs() < px(1.),
+        "{stale:?} vs {fresh:?}"
+    );
+}

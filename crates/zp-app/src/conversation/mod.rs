@@ -629,6 +629,12 @@ impl ConversationView {
             .update(cx, |composer, cx| composer.emplace(text, cx));
     }
 
+    /// The composer input (tests).
+    #[cfg(test)]
+    pub fn composer_input(&self) -> Entity<EditableTextState> {
+        self.composer.clone()
+    }
+
     /// The composer text (tests).
     #[cfg(test)]
     pub fn draft(&self, cx: &App) -> String {
