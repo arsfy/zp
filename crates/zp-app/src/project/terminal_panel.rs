@@ -324,12 +324,6 @@ impl ProjectWindow {
             .justify_center()
             .rounded(px(4.))
             .cursor_pointer()
-            .when(open, |this| {
-                this.bg(gpui::ColorExt::opacity(
-                    &gpui::rgb_to_hsla(colors.accent),
-                    0.18,
-                ))
-            })
             .hover_style(move |s| s.bg(colors.surface_hover))
             .tooltip(crate::ui::tooltip("Toggle Terminal (ctrl-`)"))
             .child(svg().data(ICON_TERMINAL).size(px(15.)).text_color(if open {

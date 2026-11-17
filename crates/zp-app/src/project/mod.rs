@@ -810,7 +810,42 @@ impl ProjectWindow {
                     .flex()
                     .items_center()
                     .gap_3()
-                    .child(self.render_terminal_button(cx))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_shrink_0()
+                            .items_center()
+                            .gap_1()
+                            .child(self.render_terminal_button(cx))
+                            .child(
+                                div()
+                                    .id("status-changes")
+                                    .size(px(20.))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .rounded(px(4.))
+                                    .cursor_pointer()
+                                    .hover_style(move |s| s.bg(colors.surface_hover))
+                                    .tooltip(crate::ui::tooltip(format!(
+                                        "Changes ({changed_files} file{} changed)",
+                                        if changed_files == 1 { "" } else { "s" }
+                                    )))
+                                    .child(
+                                        svg()
+                                            .data(include_bytes!("../../../../assets/icons/git-branch.svg"))
+                                            .size(px(15.))
+                                            .text_color(if self.layout.right_panel_visible {
+                                                colors.accent
+                                            } else {
+                                                colors.text_muted
+                                            }),
+                                    )
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.toggle_right_panel(&ToggleRightPanel, window, cx)
+                                    })),
+                            ),
+                    )
                     .child(
                         self.branch
                             .as_ref()
@@ -844,21 +879,6 @@ impl ProjectWindow {
                                 .when_some(update, |this, update| {
                                     this.on_click(move |_, _, cx| crate::updates::offer(&update, cx))
                                 }),
-                        )
-                    })
-                    .when(changed_files > 0, |this| {
-                        this.child(
-                            div()
-                                .id("status-changes")
-                                .cursor_pointer()
-                                .hover_style(|s| s.text_color(colors.text))
-                                .child(format!(
-                                    "{changed_files} file{} changed",
-                                    if changed_files == 1 { "" } else { "s" }
-                                ))
-                                .on_click(cx.listener(|this, _, window, cx| {
-                                    this.toggle_right_panel(&ToggleRightPanel, window, cx)
-                                })),
                         )
                     }),
             )
