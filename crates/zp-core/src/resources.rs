@@ -1,12 +1,14 @@
-//! Prompt templates and skills, in pi's formats.
+//! Prompt templates and Agent Skills.
 //!
 //! - Prompt templates: `*.md` files in `~/.zp/prompts/` and `<project>/.zp/prompts/`,
 //!   with optional frontmatter (`description`, `argument-hint`). `/name args` expands one;
 //!   `$1`, `$@`, `$ARGUMENTS`, `${1:-default}`, `${@:N}` and `${@:N:L}` take arguments.
 //! - Skills ([Agent Skills](https://agentskills.io/specification)): directories with a
 //!   `SKILL.md` (frontmatter `name`, `description`) under `~/.zp/skills/`,
-//!   `~/.agents/skills/`, and in projects `.zp/skills/` and `.agents/skills/`. The system
-//!   prompt lists them; `/skill:name args` loads one explicitly.
+//!   `~/.agents/skills/`, `~/.codex/skills/` and `~/.claude/skills/`, and the same
+//!   directories in projects. Pi directories are not scanned. The system prompt lists
+//!   them; `/skill:name args` loads one explicitly. Duplicate names keep the first match,
+//!   preferring project skills over user skills and ZP over the other locations.
 //!
 //! Project resources are only loaded for trusted projects.
 
@@ -237,8 +239,8 @@ fn valid_skill_name(name: &str) -> bool {
 }
 
 impl Resources {
-    /// Loads the user's resources from `data_dir` and `~/.agents`, and the project's
-    /// (from `cwd` up to its repository root) when `trusted`.
+    /// Loads the user's resources from `data_dir`, `~/.agents`, `~/.codex` and
+    /// `~/.claude`, and the project's (from `cwd` up to its repository root) when trusted.
     pub fn load(data_dir: Option<&Path>, cwd: &Path, trusted: bool) -> Self {
         let home = dirs::home_dir();
         Self::load_from(data_dir, home.as_deref(), cwd, trusted)
@@ -269,14 +271,22 @@ impl Resources {
             resources.load_templates(&data.join("prompts"), Source::User);
         }
         for dir in &project_dirs {
-            resources.load_skills(&dir.join(".zp/skills"), Source::Project);
-            resources.load_skills(&dir.join(".agents/skills"), Source::Project);
+            for skills in [
+                ".zp/skills",
+                ".agents/skills",
+                ".codex/skills",
+                ".claude/skills",
+            ] {
+                resources.load_skills(&dir.join(skills), Source::Project);
+            }
         }
         if let Some(data) = data_dir {
             resources.load_skills(&data.join("skills"), Source::User);
         }
         if let Some(home) = home {
-            resources.load_skills(&home.join(".agents/skills"), Source::User);
+            for skills in [".agents/skills", ".codex/skills", ".claude/skills"] {
+                resources.load_skills(&home.join(skills), Source::User);
+            }
         }
         resources
     }
@@ -530,6 +540,83 @@ mod tests {
         let (fields, body) = parse_frontmatter("No frontmatter");
         assert!(fields.is_empty());
         assert_eq!(body, "No frontmatter");
+    }
+
+    #[test]
+    fn skill_locations_deduplicate_and_respect_project_trust() {
+        let fixture = tempfile::tempdir().unwrap();
+        let home = fixture.path().join("home");
+        let data = home.join(".zp");
+        let project = fixture.path().join("project");
+        std::fs::create_dir_all(project.join(".git")).unwrap();
+        let write_skill = |base: &Path, directory: &str, name: &str| {
+            let dir = base.join(directory);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join("SKILL.md"),
+                format!("---\nname: {name}\ndescription: Skill from {directory}\n---\nSteps"),
+            )
+            .unwrap();
+        };
+        for (directory, name) in [
+            (".zp/skills/zp-only", "zp-only"),
+            (".agents/skills/agents-only", "agents-only"),
+            (".codex/skills/codex-only", "codex-only"),
+            (".claude/skills/claude-only", "claude-only"),
+        ] {
+            write_skill(&home, directory, &format!("user-{name}"));
+            write_skill(&project, directory, &format!("project-{name}"));
+        }
+        for base in [&home, &project] {
+            for directory in [
+                ".zp/skills/shared",
+                ".agents/skills/shared-copy",
+                ".codex/skills/shared-copy",
+                ".claude/skills/shared-copy",
+            ] {
+                write_skill(base, directory, "shared");
+            }
+            write_skill(base, ".pi/skills/pi-only", "pi-only");
+            write_skill(base, ".pi/agent/skills/pi-agent-only", "pi-agent-only");
+        }
+
+        let untrusted = Resources::load_from(Some(&data), Some(&home), &project, false);
+        assert_eq!(untrusted.skills.len(), 5);
+        assert!(
+            untrusted
+                .skills
+                .iter()
+                .all(|skill| skill.source == Source::User)
+        );
+        assert_eq!(
+            untrusted.skill("shared").unwrap().path,
+            data.join("skills/shared/SKILL.md")
+        );
+        let trusted = Resources::load_from(Some(&data), Some(&home), &project, true);
+        assert_eq!(trusted.skills.len(), 9);
+        assert_eq!(
+            trusted.skill("shared").unwrap().path,
+            project.join(".zp/skills/shared/SKILL.md")
+        );
+        assert_eq!(
+            trusted
+                .skills_prompt()
+                .matches("<name>shared</name>")
+                .count(),
+            1
+        );
+        for location in ["zp", "agents", "codex", "claude"] {
+            let user = format!("user-{location}-only");
+            let project = format!("project-{location}-only");
+            assert!(untrusted.skill(&user).is_some());
+            assert!(untrusted.skill(&project).is_none());
+            assert_eq!(trusted.skill(&user).unwrap().source, Source::User);
+            assert_eq!(trusted.skill(&project).unwrap().source, Source::Project);
+        }
+        for resources in [&untrusted, &trusted] {
+            assert!(resources.skill("pi-only").is_none());
+            assert!(resources.skill("pi-agent-only").is_none());
+        }
     }
 
     #[test]
