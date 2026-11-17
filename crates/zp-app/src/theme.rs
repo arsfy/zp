@@ -13,6 +13,10 @@ pub struct ThemeColors {
     pub background: Rgba,
     /// Raised surfaces such as panels, cards and the tab bar.
     pub surface: Rgba,
+    /// Project status bar background.
+    pub status_bar: Rgba,
+    /// Thin divider above the project status bar.
+    pub status_bar_border: Rgba,
     /// Hovered surface.
     pub surface_hover: Rgba,
     /// Borders and dividers.
@@ -114,6 +118,8 @@ impl Theme {
             colors: ThemeColors {
                 background: rgb(0x16171b),
                 surface: rgb(0x1e2026),
+                status_bar: rgb(0x2f3135),
+                status_bar_border: rgb(0x45474b),
                 surface_hover: rgb(0x2a2d35),
                 border: rgb(0x2e3139),
                 text: rgb(0xe6e7eb),
@@ -136,6 +142,8 @@ impl Theme {
             colors: ThemeColors {
                 background: rgb(0xffffff),
                 surface: rgb(0xf5f6f8),
+                status_bar: rgb(0xe9eaec),
+                status_bar_border: rgb(0xd1d3d7),
                 surface_hover: rgb(0xeaecf0),
                 border: rgb(0xdfe2e7),
                 text: rgb(0x1d1f24),

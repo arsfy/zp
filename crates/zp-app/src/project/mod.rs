@@ -793,21 +793,23 @@ impl ProjectWindow {
         }
         div()
             .id("status-bar")
-            .h(px(24.))
+            .h(px(28.))
             .flex_shrink_0()
             .flex()
             .items_center()
             .justify_between()
             .pl_1()
             .pr_3()
+            .py_0p5()
             .text_size(px(12.))
             .text_color(colors.text_muted)
-            .bg(colors.surface)
+            .bg(colors.status_bar)
             .border_t_1()
-            .border_color(colors.border)
+            .border_color(colors.status_bar_border)
             .child(
                 div()
                     .flex()
+                    .flex_shrink_0()
                     .items_center()
                     .gap_3()
                     .child(
@@ -834,7 +836,7 @@ impl ProjectWindow {
                                     .child(
                                         svg()
                                             .data(include_bytes!("../../../../assets/icons/git-branch.svg"))
-                                            .size(px(15.))
+                                            .size(px(13.))
                                             .text_color(if self.layout.right_panel_visible {
                                                 colors.accent
                                             } else {
@@ -882,7 +884,7 @@ impl ProjectWindow {
                         )
                     }),
             )
-            .child(div().child(right.join("  ·  ")))
+            .child(div().min_w_0().truncate().child(right.join("  ·  ")))
     }
 
     fn render_overlays(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {

@@ -326,7 +326,7 @@ impl ProjectWindow {
             .cursor_pointer()
             .hover_style(move |s| s.bg(colors.surface_hover))
             .tooltip(crate::ui::tooltip("Toggle Terminal (ctrl-`)"))
-            .child(svg().data(ICON_TERMINAL).size(px(15.)).text_color(if open {
+            .child(svg().data(ICON_TERMINAL).size(px(13.)).text_color(if open {
                 colors.accent
             } else {
                 colors.text_muted
