@@ -138,6 +138,9 @@ pub struct TabState {
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct AppState {
+    /// Most recently selected or used conversation model, as `provider/model`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_model: Option<String>,
     /// Most recently opened first.
     pub recent_projects: Vec<RecentProject>,
     /// Project windows to reopen at startup, in opening order.
@@ -249,7 +252,10 @@ mod tests {
         let path = dir.path().join("state.json");
         assert_eq!(AppState::load(&path), AppState::default());
 
-        let mut state = AppState::default();
+        let mut state = AppState {
+            last_model: Some("provider/model".into()),
+            ..AppState::default()
+        };
         state.touch_recent(Path::new("/work/app"));
         state.mark_open(Path::new("/work/app"));
         let project = state.project_mut(Path::new("/work/app"));

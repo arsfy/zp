@@ -206,21 +206,30 @@ impl AppModels {
         });
     }
 
-    /// The model new conversations use: the one in the settings if it is available,
-    /// else the default of the first provider with credentials.
+    /// New conversations use the configured model, or the last used model when the
+    /// default is automatic. Unavailable models fall back to a usable provider.
     pub fn default_model(cx: &App) -> Option<Model> {
         let models = &cx.try_global::<Self>()?.models;
-        let configured = AppSettings::get(cx)
+        let preferred = AppSettings::get(cx)
             .default_model
             .as_deref()
+            .or(AppStore::state(cx).last_model.as_deref())
             .and_then(|spec| models.find(spec))
             .filter(|model| models.resolve_auth(&model.provider).is_some());
-        configured.or_else(|| {
+        preferred.or_else(|| {
             models
                 .available_providers()
                 .iter()
                 .find_map(|provider| models.default_model(provider.id()))
         })
+    }
+
+    /// Remembers an explicit selection or a model used to start a conversation task.
+    pub fn remember_model(model: &Model, cx: &mut App) {
+        let spec = model.qualified_id();
+        if AppStore::state(cx).last_model.as_deref() != Some(spec.as_str()) {
+            AppStore::update(cx, |state| state.last_model = Some(spec));
+        }
     }
 
     /// Whether `provider` can be used (has a key, or needs none).

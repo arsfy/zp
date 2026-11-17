@@ -18,7 +18,7 @@ use crate::actions::{
 use crate::conversation::ConversationView;
 use crate::conversation::transcript::{Row, ToolStatus};
 use crate::project::{ProjectWindow, RenameTarget};
-use crate::store::{AppModels, FileTrash};
+use crate::store::{AppModels, AppStore, FileTrash};
 use crate::tests::{project_dir, saved_state, setup};
 use crate::workspace;
 
@@ -824,6 +824,78 @@ fn conversations_open_without_any_api_key(cx: &mut TestAppContext) {
         conversation.read_with(cx, |view, _| (view.status().model, view.needs_model()));
     assert_eq!(model.map(|m| m.qualified_id()), Some(choice.qualified_id()));
     assert!(!needs_model);
+}
+
+#[gpui::test]
+fn new_conversations_remember_the_last_model(cx: &mut TestAppContext) {
+    let faux = FauxProvider::default();
+    faux.push(FauxResponse::text("back to the original model"));
+    let other = FauxProvider::new("other");
+    let data = setup_models(cx, &[&faux, &other], false);
+    let fallback = faux.model().qualified_id();
+    let recent = other.model().qualified_id();
+    let (_dir, project) = project_dir();
+    let window = open(cx, &project);
+    let original = active(window, cx);
+
+    cx.dispatch_action(window.into(), NewChat);
+    cx.run_until_parked();
+    let conversation = active(window, cx);
+    window
+        .update(cx, |_, window, cx| {
+            conversation.update(cx, |view, cx| view.select_model(other.model(), window, cx))
+        })
+        .unwrap();
+    assert_eq!(
+        saved_state(cx, &data).last_model.as_deref(),
+        Some(recent.as_str())
+    );
+    cx.update(|cx| AppStore::init(Some(zp_core::paths::state_file(data.path())), cx));
+
+    cx.dispatch_action(window.into(), NewChat);
+    cx.run_until_parked();
+    assert_eq!(
+        active(window, cx).read_with(cx, |view, _| view.model().unwrap().qualified_id()),
+        recent
+    );
+    assert_eq!(
+        original.read_with(cx, |view, _| view.model().unwrap().qualified_id()),
+        fallback
+    );
+
+    // Merely revisiting an old conversation keeps the preference; sending uses its model.
+    cx.dispatch_action(window.into(), ActivateTab(0));
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|cx| AppStore::state(cx).last_model.clone()),
+        Some(recent.clone())
+    );
+    send(window, "continue with the original model", cx);
+    idle(&original, 2, cx);
+    assert_eq!(
+        saved_state(cx, &data).last_model.as_deref(),
+        Some(fallback.as_str())
+    );
+
+    cx.dispatch_action(window.into(), NewChat);
+    cx.run_until_parked();
+    let conversation = active(window, cx);
+    assert_eq!(
+        conversation.read_with(cx, |view, _| view.model().unwrap().qualified_id()),
+        fallback
+    );
+    window
+        .update(cx, |_, window, cx| {
+            conversation.update(cx, |view, cx| view.select_model(other.model(), window, cx))
+        })
+        .unwrap();
+    cx.update(|cx| cx.global::<AppModels>().models.remove_provider("other"));
+    cx.dispatch_action(window.into(), NewChat);
+    cx.run_until_parked();
+    assert_eq!(
+        active(window, cx).read_with(cx, |view, _| view.model().unwrap().qualified_id()),
+        fallback
+    );
 }
 
 #[gpui::test]

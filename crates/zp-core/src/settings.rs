@@ -63,7 +63,7 @@ pub struct CustomProvider {
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct Settings {
-    /// Model of new conversations, as `provider/model`.
+    /// Model of new conversations, as `provider/model`; `None` uses the last used model.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub default_model: Option<String>,
     /// Reasoning level of new conversations.

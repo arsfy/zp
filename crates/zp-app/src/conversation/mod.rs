@@ -331,8 +331,8 @@ impl ConversationView {
             .try_global::<AppModels>()
             .map(|m| m.models.clone())
             .ok_or_else(|| anyhow::anyhow!("models are not initialized"))?;
-        // A new conversation starts with the default model of a usable provider; without
-        // any, it has no model until the user picks one (sending asks for it).
+        // New conversations prefer the last usable model; without any usable provider,
+        // the user picks a model before sending.
         let new = session_model(&models, &session).is_none();
         let model = new.then(|| AppModels::default_model(cx)).flatten();
         let mut options = CodingSessionOptions::new(models, &self.root, session);
@@ -1275,6 +1275,9 @@ impl ConversationView {
         let Some(coding) = self.coding.clone() else {
             return;
         };
+        if let Some(model) = coding.agent().model() {
+            AppModels::remember_model(&model, cx);
+        }
         self.running = true;
         self.tokens_per_second = None;
         self.response_timer = ResponseTimer::default();
@@ -1470,6 +1473,8 @@ impl ConversationView {
             let level = coding.agent().thinking_level();
             if let Err(error) = coding.set_model(model.clone()) {
                 self.run_error = Some(format!("{error:#}"));
+            } else {
+                AppModels::remember_model(&model, cx);
             }
             // Keep the requested level valid for the new model.
             let clamped = model.clamp_thinking_level(level);

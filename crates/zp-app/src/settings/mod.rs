@@ -229,7 +229,7 @@ impl SettingsWindow {
             AppSettings::update(cx, |settings| settings.default_model = spec.clone()).map(|()| {
                 match spec {
                     Some(spec) => format!("New conversations use {spec}"),
-                    None => "New conversations use the first configured provider".to_owned(),
+                    None => "New conversations use the last used model".to_owned(),
                 }
             });
         self.report(result, cx);
@@ -414,7 +414,7 @@ impl SettingsWindow {
                 "{} ▾",
                 current
                     .clone()
-                    .unwrap_or_else(|| "Automatic (first configured provider)".to_owned())
+                    .unwrap_or_else(|| "Last used model".to_owned())
             ),
             ButtonKind::Normal,
             cx,
@@ -463,9 +463,10 @@ impl SettingsWindow {
                         .max_h(px(260.))
                         .overflow_y_scroll()
                         .child(
-                            menu_item("model-auto", "Automatic", current.is_none(), cx).on_click(
-                                cx.listener(|this, _, _, cx| this.set_default_model(None, cx)),
-                            ),
+                            menu_item("model-auto", "Last used model", current.is_none(), cx)
+                                .on_click(
+                                    cx.listener(|this, _, _, cx| this.set_default_model(None, cx)),
+                                ),
                         )
                         .children(choices.into_iter().enumerate().map(|(index, id)| {
                             let selected = current.as_deref() == Some(id.as_str());

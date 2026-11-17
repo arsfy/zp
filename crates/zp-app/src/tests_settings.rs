@@ -264,6 +264,7 @@ fn general_defaults_apply_to_new_conversations(cx: &mut TestAppContext) {
             .models
             .register(Arc::new(other.clone()))
     });
+    cx.update(|cx| AppModels::remember_model(&faux.model(), cx));
     let window = settings_window(Page::General, cx);
     let spec = other.model().qualified_id();
     window
@@ -273,9 +274,9 @@ fn general_defaults_apply_to_new_conversations(cx: &mut TestAppContext) {
             view.set_generate_titles(false, cx);
         })
         .unwrap();
-    let saved = saved(&data);
-    assert_eq!(saved.default_model.as_deref(), Some(spec.as_str()));
-    assert_eq!(saved.default_thinking, Some(ThinkingLevel::High));
+    let configured = saved(&data);
+    assert_eq!(configured.default_model.as_deref(), Some(spec.as_str()));
+    assert_eq!(configured.default_thinking, Some(ThinkingLevel::High));
     assert!(!cx.update(|cx| cx.global::<AppModels>().generate_titles));
 
     let (_dir, project) = project_dir();
@@ -283,6 +284,18 @@ fn general_defaults_apply_to_new_conversations(cx: &mut TestAppContext) {
     let status = active(project_window, cx).read_with(cx, |view, _| view.status());
     assert_eq!(status.model.unwrap().qualified_id(), spec);
     assert_eq!(status.thinking, ThinkingLevel::High);
+
+    window
+        .update(cx, |view, _, cx| view.set_default_model(None, cx))
+        .unwrap();
+    assert!(saved(&data).default_model.is_none());
+    cx.dispatch_action(project_window.into(), crate::actions::NewChat);
+    cx.run_until_parked();
+    let status = active(project_window, cx).read_with(cx, |view, _| view.status());
+    assert_eq!(
+        status.model.unwrap().qualified_id(),
+        faux.model().qualified_id()
+    );
 }
 
 #[gpui::test]
