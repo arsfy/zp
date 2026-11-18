@@ -1,5 +1,6 @@
 //! Markdown rendering for assistant messages.
 
+pub mod highlight;
 mod parse;
 mod render;
 

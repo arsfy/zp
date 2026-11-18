@@ -132,6 +132,7 @@ pub fn init(data_dir: Option<PathBuf>, cx: &mut App) {
     actions::init(cx);
     notifications::init(cx);
     updates::init(cx);
+    markdown::highlight::init(cx);
 }
 
 /// Applies changed settings to the running app: theme, shortcuts, titles and the

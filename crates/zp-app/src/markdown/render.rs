@@ -18,6 +18,8 @@ pub struct MarkdownStyle {
     pub border: Rgba,
     pub code_background: Rgba,
     pub mono_font: SharedString,
+    /// Code is highlighted for a dark background.
+    pub dark: bool,
 }
 
 impl MarkdownStyle {
@@ -30,6 +32,7 @@ impl MarkdownStyle {
             border: theme.colors.border,
             code_background: theme.colors.code_background,
             mono_font: theme.metrics.mono_font.clone(),
+            dark: theme.is_dark,
         }
     }
 }
@@ -269,7 +272,13 @@ fn code_block(
                 .pt_1()
                 .font_family(style.mono_font.clone())
                 .text_size(px(12.))
-                .child(ids.text(text.to_owned().into())),
+                .child({
+                    let code = ids.text(text.to_owned().into());
+                    match super::highlight::highlight(language, text, style.dark) {
+                        Some(highlights) => code.highlights((*highlights).clone()),
+                        None => code,
+                    }
+                }),
         )
         .into_any_element()
 }
