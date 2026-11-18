@@ -441,13 +441,13 @@ impl ConversationView {
             self.transcript.apply(event, &mut changes);
         }
         for &row in changes.dirty.iter().filter(|&&row| row < old_len) {
-            self.list_state.splice(row..row + 1, 1);
+            self.list_state.remeasure_items(row..row + 1);
         }
         let new_len = self.transcript.len();
         if new_len > old_len {
             // The previous last row loses the working indicator.
             if old_len > 0 && !changes.dirty.contains(&(old_len - 1)) {
-                self.list_state.splice(old_len - 1..old_len, 1);
+                self.list_state.remeasure_items(old_len - 1..old_len);
             }
             self.list_state.splice(old_len..old_len, new_len - old_len);
         }
@@ -545,14 +545,14 @@ impl ConversationView {
     /// Remeasures the space kept for the composer after the last row.
     pub(super) fn refresh_spacer(&mut self) {
         let len = self.transcript.len();
-        self.list_state.splice(len..len + 1, 1);
+        self.list_state.remeasure_items(len..len + 1);
     }
 
     /// Remeasures the last row, which shows the working indicator while busy.
     pub(super) fn refresh_last_row(&mut self) {
         let len = self.transcript.len();
         if len > 0 {
-            self.list_state.splice(len - 1..len, 1);
+            self.list_state.remeasure_items(len - 1..len);
         }
     }
 
@@ -656,6 +656,15 @@ impl ConversationView {
     #[cfg(test)]
     pub fn transcript(&self) -> &Transcript {
         &self.transcript
+    }
+
+    /// The transcript's scroll position and whether it follows new output (tests).
+    #[cfg(test)]
+    pub fn transcript_scroll(&self) -> (gpui::ListOffset, bool) {
+        (
+            self.list_state.logical_scroll_top(),
+            self.list_state.is_following_tail(),
+        )
     }
 
     /// Shared text selection for native interaction screenshots.
@@ -881,7 +890,7 @@ impl ConversationView {
             return;
         };
         if let Some(previous) = self.editing.take() {
-            self.list_state.splice(previous.row..previous.row + 1, 1);
+            self.list_state.remeasure_items(previous.row..previous.row + 1);
         }
         let input = cx.new(|cx| EditableTextState::new(StringStorage::from(text.clone()), cx));
         input.update(cx, |input, cx| input.move_to(text.len(), cx));
@@ -889,7 +898,7 @@ impl ConversationView {
         // The field may grow or shrink the row.
         let changed = cx.subscribe(&input, move |this, _, _: &TextChanged, cx| {
             if this.editing.as_ref().is_some_and(|edit| edit.row == row) {
-                this.list_state.splice(row..row + 1, 1);
+                this.list_state.remeasure_items(row..row + 1);
                 cx.notify();
             }
         });
@@ -898,7 +907,7 @@ impl ConversationView {
             input,
             _changed: changed,
         });
-        self.list_state.splice(row..row + 1, 1);
+        self.list_state.remeasure_items(row..row + 1);
         cx.notify();
     }
 
@@ -910,7 +919,7 @@ impl ConversationView {
     /// Stops editing without changing anything.
     pub(crate) fn cancel_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(edit) = self.editing.take() {
-            self.list_state.splice(edit.row..edit.row + 1, 1);
+            self.list_state.remeasure_items(edit.row..edit.row + 1);
             self.focus_composer(window, cx);
             cx.notify();
         }
@@ -1562,7 +1571,7 @@ impl ConversationView {
         cx: &mut Context<Self>,
     ) {
         self.thinking_expanded.insert((row, block), !expanded);
-        self.list_state.splice(row..row + 1, 1);
+        self.list_state.remeasure_items(row..row + 1);
         cx.notify();
     }
 
@@ -1574,7 +1583,7 @@ impl ConversationView {
         cx: &mut Context<Self>,
     ) {
         self.tool_expanded.insert(id.to_owned(), !expanded);
-        self.list_state.splice(row..row + 1, 1);
+        self.list_state.remeasure_items(row..row + 1);
         cx.notify();
     }
 }

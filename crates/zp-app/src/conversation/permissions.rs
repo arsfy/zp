@@ -253,7 +253,7 @@ impl ConversationView {
 
     pub(super) fn refresh_tool_row(&mut self, call_id: &str) {
         if let Some(row) = self.transcript.row_of_tool(call_id) {
-            self.list_state.splice(row..row + 1, 1);
+            self.list_state.remeasure_items(row..row + 1);
         }
     }
 

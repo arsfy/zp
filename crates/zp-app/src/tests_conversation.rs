@@ -978,3 +978,55 @@ fn ime_composition_has_bounds_before_the_next_frame(cx: &mut TestAppContext) {
         "{stale:?} vs {fresh:?}"
     );
 }
+
+#[gpui::test]
+fn scrolling_up_while_a_reply_streams_stays_put(cx: &mut TestAppContext) {
+    use gpui::{Modifiers, ScrollDelta, ScrollWheelEvent, TouchPhase, VisualTestContext};
+
+    let faux = FauxProvider::default().with_chunk_delay(Duration::from_millis(300));
+    let long: String = (1..=300)
+        .map(|n| format!("Line {n} of a long answer.\n\n"))
+        .collect();
+    faux.push(FauxResponse::text(long));
+    let _data = setup_models(cx, &[&faux], false);
+    let (_dir, project) = project_dir();
+    let window = open(cx, &project);
+    send(window, "write a lot", cx);
+    let conversation = active(window, cx);
+    let streamed = |cx: &mut TestAppContext| {
+        conversation.read_with(cx, |view, _| {
+            let transcript = view.transcript();
+            transcript
+                .len()
+                .checked_sub(1)
+                .and_then(|row| transcript.assistant(row))
+                .map_or(0, |message| message.text().len())
+        })
+    };
+    // The first part of the reply is on screen and the view follows it.
+    wait_until(cx, |cx| streamed(cx) > 0);
+    let first_part = streamed(cx);
+    assert!(conversation.read_with(cx, |view, _| view.transcript_scroll().1));
+
+    // Scroll up into the reply.
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    visual.simulate_event(ScrollWheelEvent {
+        position: point(px(600.), px(300.)),
+        delta: ScrollDelta::Pixels(point(px(0.), px(400.))),
+        modifiers: Modifiers::none(),
+        touch_phase: TouchPhase::Moved,
+    });
+    visual.run_until_parked();
+    let (scrolled, following) = conversation.read_with(&visual, |view, _| view.transcript_scroll());
+    assert!(!following, "scrolling up stops following the output");
+
+    // More of the reply arrives: the view stays where the user put it.
+    wait_until(cx, |cx| streamed(cx) > first_part);
+    let (now, following) = conversation.read_with(cx, |view, _| view.transcript_scroll());
+    assert!(!following);
+    assert_eq!(
+        (now.item_ix, now.offset_in_item),
+        (scrolled.item_ix, scrolled.offset_in_item),
+        "streamed output moved the scroll position"
+    );
+}
