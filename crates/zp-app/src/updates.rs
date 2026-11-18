@@ -42,6 +42,7 @@ pub struct AppUpdate {
     cancel: Option<CancellationToken>,
     dialog_open: bool,
     retry: Option<Update>,
+    ad_hoc: bool,
 }
 
 impl Global for AppUpdate {}
@@ -126,11 +127,20 @@ pub fn check(manual: bool, cx: &mut App) {
     let selected = channel(cx);
     let task = gpui_tokio::Tokio::spawn(cx, async move {
         let platform = zp_core::update::platform_key();
-        tokio::select! {
-            _ = cancel.cancelled() => anyhow::bail!("update check cancelled"),
+        let result = tokio::select! {
+            _ = cancel.cancelled() => Err(anyhow::anyhow!("update check cancelled")),
             result = zp_core::update::check(&url, selected, zp_core::VERSION,
                 &platform, PackageKind::current(), zp_core::update::PUBLIC_KEY) => result,
-        }
+        };
+        let mac_update = matches!(
+            &result,
+            Ok(CheckResult::Available(update)) if update.asset.kind == PackageKind::MacApp
+        );
+        let ad_hoc = mac_update
+            && tokio::task::spawn_blocking(running_ad_hoc)
+                .await
+                .unwrap_or(false);
+        (result, ad_hoc)
     });
     cx.spawn(async move |cx| {
         let result = task.await;
@@ -138,6 +148,10 @@ pub fn check(manual: bool, cx: &mut App) {
             if cx.global::<AppUpdate>().generation != generation {
                 return;
             }
+            let result = result.map(|(result, ad_hoc)| {
+                cx.global_mut::<AppUpdate>().ad_hoc = ad_hoc;
+                result
+            });
             let state = match result {
                 Ok(Ok(CheckResult::Available(update))) => UpdateState::Available(update),
                 Ok(Ok(CheckResult::UpToDate)) => UpdateState::UpToDate,
@@ -225,6 +239,10 @@ pub fn offer(update: &Update, cx: &mut App) {
         detail.push_str("\n\n");
         detail.push_str(&notes);
     }
+    if cx.global::<AppUpdate>().ad_hoc {
+        detail.push_str("\n\n");
+        detail.push_str(AD_HOC_NOTE);
+    }
     let Some(answer) = prompt(
         PromptLevel::Info,
         "Update ZP",
@@ -284,6 +302,19 @@ pub fn notes_excerpt(notes: &str, lines: usize) -> Option<String> {
         short.push('…');
     }
     Some(short)
+}
+
+/// Shown before updating an ad-hoc signed macOS application.
+const AD_HOC_NOTE: &str = "This copy of ZP has no Developer ID signature, so macOS sees each version as a new app: after updating it asks once more before ZP can read your API keys from the keychain, and may ask again for folder access.";
+
+/// Whether this process runs from an ad-hoc signed (or unsigned) macOS application.
+fn running_ad_hoc() -> bool {
+    install::running_bundle().is_some_and(|bundle| {
+        matches!(
+            install::mac_signing(&bundle),
+            Ok(install::MacSigning::AdHoc)
+        )
+    })
 }
 
 pub fn cancel(cx: &mut App) {

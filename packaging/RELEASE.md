@@ -21,10 +21,19 @@ Only the public key is embedded in builds. Keep the private key backed up outsid
 the repository. Existing clients require this same key to verify later updates;
 key rotation needs a separately designed migration.
 
-The existing macOS secrets are also required: `MACOS_CERTIFICATE`,
-`MACOS_CERTIFICATE_PASSWORD`, `MACOS_SIGN_IDENTITY`, `APPLE_ID`, `APPLE_TEAM_ID`,
-and `APPLE_APP_PASSWORD`. The application ZIP and DMG are signed and notarized.
-Keep the macOS bundle ID and Developer ID team consistent between releases.
+macOS signing is optional. With `MACOS_CERTIFICATE`, `MACOS_CERTIFICATE_PASSWORD`
+and `MACOS_SIGN_IDENTITY` the application and DMG are signed with that Developer ID
+identity; with `APPLE_ID`, `APPLE_TEAM_ID` and `APPLE_APP_PASSWORD` as well they are
+notarized. Without them the build is ad-hoc signed and the workflow logs a warning.
+
+The macOS updater keeps the signing identity of the installed application. A
+Developer ID installation only accepts an update signed by the same team and
+notarized. An ad-hoc installation accepts any intact signature with ZP's bundle ID
+(`dev.zp.ZP`); the signed manifest and SHA-256 still authenticate the package. macOS
+ties keychain access and privacy permissions to the signature, so after each ad-hoc
+update it asks once more before ZP can read its keychain items, and the update
+dialog says so. Keep the macOS bundle ID and Developer ID team consistent between
+releases.
 
 ## Publication
 

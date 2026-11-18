@@ -70,39 +70,7 @@ pub(super) fn prepare(
                 staged.join("Contents/MacOS/zp").is_file(),
                 "the update contains no ZP.app"
             );
-            let old_signature = Command::new("codesign")
-                .args(["-dv", "--verbose=4"])
-                .arg(&target)
-                .output()?;
-            let details = String::from_utf8_lossy(&old_signature.stderr);
-            let team = details.lines().find_map(|line| line.strip_prefix("TeamIdentifier="))
-                .filter(|team| !team.is_empty() && *team != "not set")
-                .context("this application has no Developer ID signature; install a signed release first")?;
-            ensure!(
-                team.bytes().all(|c| c.is_ascii_alphanumeric()),
-                "invalid signing team"
-            );
-            // A leading `=` makes codesign read requirement text instead of a file path.
-            let requirement = format!(
-                "=anchor apple generic and identifier \"dev.zp.ZP\" and certificate leaf[subject.OU] = \"{team}\""
-            );
-            let verified = Command::new("codesign")
-                .args(["--verify", "--deep", "--strict", "-R"])
-                .arg(requirement)
-                .arg(&staged)
-                .output()?;
-            ensure!(
-                verified.status.success(),
-                "the new application signature or signing identity is invalid"
-            );
-            let assessed = Command::new("spctl")
-                .args(["--assess", "--type", "execute"])
-                .arg(&staged)
-                .output()?;
-            ensure!(
-                assessed.status.success(),
-                "macOS could not validate the notarized application"
-            );
+            verify_mac_app(&target, &staged)?;
             staged
         }
         PackageKind::WindowsPortable => {
@@ -173,6 +141,107 @@ pub(super) fn prepare(
             .arg(launch);
     }
     Ok(Prepared { command, staging })
+}
+
+/// The bundle identifier every ZP release is signed with.
+const BUNDLE_ID: &str = "dev.zp.ZP";
+
+/// How a macOS application is signed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum MacSigning {
+    /// A Developer ID signature of this team.
+    DeveloperId(String),
+    /// An ad-hoc signature (or none): builds without Apple's certificates.
+    AdHoc,
+}
+
+/// How the application bundle at `bundle` is signed.
+pub(super) fn mac_signing(bundle: &Path) -> anyhow::Result<MacSigning> {
+    let output = Command::new("codesign")
+        .args(["-dv", "--verbose=4"])
+        .arg(bundle)
+        .output()?;
+    Ok(parse_signing(&String::from_utf8_lossy(&output.stderr)))
+}
+
+/// The signing of `codesign -dv` output.
+fn parse_signing(details: &str) -> MacSigning {
+    details
+        .lines()
+        .find_map(|line| line.strip_prefix("TeamIdentifier="))
+        .map(str::trim)
+        .filter(|team| !team.is_empty() && *team != "not set")
+        .map_or(MacSigning::AdHoc, |team| {
+            MacSigning::DeveloperId(team.to_owned())
+        })
+}
+
+/// The `.app` bundle this executable runs from, if any.
+pub(super) fn running_bundle() -> Option<std::path::PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let bundle = exe.parent()?.parent()?.parent()?;
+    bundle
+        .extension()
+        .is_some_and(|e| e == "app")
+        .then(|| bundle.to_path_buf())
+}
+
+/// Checks the unpacked application `staged` before it replaces `current`. The package
+/// itself is authentic (signed manifest, SHA-256); this keeps the signing identity:
+/// a Developer ID installation only accepts the same team, notarized. An ad-hoc
+/// installation accepts any intact signature of ZP's bundle identifier.
+fn verify_mac_app(current: &Path, staged: &Path) -> anyhow::Result<()> {
+    match mac_signing(current)? {
+        MacSigning::DeveloperId(team) => {
+            ensure!(
+                team.bytes().all(|c| c.is_ascii_alphanumeric()),
+                "invalid signing team"
+            );
+            // A leading `=` makes codesign read requirement text instead of a file path.
+            let requirement = format!(
+                "=anchor apple generic and identifier \"{BUNDLE_ID}\" and certificate leaf[subject.OU] = \"{team}\""
+            );
+            let verified = Command::new("codesign")
+                .args(["--verify", "--deep", "--strict", "-R"])
+                .arg(requirement)
+                .arg(staged)
+                .output()?;
+            ensure!(
+                verified.status.success(),
+                "the new application signature or signing identity is invalid"
+            );
+            let assessed = Command::new("spctl")
+                .args(["--assess", "--type", "execute"])
+                .arg(staged)
+                .output()?;
+            ensure!(
+                assessed.status.success(),
+                "macOS could not validate the notarized application"
+            );
+        }
+        MacSigning::AdHoc => {
+            let verified = Command::new("codesign")
+                .args(["--verify", "--deep", "--strict"])
+                .arg(staged)
+                .output()?;
+            ensure!(
+                verified.status.success(),
+                "the new application signature is invalid"
+            );
+            let details = Command::new("codesign")
+                .args(["-dv", "--verbose=2"])
+                .arg(staged)
+                .output()?;
+            let details = String::from_utf8_lossy(&details.stderr);
+            ensure!(
+                details
+                    .lines()
+                    .any(|line| line.trim() == format!("Identifier={BUNDLE_ID}")),
+                "the update is not a ZP application"
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Windows PowerShell running a script file, without a console window: ZP is a GUI
@@ -246,6 +315,57 @@ mod tests {
             assert_eq!(fs::read_to_string(&target).unwrap(), "#!/bin/sh\nexit 0\n");
             assert!(stage.join("failed").exists());
         }
+    }
+
+    #[test]
+    fn signing_is_read_from_codesign_details() {
+        assert_eq!(
+            parse_signing("Identifier=dev.zp.ZP\nTeamIdentifier=AB12CD34EF\n"),
+            MacSigning::DeveloperId("AB12CD34EF".into())
+        );
+        assert_eq!(
+            parse_signing("Identifier=dev.zp.ZP\nSignature=adhoc\nTeamIdentifier=not set\n"),
+            MacSigning::AdHoc
+        );
+        assert_eq!(
+            parse_signing("x: code object is not signed at all"),
+            MacSigning::AdHoc
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn ad_hoc_installations_accept_intact_zp_bundles_only() {
+        let directory = tempfile::tempdir().unwrap();
+        let bundle = |name: &str, identifier: &str| {
+            let app = directory.path().join(name);
+            std::fs::create_dir_all(app.join("Contents/MacOS")).unwrap();
+            std::fs::copy("/usr/bin/true", app.join("Contents/MacOS/zp")).unwrap();
+            std::fs::write(
+                app.join("Contents/Info.plist"),
+                format!(
+                    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<plist version=\"1.0\"><dict>\
+                     <key>CFBundleExecutable</key><string>zp</string>\
+                     <key>CFBundleIdentifier</key><string>{identifier}</string>\
+                     </dict></plist>"
+                ),
+            )
+            .unwrap();
+            let signed = Command::new("codesign")
+                .args(["--force", "--sign", "-"])
+                .arg(&app)
+                .output()
+                .unwrap();
+            assert!(signed.status.success(), "{signed:?}");
+            app
+        };
+        let current = bundle("Current.app", BUNDLE_ID);
+        assert_eq!(mac_signing(&current).unwrap(), MacSigning::AdHoc);
+        assert!(verify_mac_app(&current, &bundle("New.app", BUNDLE_ID)).is_ok());
+        assert!(verify_mac_app(&current, &bundle("Other.app", "com.example.other")).is_err());
+        let tampered = bundle("Tampered.app", BUNDLE_ID);
+        std::fs::write(tampered.join("Contents/MacOS/zp"), "#!/bin/sh\n").unwrap();
+        assert!(verify_mac_app(&current, &tampered).is_err());
     }
 
     #[test]

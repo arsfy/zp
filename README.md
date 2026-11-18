@@ -26,7 +26,13 @@ Download ZP from the [Releases](https://github.com/arsfy/zp/releases) page.
 
 ### macOS
 
-Open the `.dmg` and drag **ZP** to **Applications**. The application is signed and notarized.
+Open the `.dmg` and drag **ZP** to **Applications**.
+
+Releases built without Apple notarization are only ad-hoc signed, and macOS may refuse to open them ("ZP is damaged" or "Apple could not verify ZP"). Remove the download quarantine once, then open ZP normally:
+
+```sh
+xattr -dr com.apple.quarantine /Applications/ZP.app
+```
 
 ### Windows
 
@@ -59,6 +65,8 @@ ZP checks GitHub for updates after it starts and then every six hours. You can t
 - **macOS, Windows portable, AppImage and Linux archive**: ZP replaces itself and restarts. Your open projects, tabs and unsent drafts are restored. If the new version fails to start, the previous version is restored automatically.
 - **Windows installer**: the downloaded installer is started for you.
 - **Debian package**: the `.deb` is opened in your system's package installer, so it stays managed by the package manager.
+
+On macOS, releases without Apple notarization are ad-hoc signed, so macOS treats every version as a new app: after an update it asks once more before ZP can read your API keys from the keychain (choose **Always Allow**), and may ask again for folder access.
 
 Builds made from source can check for updates but cannot install them, because they don't embed the release verification key. Download releases manually, or rebuild from source.
 
