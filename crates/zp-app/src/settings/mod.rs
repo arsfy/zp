@@ -403,6 +403,12 @@ impl SettingsWindow {
         self.report(result, cx);
     }
 
+    pub fn set_review_thinking(&mut self, level: ThinkingLevel, cx: &mut Context<Self>) {
+        let result = AppSettings::update(cx, |s| s.permissions.review_thinking = Some(level))
+            .map(|()| format!("Review thinking level: {level}"));
+        self.report(result, cx);
+    }
+
     #[cfg(any(test, feature = "visual-tests"))]
     pub(crate) fn review_model_picker(&self) -> Option<Entity<ReviewModelPicker>> {
         self.review_model_picker.clone()
@@ -617,6 +623,17 @@ impl SettingsWindow {
 
     fn render_permissions(&self, cx: &mut Context<Self>) -> AnyElement {
         let current = AppSettings::get(cx).permissions.mode.unwrap_or_default();
+        let review_thinking = AppSettings::get(cx)
+            .permissions
+            .review_thinking
+            .unwrap_or_default();
+        let levels = [
+            ThinkingLevel::Off,
+            ThinkingLevel::Minimal,
+            ThinkingLevel::Low,
+            ThinkingLevel::Medium,
+            ThinkingLevel::High,
+        ];
         page_body()
             .child(section(
                 "Default permission mode",
@@ -643,6 +660,17 @@ impl SettingsWindow {
                 .truncate()
                 .on_click(cx.listener(|this, _, window, cx| this.open_review_model_picker(false, window, cx))),
             ))
+            .child(section(
+                "Review thinking level",
+                "How much the review model reasons before deciding. Higher is more careful but slower and costlier; models without that level use the closest one.",
+                cx,
+            ))
+            .child(div().flex().child(segmented(
+                "review-thinking",
+                levels.iter().map(|level| (level.as_str().to_owned(), *level == review_thinking)),
+                cx,
+                move |this, index, cx| this.set_review_thinking(levels[index], cx),
+            )))
             .child(section(
                 "Allowed commands",
                 "Command prefixes that run without asking, one per line (e.g. `cargo test`, `git status`). Destructive commands always ask.",

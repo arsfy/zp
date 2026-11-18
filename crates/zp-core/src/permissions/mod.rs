@@ -207,6 +207,8 @@ pub struct PermissionPolicy {
     /// The review model (`provider/model`); `None` picks a cheap model of the agent's
     /// provider.
     pub review_model: Option<String>,
+    /// How much the review model reasons; clamped to what the model supports.
+    pub review_thinking: zp_ai::ThinkingLevel,
 }
 
 /// Grants made with "approve for session".

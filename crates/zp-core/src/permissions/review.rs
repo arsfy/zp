@@ -7,8 +7,8 @@ use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 use zp_agent::{AgentTool as _, ToolContext};
 use zp_ai::{
-    Context, Message, Model, Models, StopReason, StreamOptions, ThinkingLevel, Tool, ToolCall,
-    ToolResultMessage, UserContent,
+    Context, Message, Model, Models, StopReason, StreamOptions, ThinkingBudgets, ThinkingLevel,
+    Tool, ToolCall, ToolResultMessage, UserContent,
 };
 use zp_tools::ReadTool;
 
@@ -28,6 +28,9 @@ a Makefile or package.json target, a config file), use the read tool to look at 
 Only files in the project can be read. Read only what you need.
 
 Reply with only a JSON object: {\"decision\": \"allow\" or \"ask\", \"reason\": \"one short sentence\"}";
+
+/// Output tokens for the verdict itself; a thinking budget comes on top.
+const ANSWER_TOKENS: u64 = 600;
 
 /// Longest excerpts sent for review.
 const INTENT_CHARS: usize = 1500;
@@ -154,11 +157,7 @@ pub async fn review_tool_call(
             parameters: reader.parameters(),
         }],
     };
-    let options = StreamOptions {
-        thinking: model.clamp_thinking_level(ThinkingLevel::Off),
-        max_tokens: Some(600),
-        ..StreamOptions::default()
-    };
+    let options = review_options(model, policy.review_thinking);
     let mut reads = 0;
     loop {
         let reply = models.complete(model, &context, options.clone()).await;
@@ -191,9 +190,42 @@ pub async fn review_tool_call(
     }
 }
 
+/// Request options for a review at `thinking`: room for the answer plus the reasoning
+/// budget (providers that count reasoning in `max_tokens` would otherwise cut it short).
+fn review_options(model: &Model, thinking: ThinkingLevel) -> StreamOptions {
+    let thinking = model.clamp_thinking_level(thinking);
+    let budgets = ThinkingBudgets::default();
+    StreamOptions {
+        thinking,
+        thinking_budgets: Some(budgets),
+        max_tokens: Some(ANSWER_TOKENS + budgets.for_level(thinking)),
+        ..StreamOptions::default()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn thinking_leaves_room_for_the_answer() {
+        let mut model = zp_ai::FauxProvider::new("faux").model();
+        model.reasoning = true;
+        let off = review_options(&model, ThinkingLevel::Off);
+        assert_eq!(off.thinking, ThinkingLevel::Off);
+        assert_eq!(off.max_tokens, Some(ANSWER_TOKENS));
+        let medium = review_options(&model, ThinkingLevel::Medium);
+        assert_eq!(medium.thinking, ThinkingLevel::Medium);
+        assert_eq!(
+            medium.max_tokens,
+            Some(ANSWER_TOKENS + ThinkingBudgets::default().medium)
+        );
+
+        model.reasoning = false;
+        let plain = review_options(&model, ThinkingLevel::High);
+        assert_eq!(plain.thinking, ThinkingLevel::Off);
+        assert_eq!(plain.max_tokens, Some(ANSWER_TOKENS));
+    }
 
     #[test]
     fn parses_answers() {

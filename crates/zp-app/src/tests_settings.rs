@@ -486,10 +486,24 @@ fn permission_settings_apply_to_open_projects(cx: &mut TestAppContext) {
     );
     let policy = cx.update(|cx| crate::approvals::project_policy(&project, cx));
     assert_eq!(policy.allow_commands, ["cargo test", "git status"]);
+    assert_eq!(policy.review_thinking, ThinkingLevel::Off);
     assert_eq!(
         cx.update(|cx| AppSettings::get(cx).permissions.mode),
         Some(PermissionMode::AutoEdit)
     );
+
+    // The review model's thinking level.
+    window
+        .update(cx, |view, _, cx| {
+            view.set_review_thinking(ThinkingLevel::Medium, cx)
+        })
+        .unwrap();
+    assert_eq!(
+        saved(&data).permissions.review_thinking,
+        Some(ThinkingLevel::Medium)
+    );
+    let policy = cx.update(|cx| crate::approvals::project_policy(&project, cx));
+    assert_eq!(policy.review_thinking, ThinkingLevel::Medium);
 }
 
 #[gpui::test]

@@ -20,6 +20,9 @@ pub struct PermissionSettings {
     /// Model for auto-review, as `provider/model`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub review_model: Option<String>,
+    /// How much the review model reasons (default `off`); clamped to what it supports.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub review_thinking: Option<zp_ai::ThinkingLevel>,
     /// Command prefixes that run without asking, e.g. `cargo test`, `git status`.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub allow_commands: Vec<String>,
@@ -258,6 +261,10 @@ impl ProjectSettings {
             review_model: project
                 .and_then(|p| p.review_model.clone())
                 .or_else(|| global.review_model.clone()),
+            review_thinking: project
+                .and_then(|p| p.review_thinking)
+                .or(global.review_thinking)
+                .unwrap_or_default(),
         }
     }
 }
@@ -273,7 +280,7 @@ mod tests {
         let root = project.path().canonicalize().unwrap();
         std::fs::write(
             crate::paths::settings_file(data.path()),
-            r#"{"theme": "dark", "permissions": {"mode": "autoEdit", "allowCommands": ["cargo test"], "reviewModel": "openai/gpt-5-mini"}}"#,
+            r#"{"theme": "dark", "permissions": {"mode": "autoEdit", "allowCommands": ["cargo test"], "reviewModel": "openai/gpt-5-mini", "reviewThinking": "low"}}"#,
         )
         .unwrap();
         std::fs::create_dir_all(root.join(".zp")).unwrap();
@@ -296,6 +303,7 @@ mod tests {
         assert_eq!(policy.allow_commands, ["cargo test", "make"]);
         assert_eq!(policy.additional_directories, [root.join("vendor")]);
         assert_eq!(policy.review_model.as_deref(), Some("openai/gpt-5-mini"));
+        assert_eq!(policy.review_thinking, zp_ai::ThinkingLevel::Low);
         assert_eq!(
             trusted
                 .permission_policy(&root, Some(PermissionMode::Ask))
