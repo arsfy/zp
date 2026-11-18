@@ -1393,6 +1393,45 @@ fn settings_pages(cx: &mut VisualTestAppContext, out: &std::path::Path) {
                 view.open_provider_form(None, window, cx)
             });
             shot(cx, "30-settings-custom-provider.png");
+            step(cx, &|view, _, cx| {
+                let listed = |id: &str, context: u64, endpoints: &[&str]| zp_ai::UpstreamModel {
+                    context_window: Some(context),
+                    endpoints: Some(endpoints.iter().map(|e| (*e).to_owned()).collect()),
+                    ..zp_ai::UpstreamModel::new(id)
+                };
+                view.show_endpoint_test(
+                    crate::settings::providers::EndpointTest::Listed(vec![
+                        listed("claude-sonnet-5", 1_000_000, &["/messages"]),
+                        listed(
+                            "deepseek/deepseek-v4.1-flash",
+                            1_000_000,
+                            &["/chat/completions", "/responses"],
+                        ),
+                        listed(
+                            "moonshotai/Kimi-K3",
+                            1_000_000,
+                            &["/chat/completions", "/responses"],
+                        ),
+                        listed("Qwen/Qwen3.8-Max", 1_000_000, &["/chat/completions"]),
+                        listed("zai-org/GLM-5.3", 1_000_000, &["/chat/completions"]),
+                        listed("google/gemini-3.8-flash", 1_000_000, &["/chat/completions"]),
+                        listed(
+                            "xai/grok-4.7",
+                            500_000,
+                            &["/chat/completions", "/responses"],
+                        ),
+                        listed(
+                            "gpt-6-luna",
+                            1_050_000,
+                            &["/chat/completions", "/responses"],
+                        ),
+                        listed("MiniMaxAI/MiniMax-M3", 1_000_000, &["/chat/completions"]),
+                        zp_ai::UpstreamModel::new("text-embedding-3-large"),
+                    ]),
+                    cx,
+                );
+            });
+            shot(cx, "30-settings-custom-provider-tested.png");
         }
     }
 }

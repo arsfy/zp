@@ -331,6 +331,100 @@ fn api_keys_and_custom_providers(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+fn custom_provider_form_tests_the_model_list(cx: &mut TestAppContext) {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    let faux = FauxProvider::default();
+    let data = setup_models(cx, &[&faux], false);
+    // A tiny endpoint that lists two models when called with the right key.
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let listener = runtime
+        .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
+        .unwrap();
+    let base_url = format!("http://{}/v1", listener.local_addr().unwrap());
+    runtime.spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            let mut buffer = [0u8; 4096];
+            let read = socket.read(&mut buffer).await.unwrap_or(0);
+            let request = String::from_utf8_lossy(&buffer[..read]).to_ascii_lowercase();
+            let (status, body) = if !request.starts_with("get /v1/models ") {
+                ("404 Not Found", r#"{"error":"no such route"}"#.to_owned())
+            } else if request.contains("authorization: bearer sk-good") {
+                (
+                    "200 OK",
+                    serde_json::json!({"data": [
+                        {"id": "chat-a", "context_length": 200000, "supported_endpoints": ["/chat/completions"]},
+                        {"id": "text-embedding-x"}
+                    ]})
+                    .to_string(),
+                )
+            } else {
+                ("401 Unauthorized", r#"{"error":{"message":"bad key"}}"#.to_owned())
+            };
+            let reply = format!(
+                "HTTP/1.1 {status}\r\ncontent-type: application/json\r\nconnection: close\r\ncontent-length: {}\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = socket.write_all(reply.as_bytes()).await;
+        }
+    });
+
+    let window = settings_window(Page::Providers, cx);
+    let test = |key: &str, url: &str, cx: &mut TestAppContext| {
+        window
+            .update(cx, |view, window, cx| {
+                if view.provider_form().is_none() {
+                    view.open_provider_form(None, window, cx);
+                }
+                let form = view.provider_form().unwrap();
+                for (field, text) in [(&form.base_url, url), (&form.key, key)] {
+                    field.update(cx, |input, cx| input.emplace(text, cx));
+                }
+                view.test_provider_form(cx);
+            })
+            .unwrap();
+        let result = |cx: &mut TestAppContext| {
+            window
+                .update(cx, |view, _, _| {
+                    view.provider_form().unwrap().endpoint_test().cloned()
+                })
+                .unwrap()
+        };
+        wait_until(cx, |cx| {
+            !matches!(result(cx), Some(crate::settings::EndpointTest::Running))
+        });
+        result(cx).unwrap()
+    };
+    use crate::settings::EndpointTest;
+
+    match test("", "localhost:1", cx) {
+        EndpointTest::Failed(error) => assert!(error.contains("base URL"), "{error}"),
+        other => panic!("expected a validation error, got {other:?}"),
+    }
+    match test("sk-bad", &base_url, cx) {
+        EndpointTest::Failed(error) => assert!(error.contains("bad key"), "{error}"),
+        other => panic!("expected a failure, got {other:?}"),
+    }
+    match test("sk-good", &base_url, cx) {
+        EndpointTest::Listed(models) => {
+            let ids: Vec<_> = models.iter().map(|m| m.id.as_str()).collect();
+            assert_eq!(ids, ["chat-a", "text-embedding-x"]);
+            assert_eq!(models[0].context_window, Some(200_000));
+        }
+        other => panic!("expected models, got {other:?}"),
+    }
+    // Testing saves nothing.
+    assert!(saved(&data).providers.is_empty());
+    assert!(
+        cx.update(|cx| cx.global::<AppModels>().models.provider("test"))
+            .is_none()
+    );
+    drop(runtime);
+}
+
+#[gpui::test]
 fn general_defaults_apply_to_new_conversations(cx: &mut TestAppContext) {
     let faux = FauxProvider::default();
     let data = setup_models(cx, &[&faux], true);

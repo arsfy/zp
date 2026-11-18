@@ -5,11 +5,11 @@
 use futures::StreamExt as _;
 use gpui::{
     AnyElement, App, ClickEvent, ClipboardItem, Context, Entity, Focusable as _, FontWeight,
-    IntoElement, MouseButton, Task, Window, div, prelude::*, px,
+    IntoElement, MouseButton, ScrollHandle, Task, Window, div, prelude::*, px,
 };
 use gpui_elements::editable_text::EditableTextState;
 use zp_ai::oauth::{LoginEvent, LoginInteraction, LoginOptions, ManualInput};
-use zp_ai::{AuthSource, CancellationToken};
+use zp_ai::{AuthSource, CancellationToken, UpstreamModel};
 use zp_core::model_catalog::SyncOutcome;
 use zp_core::settings::CustomProvider;
 
@@ -29,6 +29,22 @@ pub struct ProviderForm {
     pub models: Entity<EditableTextState>,
     anthropic: bool,
     error: Option<String>,
+    /// The last "Test" of the endpoint's model list.
+    test: Option<EndpointTest>,
+    _test_task: Option<Task<()>>,
+    /// The dialog body's scroll position, to bring test results into view.
+    scroll: ScrollHandle,
+}
+
+/// The result of listing the models of the form's endpoint.
+#[derive(Clone, Debug)]
+pub enum EndpointTest {
+    /// The request is in flight.
+    Running,
+    /// The endpoint answered with these models.
+    Listed(Vec<UpstreamModel>),
+    /// The request failed.
+    Failed(String),
 }
 
 impl ProviderForm {
@@ -46,7 +62,22 @@ impl ProviderForm {
             models: input(def.map(|d| d.models.join("\n")).unwrap_or_default(), cx),
             anthropic: def.and_then(|d| d.api.as_deref()) == Some("anthropic-messages"),
             error: None,
+            test: None,
+            _test_task: None,
+            scroll: ScrollHandle::new(),
         }
+    }
+
+    /// Index of the "Model list" row among the form's rows (title, [id], name, base URL,
+    /// API, key, headers, models, model list), to scroll results into view.
+    fn test_row(&self) -> usize {
+        if self.editing.is_some() { 7 } else { 8 }
+    }
+
+    /// The last endpoint test (tests).
+    #[cfg(test)]
+    pub fn endpoint_test(&self) -> Option<&EndpointTest> {
+        self.test.as_ref()
     }
 
     /// The provider described by the form.
@@ -515,6 +546,81 @@ impl SettingsWindow {
         }
     }
 
+    /// Lists the models of the form's endpoint the way a model list refresh would, with the
+    /// key typed in the form (or, when editing, the stored one), without saving anything.
+    pub fn test_provider_form(&mut self, cx: &mut Context<Self>) {
+        let Some(ProviderDialog::Custom(form)) = &mut self.dialog else {
+            return;
+        };
+        let editing = form.editing.clone();
+        let provider = form.definition(cx).and_then(|mut def| {
+            if let Some(id) = &editing {
+                def.id.clone_from(id);
+            }
+            if def.id.is_empty() {
+                "test".clone_into(&mut def.id);
+            }
+            zp_core::providers::validate_custom_provider(&def, &[])?;
+            zp_core::providers::custom_provider(&def)
+        });
+        let provider = match provider {
+            Ok(provider) => provider,
+            Err(error) => {
+                form.test = Some(EndpointTest::Failed(format!("{error:#}")));
+                form._test_task = None;
+                cx.notify();
+                return;
+            }
+        };
+        let typed_key = form.key.read(cx).as_str().trim().to_owned();
+        let models = cx.global::<AppModels>().models.clone();
+        let listing = gpui_tokio::Tokio::spawn(cx, async move {
+            let cancel = CancellationToken::new();
+            let api_key = if !typed_key.is_empty() {
+                Some(typed_key)
+            } else if let Some(id) = editing.filter(|id| models.resolve_auth(id).is_some()) {
+                models
+                    .request_auth(&id, &cancel)
+                    .await
+                    .map_err(zp_ai::SyncError::Failed)?
+                    .api_key
+            } else {
+                None
+            };
+            provider.list_models(api_key, cancel).await
+        });
+        form.test = Some(EndpointTest::Running);
+        // Replacing (or closing) the form drops the task, which aborts the request.
+        form._test_task = Some(cx.spawn(async move |this, cx| {
+            let result = match listing.await {
+                Ok(Ok(models)) if models.is_empty() => {
+                    EndpointTest::Failed("the endpoint listed no models".into())
+                }
+                Ok(Ok(models)) => EndpointTest::Listed(models),
+                Ok(Err(error)) => EndpointTest::Failed(error.to_string()),
+                Err(error) => EndpointTest::Failed(error.to_string()),
+            };
+            let _ = this.update(cx, |this, cx| {
+                if let Some(ProviderDialog::Custom(form)) = &mut this.dialog {
+                    form.test = Some(result);
+                    form.scroll.scroll_to_top_of_item(form.test_row());
+                }
+                cx.notify();
+            });
+        }));
+        cx.notify();
+    }
+
+    /// Shows `result` as the form's endpoint test (screenshots).
+    #[cfg(feature = "visual-tests")]
+    pub(crate) fn show_endpoint_test(&mut self, result: EndpointTest, cx: &mut Context<Self>) {
+        if let Some(ProviderDialog::Custom(form)) = &mut self.dialog {
+            form.test = Some(result);
+            form.scroll.scroll_to_top_of_item(form.test_row());
+        }
+        cx.notify();
+    }
+
     /// Removes custom provider `id` (with its key and cached model list).
     pub fn delete_provider(&mut self, id: &str, cx: &mut Context<Self>) {
         let result = AppSettings::update(cx, |settings| settings.providers.retain(|p| p.id != id))
@@ -807,6 +913,22 @@ impl SettingsWindow {
             ProviderDialog::Method { provider } => self.render_method(provider, cx),
             ProviderDialog::Login(login) => self.render_login(login, cx),
         };
+        let footer = match dialog {
+            ProviderDialog::Custom(form) => Some(self.render_provider_form_footer(form, cx)),
+            _ => None,
+        };
+        // Forms scroll their own fields (to bring rows into view); the rest scroll here.
+        let body = if footer.is_some() {
+            content
+        } else {
+            div()
+                .id("provider-dialog-body")
+                .flex_1()
+                .min_h_0()
+                .overflow_y_scroll()
+                .child(content)
+                .into_any_element()
+        };
         Some(
             div()
                 .id("provider-dialog-backdrop")
@@ -831,7 +953,6 @@ impl SettingsWindow {
                         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                         .w(px(560.))
                         .max_h(px(560.))
-                        .overflow_y_scroll()
                         .flex()
                         .flex_col()
                         .gap_3()
@@ -841,7 +962,9 @@ impl SettingsWindow {
                         .border_color(colors.border)
                         .bg(colors.surface)
                         .shadow_lg()
-                        .child(content),
+                        // Fields scroll; a form's buttons stay in view.
+                        .child(body)
+                        .children(footer),
                 )
                 .into_any_element(),
         )
@@ -1204,6 +1327,123 @@ impl SettingsWindow {
         .into_any_element()
     }
 
+    /// The "Test" button and what the endpoint listed.
+    fn render_endpoint_test(&self, form: &ProviderForm, cx: &mut Context<Self>) -> AnyElement {
+        let colors = cx.theme().colors.clone();
+        let running = matches!(form.test, Some(EndpointTest::Running));
+        let typed_models = !form.models.read(cx).as_str().trim().is_empty();
+        let status = match &form.test {
+            None => (
+                "Fetch the endpoint's model list with these settings.".to_owned(),
+                colors.text_muted,
+            ),
+            Some(EndpointTest::Running) => {
+                ("Fetching the model list…".to_owned(), colors.text_muted)
+            }
+            Some(EndpointTest::Listed(models)) => (
+                format!(
+                    "{} model{} listed{}",
+                    models.len(),
+                    if models.len() == 1 { "" } else { "s" },
+                    if typed_models {
+                        "; the Models field above is used instead"
+                    } else {
+                        ""
+                    },
+                ),
+                colors.success,
+            ),
+            Some(EndpointTest::Failed(error)) => (error.clone(), colors.error),
+        };
+        let listed = match &form.test {
+            Some(EndpointTest::Listed(models)) => Some(models.clone()),
+            _ => None,
+        };
+        div()
+            .flex()
+            .flex_col()
+            .gap_1p5()
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        button(
+                            "test-provider",
+                            if running { "Testing…" } else { "Test" },
+                            ButtonKind::Normal,
+                            cx,
+                        )
+                        .debug_selector(|| "test-provider".into())
+                        .flex_shrink_0()
+                        .when(running, |this| this.opacity(0.6))
+                        .when(!running, |this| {
+                            this.on_click(cx.listener(|this, _, _, cx| this.test_provider_form(cx)))
+                        }),
+                    )
+                    .child(
+                        div()
+                            .min_w_0()
+                            .text_size(px(12.))
+                            .text_color(status.1)
+                            .child(status.0),
+                    ),
+            )
+            .when_some(listed, |this, models| {
+                this.child(
+                    // Part of the form's single scroll area: a nested scroller would take
+                    // the wheel from the form halfway through.
+                    div()
+                        .debug_selector(|| "provider-test-models".into())
+                        .rounded(px(4.))
+                        .border_1()
+                        .border_color(colors.border)
+                        .py_1()
+                        .children(models.into_iter().map(|model| {
+                            let mut details = Vec::new();
+                            if let Some(context) = model.context_window {
+                                details
+                                    .push(format!("{} context", crate::ui::format_tokens(context)));
+                            }
+                            if let Some(endpoints) = &model.endpoints {
+                                let routes: Vec<&str> = endpoints
+                                    .iter()
+                                    .map(|e| match e.trim_start_matches("/v1") {
+                                        "/chat/completions" => "chat",
+                                        other => other.trim_start_matches('/'),
+                                    })
+                                    .collect();
+                                details.push(routes.join(", "));
+                            }
+                            if !model.looks_like_chat() {
+                                details.push("not a chat model".to_owned());
+                            }
+                            div()
+                                .flex()
+                                .gap_2()
+                                .px_2()
+                                .text_size(px(12.))
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .truncate()
+                                        .font_family(cx.theme().metrics.mono_font.clone())
+                                        .child(model.id),
+                                )
+                                .child(
+                                    div()
+                                        .flex_shrink_0()
+                                        .text_color(colors.text_muted)
+                                        .child(details.join(" · ")),
+                                )
+                        })),
+                )
+            })
+            .into_any_element()
+    }
+
     fn render_provider_form(&self, form: &ProviderForm, cx: &mut Context<Self>) -> AnyElement {
         let colors = cx.theme().colors.clone();
         let label = |text: &'static str| {
@@ -1228,8 +1468,13 @@ impl SettingsWindow {
         let anthropic = form.anthropic;
         let editing = form.editing.clone();
         div()
+            .id("provider-dialog-body")
             .flex()
             .flex_col()
+            .flex_1()
+            .min_h_0()
+            .overflow_y_scroll()
+            .track_scroll(&form.scroll)
             .gap_2()
             .child(Self::dialog_title(
                 match &editing {
@@ -1281,28 +1526,38 @@ impl SettingsWindow {
                 super::text_block(&form.models, "One model id per line (empty: the endpoint's list)", cx)
                     .into_any_element(),
             ))
+            .child(row("Model list", self.render_endpoint_test(form, cx)))
             .when_some(form.error.clone(), |this, error| {
                 this.child(div().text_size(px(12.)).text_color(colors.error).child(error))
             })
-            .child(
-                div()
-                    .flex()
-                    .gap_1p5()
-                    .justify_end()
-                    .when(editing.is_none(), |this| {
-                        this.child(
-                            button("dialog-back", "Back", ButtonKind::Normal, cx)
-                                .on_click(cx.listener(|this, _, window, cx| this.open_add_dialog(window, cx))),
-                        )
-                    })
-                    .child(
-                        button("dialog-cancel", "Cancel", ButtonKind::Normal, cx)
-                            .on_click(cx.listener(|this, _, _, cx| this.close_dialog(cx))),
-                    )
-                    .child(
-                        button("save-provider", "Save Provider", ButtonKind::Primary, cx)
-                            .on_click(cx.listener(|this, _, _, cx| this.save_provider_form(cx))),
+            .into_any_element()
+    }
+
+    /// The form's buttons, kept below the scrolling fields.
+    fn render_provider_form_footer(
+        &self,
+        form: &ProviderForm,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        div()
+            .flex()
+            .flex_shrink_0()
+            .gap_1p5()
+            .justify_end()
+            .when(form.editing.is_none(), |this| {
+                this.child(
+                    button("dialog-back", "Back", ButtonKind::Normal, cx).on_click(
+                        cx.listener(|this, _, window, cx| this.open_add_dialog(window, cx)),
                     ),
+                )
+            })
+            .child(
+                button("dialog-cancel", "Cancel", ButtonKind::Normal, cx)
+                    .on_click(cx.listener(|this, _, _, cx| this.close_dialog(cx))),
+            )
+            .child(
+                button("save-provider", "Save Provider", ButtonKind::Primary, cx)
+                    .on_click(cx.listener(|this, _, _, cx| this.save_provider_form(cx))),
             )
             .into_any_element()
     }

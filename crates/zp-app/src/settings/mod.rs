@@ -6,7 +6,7 @@ mod about;
 mod keybindings;
 mod mcp;
 mod models;
-mod providers;
+pub(crate) mod providers;
 
 use gpui::{
     AnyElement, App, AppContext as _, ColorExt as _, Context, Entity, FocusHandle, Focusable,
@@ -23,6 +23,8 @@ use crate::store::{AppModels, AppSettings};
 use crate::theme::ActiveTheme;
 use crate::ui::{CUSTOM_TITLE_BAR, title_bar};
 
+#[cfg(test)]
+pub use providers::EndpointTest;
 pub use providers::ProviderDialog;
 
 const SETTINGS_SIZE: (f32, f32) = (980.0, 700.0);
