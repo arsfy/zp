@@ -1,4 +1,4 @@
-## v0.1.0-rc.2 18 Nov 2026
+## v0.1.0-rc.2 18 Nov 2026 `0d59eaa`
 
 #### Providers and models
 
@@ -27,6 +27,6 @@
 - macOS releases can be built without Apple notarization. Such ad-hoc signed copies only accept updates that are intact ZP bundles, and the update prompt explains that macOS will ask again for keychain and folder access. The README explains how to open them.
 - `zp-cli models` prints context sizes such as `1.05M` instead of `1.048576M`.
 
-## v0.1.0-rc.1 18 Nov 2026
+## v0.1.0-rc.1 18 Nov 2026 `cdd2a57`
 
 - First version
