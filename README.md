@@ -15,6 +15,8 @@
 
 [zp](https://github.com/arsfy/zp) is a lightweight, natively rendered, high-performance GUI harness. It adopts a minimalist Agent design philosophy similar to Pi, combined with a project-oriented design approach and Git management inspired by VS Code / Zed.
 
+*The installation package is about 18–24 MB, and the executable after installation is 30–45 MB.*
+
 <img width="100%" alt="Home" src="https://github.com/user-attachments/assets/0fd8d3b2-3e30-4e5c-9056-8f678ce9f2b9" />
 
 ## Installation
