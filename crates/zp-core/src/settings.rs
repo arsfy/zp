@@ -158,7 +158,10 @@ pub struct Settings {
     /// Check for new versions at startup (default on).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub check_for_updates: Option<bool>,
-    /// Where to look for updates (default: the GitHub releases feed).
+    /// Selected release channel (defaults to the channel of this build).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub update_channel: Option<crate::update::UpdateChannel>,
+    /// Releases API endpoint (overridden for development and tests).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub update_feed: Option<String>,
     /// Context compaction.

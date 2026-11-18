@@ -622,8 +622,7 @@ impl ConversationView {
             .unwrap_or_else(|| "New Chat".to_owned())
     }
 
-    /// Replaces the composer text (tests, screenshots).
-    #[cfg(any(test, feature = "visual-tests"))]
+    /// Restores or replaces the composer draft.
     pub fn set_draft(&self, text: &str, cx: &mut App) {
         self.composer
             .update(cx, |composer, cx| composer.emplace(text, cx));
@@ -635,8 +634,7 @@ impl ConversationView {
         self.composer.clone()
     }
 
-    /// The composer text (tests).
-    #[cfg(test)]
+    /// The current composer draft.
     pub fn draft(&self, cx: &App) -> String {
         self.composer.read(cx).as_str().to_owned()
     }

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Builds ZP.app and a release zip, or a drag-to-install DMG with --dmg.
+# Builds ZP.app and an update ZIP, plus a drag-to-install DMG with --dmg.
 #
 #   scripts/bundle-macos.sh [--target aarch64-apple-darwin] [--dmg]
 #
@@ -61,7 +61,16 @@ app="$dist/ZP.app"
 rm -rf "$app"
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
 cp "$binary" "$app/Contents/MacOS/zp"
-sed "s/__VERSION__/$version/g" packaging/macos/Info.plist > "$app/Contents/Info.plist"
+python3 - "$version" "$app/Contents/Info.plist" <<'PY'
+import os, plistlib, sys
+with open("packaging/macos/Info.plist", "rb") as source:
+    info = plistlib.load(source)
+info["CFBundleShortVersionString"] = sys.argv[1].split("-")[0]
+info["CFBundleVersion"] = os.environ.get("GITHUB_RUN_NUMBER", "1")
+info["ZPReleaseVersion"] = sys.argv[1]
+with open(sys.argv[2], "wb") as output:
+    plistlib.dump(info, output)
+PY
 
 echo "==> icon"
 iconutil -c icns packaging/macos/ZP.iconset -o "$app/Contents/Resources/ZP.icns"
@@ -75,6 +84,18 @@ codesign --force --options runtime "${timestamp[@]}" \
   --entitlements packaging/macos/entitlements.plist \
   --sign "$identity" "$app"
 codesign --verify --strict --verbose=1 "$app"
+
+zip="$dist/ZP-$version-darwin-$arch.zip"
+rm -f "$zip"
+ditto -c -k --keepParent "$app" "$zip"
+if [[ -n "${ZP_NOTARY_PROFILE:-}" ]]; then
+  echo "==> notarizing application"
+  xcrun notarytool submit "$zip" --keychain-profile "$ZP_NOTARY_PROFILE" --wait
+  xcrun stapler staple "$app"
+  rm -f "$zip"
+  ditto -c -k --keepParent "$app" "$zip"
+fi
+echo "==> $zip"
 
 if [[ "$build_dmg" == true ]]; then
   echo "==> creating DMG"
@@ -94,20 +115,6 @@ if [[ "$build_dmg" == true ]]; then
     echo "==> notarizing DMG"
     xcrun notarytool submit "$dmg" --keychain-profile "$ZP_NOTARY_PROFILE" --wait
     xcrun stapler staple "$dmg"
-    xcrun stapler staple "$app"
   fi
   echo "==> $dmg"
-else
-  zip="$dist/ZP-$version-darwin-$arch.zip"
-  rm -f "$zip"
-  ditto -c -k --keepParent "$app" "$zip"
-
-  if [[ -n "${ZP_NOTARY_PROFILE:-}" ]]; then
-    echo "==> notarizing"
-    xcrun notarytool submit "$zip" --keychain-profile "$ZP_NOTARY_PROFILE" --wait
-    xcrun stapler staple "$app"
-    rm -f "$zip"
-    ditto -c -k --keepParent "$app" "$zip"
-  fi
-  echo "==> $zip"
 fi

@@ -33,7 +33,9 @@ zp-core.workspace = true
 zp-mcp.workspace = true
 zp-session.workspace = true
 zp-tools.workspace = true
-tempfile = { workspace = true, optional = true }
+tempfile.workspace = true
+tokio-util.workspace = true
+tokio.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 rustix = { version = "1", features = ["termios"] }
@@ -45,9 +47,10 @@ url = "2"
 
 [features]
 # `zp --visual-tests DIR`: render scripted scenarios off-screen and save screenshots.
-visual-tests = ["gpui/test-support", "gpui_platform/test-support", "dep:tempfile"]
+visual-tests = ["gpui/test-support", "gpui_platform/test-support"]
 
 [dev-dependencies]
 gpui = { workspace = true, features = ["test-support"] }
 tempfile.workspace = true
+zp-core = { workspace = true, features = ["test-support"] }
 tokio = { workspace = true, features = ["net", "io-util", "rt-multi-thread"] }

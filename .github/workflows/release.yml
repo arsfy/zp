@@ -1,5 +1,3 @@
-# Builds release packages for macOS, Linux and Windows on a version tag, then publishes
-# them with the update feed (latest.json).
 name: release
 
 on:
@@ -8,44 +6,81 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  ZP_UPDATE_PUBLIC_KEY: ${{ vars.ZP_UPDATE_PUBLIC_KEY }}
 
 jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      prerelease: ${{ steps.version.outputs.prerelease }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: version
+        run: python3 scripts/release.py --validate >> "$GITHUB_OUTPUT"
+      - name: Require update verification key
+        run: test -n "$ZP_UPDATE_PUBLIC_KEY"
+
   macos:
+    needs: validate
     strategy:
       matrix:
         include:
-          - runner: macos-14
+          - runner: macos-15
             target: aarch64-apple-darwin
-          - runner: macos-13
+          - runner: macos-15-intel
             target: x86_64-apple-darwin
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
       - name: Import signing certificate
-        if: env.MACOS_CERTIFICATE != ''
         env:
           MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
           MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          MACOS_SIGN_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
         run: |
-          echo "$MACOS_CERTIFICATE" | base64 --decode > cert.p12
-          security create-keychain -p ci build.keychain
-          security default-keychain -s build.keychain
-          security unlock-keychain -p ci build.keychain
-          security import cert.p12 -k build.keychain -P "$MACOS_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
-          security set-key-partition-list -S apple-tool:,apple: -s -k ci build.keychain
-          xcrun notarytool store-credentials zp --apple-id "${{ secrets.APPLE_ID }}" \
-            --team-id "${{ secrets.APPLE_TEAM_ID }}" --password "${{ secrets.APPLE_APP_PASSWORD }}"
-          echo "ZP_SIGN_IDENTITY=${{ secrets.MACOS_SIGN_IDENTITY }}" >> "$GITHUB_ENV"
+          test -n "$MACOS_CERTIFICATE"
+          test -n "$MACOS_SIGN_IDENTITY"
+          echo "$MACOS_CERTIFICATE" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security create-keychain -p ci "$RUNNER_TEMP/build.keychain"
+          security default-keychain -s "$RUNNER_TEMP/build.keychain"
+          security unlock-keychain -p ci "$RUNNER_TEMP/build.keychain"
+          security import "$RUNNER_TEMP/cert.p12" -k "$RUNNER_TEMP/build.keychain" -P "$MACOS_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          rm "$RUNNER_TEMP/cert.p12"
+          security set-key-partition-list -S apple-tool:,apple: -s -k ci "$RUNNER_TEMP/build.keychain"
+          xcrun notarytool store-credentials zp --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" --password "$APPLE_APP_PASSWORD"
+          echo "ZP_SIGN_IDENTITY=$MACOS_SIGN_IDENTITY" >> "$GITHUB_ENV"
           echo "ZP_NOTARY_PROFILE=zp" >> "$GITHUB_ENV"
       - run: scripts/bundle-macos.sh --target ${{ matrix.target }} --dmg
       - uses: actions/upload-artifact@v4
         with:
           name: macos-${{ matrix.target }}
-          path: dist/*.dmg
+          if-no-files-found: error
+          path: |
+            dist/*.dmg
+            dist/*.zip
+      - name: Remove signing keychain
+        if: always()
+        run: security delete-keychain "$RUNNER_TEMP/build.keychain" || true
 
   linux:
+    needs: validate
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
@@ -55,46 +90,67 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libvulkan-dev \
             libx11-xcb-dev libxcb1-dev libfontconfig-dev libdbus-1-dev libsecret-1-dev libfuse2
-          curl -fsSL -o /usr/local/bin/appimagetool \
+          sudo curl -fsSL -o /usr/local/bin/appimagetool \
             https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
-          chmod +x /usr/local/bin/appimagetool
+          sudo chmod +x /usr/local/bin/appimagetool
       - run: scripts/package-linux.sh
       - uses: actions/upload-artifact@v4
         with:
           name: linux
+          if-no-files-found: error
           path: |
             dist/*.AppImage
             dist/*.deb
             dist/*.tar.gz
 
   windows:
+    needs: validate
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
       - run: choco install innosetup imagemagick -y
       - run: scripts/package-windows.ps1
         shell: pwsh
       - uses: actions/upload-artifact@v4
         with:
           name: windows
+          if-no-files-found: error
           path: |
             dist/*.exe
             dist/*.zip
 
   publish:
-    needs: [macos, linux, windows]
-    runs-on: ubuntu-latest
+    needs: [validate, macos, linux, windows]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RELEASE_TAG: ${{ github.ref_name }}
+      RELEASE_VERSION: ${{ needs.validate.outputs.version }}
+      RELEASE_PRERELEASE: ${{ needs.validate.outputs.prerelease }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
           path: dist
           merge-multiple: true
-      - name: Update feed
+      - name: Prepare draft release and notes
+        run: |
+          gh release create "$RELEASE_TAG" --verify-tag --draft --generate-notes \
+            --title "ZP $RELEASE_VERSION" --prerelease="$RELEASE_PRERELEASE" --latest=false
+          gh release view "$RELEASE_TAG" --json body --jq .body > "$RUNNER_TEMP/release-notes.md"
+      - name: Sign update manifest
         env:
-          ZP_RELEASE_NOTES: "See the release page for changes."
-        run: scripts/release.sh
-      - uses: softprops/action-gh-release@v2
-        with:
-          files: dist/*
+          ZP_UPDATE_PRIVATE_KEY: ${{ secrets.ZP_UPDATE_PRIVATE_KEY }}
+        run: ZP_RELEASE_NOTES_FILE="$RUNNER_TEMP/release-notes.md" scripts/release.sh
+      - name: Upload all assets and publish
+        run: |
+          gh release upload "$RELEASE_TAG" dist/*
+          latest=true
+          if [ "$RELEASE_PRERELEASE" = true ]; then latest=false; fi
+          gh release edit "$RELEASE_TAG" --draft=false --prerelease="$RELEASE_PRERELEASE" --latest="$latest"

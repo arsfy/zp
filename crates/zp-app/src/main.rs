@@ -56,6 +56,7 @@ use crate::theme::Theme;
 use crate::workspace::Workspaces;
 
 fn main() {
+    updates::take_handoff();
     zp_core::logging::init();
     tracing::info!(version = zp_core::VERSION, "starting {}", zp_core::APP_NAME);
     let project_arg = std::env::args_os().nth(1).map(PathBuf::from);
@@ -116,6 +117,7 @@ fn main() {
             return;
         }
         cx.activate(true);
+        updates::acknowledge_startup(cx);
     });
 }
 

@@ -540,7 +540,7 @@ fn update_checks(cx: &mut TestAppContext) {
     let listener = runtime
         .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
         .unwrap();
-    let url = format!("http://{}/latest.json", listener.local_addr().unwrap());
+    let url = format!("http://{}/releases", listener.local_addr().unwrap());
     runtime.spawn(async move {
         loop {
             let Ok((mut socket, _)) = listener.accept().await else {
@@ -565,18 +565,19 @@ fn update_checks(cx: &mut TestAppContext) {
     cx.update(|cx| {
         crate::store::AppSettings::update(cx, |_| {}).unwrap();
     });
-    let platform = zp_core::update::platform_key();
-    *feed.lock().unwrap() = json!({"version": "99.0.0", "notes": "New things", "platforms": {platform.clone(): {"url": "http://x/ZP.zip", "sha256": "00"}}}).to_string();
+    *feed.lock().unwrap() =
+        json!([{"tag_name": "v99.0.0", "draft": false, "prerelease": false, "assets": []}])
+            .to_string();
     let state = |cx: &mut TestAppContext| cx.update(|cx| crate::updates::state(cx));
     cx.update(|cx| crate::updates::check(false, cx));
     wait_until(cx, |cx| {
         !matches!(state(cx), crate::updates::UpdateState::Checking)
     });
     assert!(
-        matches!(state(cx), crate::updates::UpdateState::Available(u) if u.version == "99.0.0")
+        matches!(state(cx), crate::updates::UpdateState::Failed(error) if error.contains("release.json"))
     );
 
-    *feed.lock().unwrap() = json!({"version": zp_core::VERSION, "platforms": {}}).to_string();
+    *feed.lock().unwrap() = "[]".to_owned();
     cx.update(|cx| crate::updates::check(false, cx));
     wait_until(cx, |cx| {
         !matches!(state(cx), crate::updates::UpdateState::Checking)

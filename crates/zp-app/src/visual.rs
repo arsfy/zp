@@ -110,6 +110,11 @@ pub fn run(out: PathBuf) {
         models.set_provider(Arc::new(faux.clone()));
         AppModels::set(models, false, cx);
     });
+    if std::env::var("ZP_VISUAL_SCENE").as_deref() == Ok("updates") {
+        update_settings(&mut cx, &root, &out);
+        println!("update screenshots written to {}", out.display());
+        return;
+    }
     if std::env::var("ZP_VISUAL_SCENE").as_deref() == Ok("transcript-display") {
         transcript_display_settings(&mut cx, &out);
         println!(
@@ -327,6 +332,116 @@ pub fn run(out: PathBuf) {
     settings_pages(&mut cx, &out);
     advanced(&mut cx, &faux, &data_dir_of(&data), &out);
     println!("screenshots written to {}", out.display());
+}
+
+fn update_settings(cx: &mut VisualTestAppContext, root: &std::path::Path, out: &std::path::Path) {
+    use crate::settings::{Page, SettingsWindow};
+    use crate::updates::{AppUpdate, UpdateState};
+    use zp_core::update::{Asset, PackageKind, Update, UpdateChannel};
+
+    let update = Update {
+        version: "0.3.0-rc.10".into(),
+        channel: UpdateChannel::Preview,
+        notes: "## What's Changed\n* Update channels for stable and preview releases\n* Signed release manifests\n* Faster terminal search".into(),
+        release_url: "https://github.com/arsfy/zp/releases/tag/v0.3.0-rc.10".into(),
+        asset: Asset {
+            name: "ZP.zip".into(),
+            kind: PackageKind::MacApp,
+            url: "https://github.com/arsfy/zp/releases/download/v0.3.0-rc.10/ZP.zip".into(),
+            size: 42_000_000,
+            sha256: "00".repeat(32),
+        },
+    };
+    cx.update(|cx| {
+        crate::store::AppSettings::update(cx, |s| s.update_channel = Some(UpdateChannel::Preview))
+            .unwrap();
+        cx.global_mut::<AppUpdate>().state = UpdateState::Available(update.clone());
+    });
+    let states = [
+        ("available", UpdateState::Available(update.clone())),
+        (
+            "downloading",
+            UpdateState::Downloading {
+                update: update.clone(),
+                received: 15_500_000,
+                total: update.asset.size,
+            },
+        ),
+        (
+            "ready",
+            UpdateState::Ready(update.clone(), std::path::PathBuf::from("ZP.zip")),
+        ),
+        ("up-to-date", UpdateState::UpToDate),
+        (
+            "failed",
+            UpdateState::Failed("could not reach GitHub releases: connection timed out".into()),
+        ),
+    ];
+    for (index, (name, state)) in states.into_iter().enumerate() {
+        let sizes: &[(f32, f32)] = if index == 0 {
+            &[(980., 760.), (720., 560.)]
+        } else {
+            &[(980., 760.)]
+        };
+        cx.update(|cx| {
+            let updater = cx.global_mut::<AppUpdate>();
+            updater.state = state;
+            updater.last_checked = Some(chrono::Local::now() - chrono::Duration::minutes(12));
+        });
+        for &(width, height) in sizes {
+            let window = cx
+                .open_offscreen_window(size(px(width), px(height)), |window, cx| {
+                    cx.new(|cx| SettingsWindow::new_on(Page::About, window, cx))
+                })
+                .unwrap();
+            pump(cx, Duration::from_millis(1000));
+            cx.capture_screenshot(window.into())
+                .unwrap()
+                .save(out.join(format!("about-{name}-{}.png", width as u32)))
+                .unwrap();
+            cx.update_window(window.into(), |_, window, _| window.remove_window())
+                .unwrap();
+        }
+    }
+    cx.update(|cx| cx.global_mut::<AppUpdate>().state = UpdateState::Available(update.clone()));
+    for width in [720., 1280.] {
+        let window = cx
+            .open_offscreen_window(size(px(width), px(820.)), |window, cx| {
+                cx.new(|cx| ProjectWindow::new(root.to_path_buf(), window, cx))
+            })
+            .unwrap();
+        pump(cx, Duration::from_millis(200));
+        cx.capture_screenshot(window.into())
+            .unwrap()
+            .save(out.join(format!("update-title-{}.png", width as u32)))
+            .unwrap();
+        cx.update(|cx| {
+            cx.global_mut::<AppUpdate>().state = UpdateState::Downloading {
+                update: update.clone(),
+                received: 21_000_000,
+                total: update.asset.size,
+            };
+            cx.refresh_windows();
+        });
+        pump(cx, Duration::from_millis(100));
+        cx.capture_screenshot(window.into())
+            .unwrap()
+            .save(out.join(format!("update-progress-{}.png", width as u32)))
+            .unwrap();
+        cx.update(|cx| {
+            cx.global_mut::<AppUpdate>().state = UpdateState::Available(update.clone());
+        });
+        if width > 1000. {
+            cx.update(|cx| crate::updates::offer(&update, cx));
+            pump(cx, Duration::from_millis(300));
+            cx.capture_screenshot(window.into())
+                .unwrap()
+                .save(out.join("update-dialog.png"))
+                .unwrap();
+        }
+        cx.update_window(window.into(), |_, window, _| window.remove_window())
+            .unwrap();
+    }
 }
 
 fn data_dir_of(data: &tempfile::TempDir) -> PathBuf {

@@ -2,7 +2,7 @@
 Type=Application
 Name=ZP
 GenericName=Coding Agent
-Comment=A native GUI coding agent harness
+Comment=A lightweight, native and high performance GUI Harness
 Exec=zp %F
 Icon=zp
 Terminal=false

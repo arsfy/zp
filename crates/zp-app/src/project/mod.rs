@@ -9,8 +9,8 @@ use std::path::{Path, PathBuf};
 
 use gpui::{
     AnyElement, App, Context, DismissEvent, DragMoveEvent, Entity, FocusHandle, Focusable,
-    FontWeight, IntoElement, MouseButton, Pixels, Point, Render, Subscription, Window, anchored,
-    deferred, div, prelude::*, px, rgb_to_hsla, svg,
+    FontWeight, IntoElement, Pixels, Point, Render, Subscription, Window, anchored, deferred, div,
+    prelude::*, px, rgb_to_hsla, svg,
 };
 use gpui_elements::editable_text::{EditableTextState, StringStorage, TextChanged, text_input};
 use zp_core::app_state::PanelLayout;
@@ -375,6 +375,13 @@ impl ProjectWindow {
         &self.root
     }
 
+    pub fn has_update_interruptions(&self, cx: &App) -> bool {
+        self.tabs.iter().any(|tab| {
+            let conversation = tab.conversation.read(cx);
+            conversation.is_busy() || !conversation.draft(cx).is_empty()
+        }) || self.terminals.has_tabs()
+    }
+
     /// The current panel layout.
     #[cfg(test)]
     pub fn layout(&self) -> &PanelLayout {
@@ -702,29 +709,7 @@ impl ProjectWindow {
                         )
                     }),
             )
-            .child(
-                div()
-                    .id("open-settings")
-                    .size(px(28.))
-                    .flex_shrink_0()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .rounded(px(4.))
-                    .cursor_pointer()
-                    .tooltip(crate::ui::tooltip("Settings"))
-                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                    .on_click(|_, _, cx| {
-                        cx.stop_propagation();
-                        crate::settings::SettingsWindow::open(cx);
-                    })
-                    .child(
-                        svg()
-                            .data(include_bytes!("../../../../assets/icons/settings.svg"))
-                            .text_color(colors.text_muted)
-                            .size(px(16.)),
-                    ),
-            )
+            .child(crate::ui::title_bar_controls(cx))
     }
 
     fn render_status_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -742,15 +727,6 @@ impl ProjectWindow {
             .filter(|tab| tab.conversation.read(cx).needs_attention())
             .count();
         let restricted = self.is_restricted(cx);
-        let update_badge = match crate::updates::state(cx) {
-            crate::updates::UpdateState::Available(update) => {
-                Some((format!("Update {} available", update.version), Some(update)))
-            }
-            crate::updates::UpdateState::Downloading(update) => {
-                Some((format!("Downloading {}…", update.version), None))
-            }
-            _ => None,
-        };
         let mut right = Vec::new();
         if waiting > 0 {
             right.push(format!(
@@ -877,22 +853,20 @@ impl ProjectWindow {
                                     this.prompt_trust(window, cx)
                                 })),
                         )
-                    })
-                    .when_some(update_badge, |this, (label, update)| {
-                        this.child(
-                            div()
-                                .id("status-update")
-                                .cursor_pointer()
-                                .text_color(colors.accent)
-                                .hover_style(|s| s.text_color(colors.text))
-                                .child(label)
-                                .when_some(update, |this, update| {
-                                    this.on_click(move |_, _, cx| crate::updates::offer(&update, cx))
-                                }),
-                        )
                     }),
             )
-            .child(div().min_w_0().truncate().child(right.join("  ·  ")))
+            .child(
+                div()
+                    .min_w_0()
+                    .flex()
+                    .items_center()
+                    .gap_3()
+                    .child(div().min_w_0().truncate().child(right.join("  ·  ")))
+                    // Without a custom title row, its controls live here.
+                    .when(!CUSTOM_TITLE_BAR, |this| {
+                        this.child(crate::ui::status_bar_controls(cx))
+                    }),
+            )
     }
 
     fn render_overlays(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {

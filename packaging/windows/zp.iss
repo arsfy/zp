@@ -3,11 +3,15 @@
 #ifndef Version
   #define Version "0.0.0"
 #endif
+#ifndef NumericVersion
+  #define NumericVersion "0.0.0"
+#endif
 
 [Setup]
 AppId={{6F0F7C5B-2B6B-4C47-9B5E-5A1E2C7D0A01}
 AppName=ZP
 AppVersion={#Version}
+VersionInfoVersion={#NumericVersion}.0
 AppPublisher=ZP
 DefaultDirName={autopf}\ZP
 DefaultGroupName=ZP
@@ -20,6 +24,7 @@ PrivilegesRequiredOverridesAllowed=dialog
 SetupIconFile=zp.ico
 UninstallDisplayIcon={app}\zp.exe
 WizardStyle=modern
+CloseApplications=yes
 
 [Files]
 Source: "{#Source}"; DestDir: "{app}"; Flags: ignoreversion

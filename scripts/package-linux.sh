@@ -38,20 +38,22 @@ fi
 if command -v dpkg-deb >/dev/null; then
   case "$arch" in x86_64) debarch=amd64 ;; aarch64) debarch=arm64 ;; *) debarch=$arch ;; esac
   root=$(mktemp -d)/zp_$version
+  deb_version=${version/-/\~}
   mkdir -p "$root/DEBIAN" "$root/usr/bin" "$root/usr/share/applications" "$root/usr/share/icons/hicolor/1024x1024/apps"
   cp "$binary" "$root/usr/bin/zp"
   cp packaging/linux/zp.desktop "$root/usr/share/applications/zp.desktop"
   cp assets/icon.png "$root/usr/share/icons/hicolor/1024x1024/apps/zp.png"
   cat > "$root/DEBIAN/control" <<CONTROL
 Package: zp
-Version: $version
+Version: $deb_version
 Section: devel
 Priority: optional
 Architecture: $debarch
 Depends: libxkbcommon0, libxkbcommon-x11-0, libvulkan1, libwayland-client0, libsecret-1-0
 Maintainer: ZP <zp@users.noreply.github.com>
-Description: A native GUI coding agent harness
+Description: A lightweight, native and high performance GUI Harness
 CONTROL
+  # The file name keeps the release version: GitHub renames `~` in uploaded assets.
   dpkg-deb --build --root-owner-group "$root" "dist/zp_${version}_${debarch}.deb"
 fi
 ls -1 dist

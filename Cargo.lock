@@ -1573,9 +1573,9 @@ dependencies = [
 
 [[package]]
 name = "dirs"
-version = "6.0.0"
+version = "7.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c3e8aa94d75141228480295a7d0e7feb620b1a5ad9f12bc40be62411e38cce4e"
+checksum = "8d57d423b3c82e89b9a24ca3091fee61f456a26edbd28d26c65906f4bc1dcd8f"
 dependencies = [
  "dirs-sys 0.5.0",
 ]
@@ -4087,9 +4087,9 @@ dependencies = [
 
 [[package]]
 name = "nix"
-version = "0.30.1"
+version = "0.32.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "74523f3a35e05aba87a1d978330aef40f67b0304ac79c1c00b294c9830543db6"
+checksum = "77730ed34f01f4990cb2ea67fec715ecebc6fab9a6396cf83c5529b13f581bdc"
 dependencies = [
  "bitflags",
  "cfg-if",
@@ -6119,9 +6119,12 @@ checksum = "e3a9fe34e3e7a50316060351f37187a3f546bce95496156754b601a5fa71b76e"
 
 [[package]]
 name = "similar"
-version = "2.7.0"
+version = "3.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bbbb5d9659141646ae647b42fe094daf6c6192d1620870b449d9557f748b2daa"
+checksum = "d2f8bec09ae8fae0f4f265a4559a9334be3929d8504e9b536df0a41302bd1733"
+dependencies = [
+ "bstr",
+]
 
 [[package]]
 name = "simplecss"
@@ -8737,12 +8740,12 @@ dependencies = [
 name = "zp-ai"
 version = "0.1.0"
 dependencies = [
- "base64 0.22.1",
+ "base64 0.23.1",
  "futures",
  "reqwest",
  "serde",
  "serde_json",
- "sha2 0.10.9",
+ "sha2 0.11.1",
  "tokio",
  "tokio-util",
  "tracing",
@@ -8769,6 +8772,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
+ "tokio-util",
  "tracing",
  "trash",
  "url",
@@ -8802,15 +8806,17 @@ name = "zp-core"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "base64 0.22.1",
- "dirs 6.0.0",
+ "base64 0.23.1",
+ "dirs 7.0.0",
  "futures",
  "ignore",
  "keyring",
  "reqwest",
+ "ring",
+ "semver",
  "serde",
  "serde_json",
- "sha2 0.10.9",
+ "sha2 0.11.1",
  "similar",
  "tempfile",
  "tokio",
@@ -8829,7 +8835,7 @@ name = "zp-mcp"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "dirs 6.0.0",
+ "dirs 7.0.0",
  "futures",
  "reqwest",
  "serde",
@@ -8862,12 +8868,12 @@ name = "zp-tools"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "base64 0.22.1",
- "dirs 6.0.0",
+ "base64 0.23.1",
+ "dirs 7.0.0",
  "futures",
  "globset",
  "ignore",
- "nix 0.30.1",
+ "nix 0.32.0",
  "regex",
  "serde",
  "serde_json",

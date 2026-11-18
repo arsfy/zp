@@ -84,16 +84,21 @@ impl AppStore {
 
     /// Writes pending changes now.
     pub fn flush(cx: &mut App) {
+        if let Err(error) = Self::try_flush(cx) {
+            tracing::warn!(%error, "could not save the UI state");
+        }
+    }
+
+    pub fn try_flush(cx: &mut App) -> anyhow::Result<()> {
         let store = cx.global_mut::<Self>();
         if let Some(task) = store.save_task.take() {
             // May be the task running this call; let it finish.
             task.detach();
         }
-        if let Some(path) = &store.path
-            && let Err(error) = store.state.save(path)
-        {
-            tracing::warn!(%error, "could not save the UI state");
+        if let Some(path) = &store.path {
+            store.state.save(path)?;
         }
+        Ok(())
     }
 }
 

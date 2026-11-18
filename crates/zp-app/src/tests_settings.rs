@@ -57,6 +57,15 @@ fn one_settings_window(cx: &mut TestAppContext) {
     let (_dir, project) = project_dir();
     let project_window = open(cx, &project);
     let first = settings_window(Page::General, cx);
+    first
+        .update(cx, |_, window, cx| {
+            assert_eq!(
+                window.window_bounds().get_bounds().center(),
+                window.display(cx).unwrap().bounds().center(),
+                "Settings should be centered without the project window's cascade offset"
+            );
+        })
+        .unwrap();
     let windows = cx.update(|cx| cx.windows().len());
     let second = settings_window(Page::Keybindings, cx);
     assert_eq!(first, second);
@@ -72,6 +81,49 @@ fn one_settings_window(cx: &mut TestAppContext) {
     cx.dispatch_action(project_window.into(), crate::actions::OpenSettings);
     cx.run_until_parked();
     assert_eq!(cx.update(|cx| cx.windows().len()), windows);
+    settings_window(Page::General, cx)
+        .update(cx, |_, window, cx| {
+            assert_eq!(
+                window.window_bounds().get_bounds().center(),
+                window.display(cx).unwrap().bounds().center()
+            );
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn about_action_opens_settings_and_update_preferences_are_saved(cx: &mut TestAppContext) {
+    let data = setup_models(cx, &[&FauxProvider::default()], false);
+    let (_dir, project) = project_dir();
+    let project_window = open(cx, &project);
+    let settings = settings_window(Page::General, cx);
+    cx.dispatch_action(project_window.into(), crate::actions::About);
+    cx.run_until_parked();
+    assert_eq!(
+        settings.update(cx, |view, _, _| view.page()).unwrap(),
+        Page::About
+    );
+    cx.update(|cx| {
+        AppSettings::update(cx, |settings| {
+            settings.update_feed = Some("http://127.0.0.1:1/releases".into())
+        })
+        .unwrap();
+    });
+    settings
+        .update(cx, |view, _, cx| {
+            view.set_auto_updates(false, cx);
+            view.set_update_channel(zp_core::update::UpdateChannel::Preview, cx);
+        })
+        .unwrap();
+    assert_eq!(saved(&data).check_for_updates, Some(false));
+    assert_eq!(
+        saved(&data).update_channel,
+        Some(zp_core::update::UpdateChannel::Preview)
+    );
+    assert_eq!(
+        settings.update(cx, |view, _, _| view.page()).unwrap(),
+        Page::About
+    );
 }
 
 #[gpui::test]

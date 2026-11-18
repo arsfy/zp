@@ -431,6 +431,7 @@ impl ProjectWindow {
             .map(|tab| {
                 let view = tab.conversation.read(cx);
                 TabState {
+                    draft: view.draft(cx),
                     leaf_includes_restores: true,
                     session: view.session_file(),
                     leaf: view.leaf_id(),
@@ -461,11 +462,12 @@ impl ProjectWindow {
                         continue;
                     }
                 },
-                // At most one unsaved chat is worth restoring.
-                None if self
-                    .tabs
-                    .iter()
-                    .any(|t| t.conversation.read(cx).session_file().is_none()) =>
+                // Keep every draft, but restore at most one empty unsaved chat.
+                None if state.draft.is_empty()
+                    && self.tabs.iter().any(|t| {
+                        t.conversation.read(cx).session_file().is_none()
+                            && t.conversation.read(cx).draft(cx).is_empty()
+                    }) =>
                 {
                     continue;
                 }
@@ -473,6 +475,10 @@ impl ProjectWindow {
             };
             let mut tab = self.make_tab(session, false, window, cx);
             tab.pinned = state.pinned;
+            if !state.draft.is_empty() {
+                tab.conversation
+                    .update(cx, |view, cx| view.set_draft(&state.draft, cx));
+            }
             if let Some(leaf) = &state.leaf {
                 tab.conversation.update(cx, |view, cx| {
                     view.restore_leaf(leaf, !state.leaf_includes_restores, cx)

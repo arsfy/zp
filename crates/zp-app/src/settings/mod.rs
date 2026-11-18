@@ -2,6 +2,7 @@
 //! Keybindings. Changes are saved to `~/.zp/settings.json` (keys to the system keychain)
 //! and applied to the running app at once.
 
+mod about;
 mod keybindings;
 mod mcp;
 mod models;
@@ -9,8 +10,8 @@ mod providers;
 
 use gpui::{
     AnyElement, App, AppContext as _, ColorExt as _, Context, Entity, FocusHandle, Focusable,
-    FontWeight, Global, IntoElement, Render, SharedString, Subscription, Window, WindowHandle, div,
-    prelude::*, px, rgb_to_hsla,
+    FontWeight, Global, IntoElement, Render, SharedString, Subscription, Window, WindowBounds,
+    WindowHandle, div, prelude::*, px, rgb_to_hsla, size,
 };
 use gpui_elements::editable_text::{EditableTextState, StringStorage, text_area, text_input};
 use zp_ai::ThinkingLevel;
@@ -38,10 +39,11 @@ pub enum Page {
     Appearance,
     Keybindings,
     Mcp,
+    About,
 }
 
 impl Page {
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::General,
         Self::Models,
         Self::Providers,
@@ -49,6 +51,7 @@ impl Page {
         Self::Permissions,
         Self::Appearance,
         Self::Keybindings,
+        Self::About,
     ];
 
     pub fn label(self) -> &'static str {
@@ -60,6 +63,7 @@ impl Page {
             Self::Appearance => "Appearance",
             Self::Keybindings => "Keybindings",
             Self::Mcp => "MCP Servers",
+            Self::About => "About",
         }
     }
 }
@@ -179,7 +183,11 @@ impl SettingsWindow {
             SETTINGS_SIZE,
             SETTINGS_MIN_SIZE,
             cx,
-        );
+        )
+        .window_bounds(Some(WindowBounds::centered(
+            size(px(SETTINGS_SIZE.0), px(SETTINGS_SIZE.1)),
+            cx,
+        )));
         match cx.open_window(options, |window, cx| {
             cx.new(|cx| Self::new(page, window, cx))
         }) {
@@ -726,6 +734,7 @@ impl Render for SettingsWindow {
             Page::Appearance => self.render_appearance(cx),
             Page::Keybindings => self.render_keybindings(cx),
             Page::Mcp => self.render_mcp(cx),
+            Page::About => self.render_about(cx),
         };
         let notice = self.notice.clone().filter(|(text, _)| !text.is_empty());
         div()
@@ -763,7 +772,13 @@ impl Render for SettingsWindow {
                         .bg(colors.surface)
                         .border_b_1()
                         .border_color(colors.border)
-                        .child(div().font_weight(FontWeight::SEMIBOLD).child("Settings")),
+                        .child(
+                            div()
+                                .flex_1()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .child("Settings"),
+                        )
+                        .children(crate::updates::title_bar_button(false, cx)),
                 )
             })
             .child(

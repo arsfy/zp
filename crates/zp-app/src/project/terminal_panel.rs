@@ -50,6 +50,10 @@ pub(super) struct Terminals {
 }
 
 impl Terminals {
+    pub(super) fn has_tabs(&self) -> bool {
+        !self.tabs.is_empty()
+    }
+
     fn active(&self) -> Option<&Entity<TerminalView>> {
         self.tabs.get(self.active).map(|tab| &tab.view)
     }

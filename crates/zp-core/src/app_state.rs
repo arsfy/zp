@@ -120,6 +120,9 @@ pub struct ProjectUiState {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct TabState {
+    /// Unsent composer text, restored with the tab (across restarts and updates).
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub draft: String,
     /// The saved leaf includes file restores (older builds saved the preceding entry).
     #[serde(default)]
     pub leaf_includes_restores: bool,

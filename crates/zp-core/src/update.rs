@@ -1,49 +1,168 @@
-//! Update checks: a small JSON feed published with each release (`latest.json`, written
-//! by `scripts/release.sh`) lists the newest version and one download per platform with
-//! its SHA-256.
-//!
-//! ```json
-//! {"version": "0.2.0", "notes": "…", "platforms": {
-//!   "darwin-aarch64": {"url": "https://…/ZP-0.2.0-darwin-aarch64.zip", "sha256": "…"}}}
-//! ```
+//! GitHub release discovery and authenticated, user-initiated update downloads.
 
 use std::collections::BTreeMap;
+use std::io::Read as _;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
-use anyhow::{Context as _, bail};
+use anyhow::{Context as _, bail, ensure};
+use base64::Engine as _;
+use reqwest::Client;
+use ring::signature::{ED25519, UnparsedPublicKey};
+use semver::Version;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
+use tokio_util::sync::CancellationToken;
 
-/// Where releases are announced.
-pub const DEFAULT_FEED_URL: &str =
-    "https://github.com/arsfy/zp/releases/latest/download/latest.json";
+pub const REPOSITORY_URL: &str = "https://github.com/arsfy/zp";
+pub const DEFAULT_RELEASES_URL: &str = "https://api.github.com/repos/arsfy/zp/releases";
+pub const PUBLIC_KEY: &str = match option_env!("ZP_UPDATE_PUBLIC_KEY") {
+    Some(key) => key,
+    None => "",
+};
+const MAX_METADATA_BYTES: usize = 8 * 1024 * 1024;
 
-/// A downloadable build.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum UpdateChannel {
+    Stable,
+    Preview,
+}
+
+impl Default for UpdateChannel {
+    fn default() -> Self {
+        version_channel(crate::VERSION).unwrap_or(Self::Stable)
+    }
+}
+
+impl UpdateChannel {
+    pub const ALL: [Self; 2] = [Self::Stable, Self::Preview];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Stable => "Stable",
+            Self::Preview => "Preview",
+        }
+    }
+
+    fn accepts(self, version: &str) -> bool {
+        match version_channel(version) {
+            Some(Self::Stable) => true,
+            Some(Self::Preview) => self == Self::Preview,
+            None => false,
+        }
+    }
+}
+
+fn parse_version(version: &str) -> Option<Version> {
+    Version::parse(version.strip_prefix('v').unwrap_or(version)).ok()
+}
+
+/// Only stable, preview.N and rc.N versions are update candidates.
+pub fn version_channel(version: &str) -> Option<UpdateChannel> {
+    let version = parse_version(version)?;
+    if version.pre.is_empty() {
+        return Some(UpdateChannel::Stable);
+    }
+    let (name, number) = version.pre.as_str().split_once('.')?;
+    (matches!(name, "preview" | "rc") && number.parse::<u64>().is_ok())
+        .then_some(UpdateChannel::Preview)
+}
+
+pub fn is_newer(candidate: &str, current: &str) -> bool {
+    match (parse_version(candidate), parse_version(current)) {
+        (Some(candidate), Some(current)) => candidate.cmp_precedence(&current).is_gt(),
+        _ => false,
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PackageKind {
+    MacApp,
+    WindowsInstaller,
+    WindowsPortable,
+    AppImage,
+    Deb,
+    Archive,
+}
+
+impl PackageKind {
+    pub fn current() -> Self {
+        if cfg!(target_os = "macos") {
+            Self::MacApp
+        } else if cfg!(windows) {
+            let installed = std::env::current_exe()
+                .ok()
+                .and_then(|p| p.parent().map(|p| p.join("unins000.exe")))
+                .is_some_and(|p| p.exists());
+            if installed {
+                Self::WindowsInstaller
+            } else {
+                Self::WindowsPortable
+            }
+        } else if std::env::var_os("APPIMAGE").is_some() {
+            Self::AppImage
+        } else if std::env::current_exe().is_ok_and(|p| p == Path::new("/usr/bin/zp")) {
+            Self::Deb
+        } else {
+            Self::Archive
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Asset {
+    pub name: String,
+    pub kind: PackageKind,
     pub url: String,
+    pub size: u64,
     pub sha256: String,
 }
 
-/// The release feed.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Feed {
+    pub schema_version: u32,
     pub version: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub notes: Option<String>,
+    pub channel: UpdateChannel,
+    pub published_at: String,
     #[serde(default)]
-    pub platforms: BTreeMap<String, Asset>,
+    pub notes: String,
+    pub platforms: BTreeMap<String, Vec<Asset>>,
 }
 
-/// An update for this platform.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Update {
     pub version: String,
-    pub notes: Option<String>,
+    pub channel: UpdateChannel,
+    pub notes: String,
+    pub release_url: String,
     pub asset: Asset,
 }
 
-/// This build's platform key, e.g. `darwin-aarch64`, `linux-x86_64`, `windows-x86_64`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CheckResult {
+    Available(Update),
+    UpToDate,
+    Unavailable(String),
+}
+
+#[derive(Debug, Deserialize)]
+struct ReleaseAsset {
+    name: String,
+    browser_download_url: String,
+    size: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct Release {
+    tag_name: String,
+    draft: bool,
+    prerelease: bool,
+    assets: Vec<ReleaseAsset>,
+}
+
 pub fn platform_key() -> String {
     let os = match std::env::consts::OS {
         "macos" => "darwin",
@@ -52,177 +171,232 @@ pub fn platform_key() -> String {
     format!("{os}-{}", std::env::consts::ARCH)
 }
 
-fn parse_version(version: &str) -> (Vec<u64>, Option<&str>) {
-    let version = version.trim().trim_start_matches('v');
-    let (core, pre) = match version.split_once('-') {
-        Some((core, pre)) => (core, Some(pre)),
-        None => (version, None),
-    };
-    let core = core.split('+').next().unwrap_or(core);
-    (
-        core.split('.')
-            .map(|part| part.parse().unwrap_or(0))
-            .collect(),
-        pre,
-    )
+fn client(timeout: Duration) -> anyhow::Result<Client> {
+    Ok(Client::builder()
+        .user_agent(concat!("ZP/", env!("CARGO_PKG_VERSION")))
+        .connect_timeout(Duration::from_secs(15))
+        .timeout(timeout)
+        .build()?)
 }
 
-/// Whether `candidate` is newer than `current` (semantic versions; a pre-release is older
-/// than its release).
-pub fn is_newer(candidate: &str, current: &str) -> bool {
-    let (a, a_pre) = parse_version(candidate);
-    let (b, b_pre) = parse_version(current);
-    let len = a.len().max(b.len());
-    for i in 0..len {
-        let (x, y) = (
-            a.get(i).copied().unwrap_or(0),
-            b.get(i).copied().unwrap_or(0),
+async fn metadata(response: reqwest::Response) -> anyhow::Result<Vec<u8>> {
+    let mut response = response.error_for_status()?;
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response.chunk().await? {
+        ensure!(
+            bytes.len() + chunk.len() <= MAX_METADATA_BYTES,
+            "release metadata is too large"
         );
-        if x != y {
-            return x > y;
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
+}
+
+fn verify_manifest(bytes: &[u8], signature: &[u8], public_key: &str) -> anyhow::Result<Feed> {
+    ensure!(
+        !public_key.is_empty(),
+        "this build has no update verification key; download from {REPOSITORY_URL}/releases"
+    );
+    let key = base64::engine::general_purpose::STANDARD
+        .decode(public_key.trim())
+        .context("invalid update verification key")?;
+    UnparsedPublicKey::new(&ED25519, key)
+        .verify(bytes, signature)
+        .map_err(|_| anyhow::anyhow!("release manifest signature is invalid"))?;
+    let feed: Feed = serde_json::from_slice(bytes).context("invalid release manifest")?;
+    ensure!(
+        feed.schema_version == 1,
+        "unsupported release manifest version"
+    );
+    ensure!(
+        version_channel(&feed.version) == Some(feed.channel),
+        "release channel does not match its version"
+    );
+    Ok(feed)
+}
+
+fn candidate(release: &Release, channel: UpdateChannel, current: &str) -> bool {
+    !release.draft
+        && channel.accepts(&release.tag_name)
+        && version_channel(&release.tag_name)
+            .is_some_and(|c| release.prerelease == (c == UpdateChannel::Preview))
+        && is_newer(&release.tag_name, current)
+}
+
+pub async fn check(
+    url: &str,
+    channel: UpdateChannel,
+    current: &str,
+    platform: &str,
+    kind: PackageKind,
+    public_key: &str,
+) -> anyhow::Result<CheckResult> {
+    ensure!(
+        parse_version(current).is_some(),
+        "invalid installed version"
+    );
+    let client = client(Duration::from_secs(60))?;
+    let mut releases = Vec::new();
+    for page in 1..=100 {
+        let mut page_url = reqwest::Url::parse(url)?;
+        page_url
+            .query_pairs_mut()
+            .append_pair("per_page", "100")
+            .append_pair("page", &page.to_string());
+        let bytes = metadata(
+            client
+                .get(page_url)
+                .header("Accept", "application/vnd.github+json")
+                .send()
+                .await
+                .context("could not reach GitHub releases")?,
+        )
+        .await?;
+        let batch: Vec<Release> =
+            serde_json::from_slice(&bytes).context("invalid GitHub releases response")?;
+        let done = batch.len() < 100;
+        releases.extend(batch.into_iter().filter(|r| candidate(r, channel, current)));
+        if done {
+            break;
         }
+        ensure!(page < 100, "too many release pages; try again later");
     }
-    match (a_pre, b_pre) {
-        (None, Some(_)) => true,
-        (Some(x), Some(y)) => x > y,
-        _ => false,
-    }
-}
-
-/// The update `feed` offers this platform over `current`, if any.
-pub fn update_from(feed: &Feed, current: &str, platform: &str) -> Option<Update> {
-    if !is_newer(&feed.version, current) {
-        return None;
-    }
-    let asset = feed.platforms.get(platform)?.clone();
-    Some(Update {
-        version: feed.version.clone(),
-        notes: feed.notes.clone(),
-        asset,
-    })
-}
-
-/// Fetches the feed at `url` and returns the update for this build, if any.
-pub async fn check(url: &str) -> anyhow::Result<Option<Update>> {
-    let response = reqwest::get(url)
-        .await
-        .context("could not reach the update feed")?;
-    if !response.status().is_success() {
-        bail!("the update feed answered HTTP {}", response.status());
-    }
-    let text = response.text().await?;
-    let feed: Feed = serde_json::from_str(&text).context("the update feed is not valid")?;
-    Ok(update_from(&feed, crate::VERSION, &platform_key()))
-}
-
-/// The SHA-256 of `bytes`, in hex.
-pub fn sha256_hex(bytes: &[u8]) -> String {
-    Sha256::digest(bytes)
+    releases.sort_by(|a, b| {
+        parse_version(&b.tag_name)
+            .unwrap()
+            .cmp_precedence(&parse_version(&a.tag_name).unwrap())
+    });
+    let Some(release) = releases.first() else {
+        return Ok(CheckResult::UpToDate);
+    };
+    let manifest = release
+        .assets
         .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect()
+        .find(|a| a.name == "release.json")
+        .context("this release is missing release.json")?;
+    let signature = release
+        .assets
+        .iter()
+        .find(|a| a.name == "release.json.sig")
+        .context("this release is missing its signature")?;
+    let bytes = metadata(client.get(&manifest.browser_download_url).send().await?).await?;
+    let signature = metadata(client.get(&signature.browser_download_url).send().await?).await?;
+    let feed = verify_manifest(&bytes, &signature, public_key)?;
+    ensure!(
+        parse_version(&feed.version) == parse_version(&release.tag_name),
+        "manifest version does not match release tag"
+    );
+    let Some(asset) = feed
+        .platforms
+        .get(platform)
+        .and_then(|assets| assets.iter().find(|a| a.kind == kind))
+    else {
+        return Ok(CheckResult::Unavailable(feed.version));
+    };
+    validate_asset(asset)?;
+    ensure!(
+        release.assets.iter().any(|a| a.name == asset.name
+            && a.browser_download_url == asset.url
+            && a.size == asset.size),
+        "the update package does not match the release assets"
+    );
+    Ok(CheckResult::Available(Update {
+        release_url: format!("{REPOSITORY_URL}/releases/tag/{}", release.tag_name),
+        version: feed.version,
+        channel: feed.channel,
+        notes: feed.notes,
+        asset: asset.clone(),
+    }))
 }
 
-/// Downloads `asset` into `dir` and checks its SHA-256. Returns the file.
-pub async fn download(asset: &Asset, dir: &Path) -> anyhow::Result<PathBuf> {
-    let response = reqwest::get(&asset.url)
-        .await
-        .context("could not download the update")?;
-    if !response.status().is_success() {
-        bail!("the download answered HTTP {}", response.status());
+fn validate_asset(asset: &Asset) -> anyhow::Result<()> {
+    ensure!(
+        !asset.name.is_empty()
+            && asset.name != "."
+            && asset.name != ".."
+            && !asset.name.contains(['/', '\\', ':'])
+            && !asset.name.chars().any(char::is_control),
+        "invalid update filename"
+    );
+    ensure!(
+        asset.size > 0
+            && asset.sha256.len() == 64
+            && asset.sha256.bytes().all(|c| c.is_ascii_hexdigit()),
+        "invalid update checksum or size"
+    );
+    let url = reqwest::Url::parse(&asset.url)?;
+    ensure!(
+        url.scheme() == "https"
+            || (cfg!(any(test, feature = "test-support"))
+                && url.scheme() == "http"
+                && url.host_str() == Some("127.0.0.1")),
+        "update packages require HTTPS"
+    );
+    Ok(())
+}
+
+pub fn sha256_hex(bytes: &[u8]) -> String {
+    hex_digest(&Sha256::digest(bytes))
+}
+
+fn hex_digest(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+pub fn verify_download(path: &Path, asset: &Asset) -> anyhow::Result<()> {
+    let mut file = std::fs::File::open(path)?;
+    ensure!(
+        file.metadata()?.len() == asset.size,
+        "the downloaded update size has changed"
+    );
+    let mut digest = Sha256::new();
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let n = file.read(&mut buffer)?;
+        if n == 0 {
+            break;
+        }
+        digest.update(&buffer[..n]);
     }
-    let bytes = response
-        .bytes()
-        .await
-        .context("the download was interrupted")?;
-    let actual = sha256_hex(&bytes);
-    if !actual.eq_ignore_ascii_case(asset.sha256.trim()) {
-        bail!(
-            "the download is corrupt (SHA-256 {actual}, expected {})",
-            asset.sha256
-        );
+    ensure!(
+        hex_digest(&digest.finalize()).eq_ignore_ascii_case(&asset.sha256),
+        "the downloaded update has changed; download it again"
+    );
+    Ok(())
+}
+
+/// Partial files are removed on cancellation or failure; only verified packages persist.
+pub async fn download(
+    asset: &Asset,
+    dir: &Path,
+    cancel: &CancellationToken,
+    progress: impl Fn(u64, u64),
+) -> anyhow::Result<PathBuf> {
+    validate_asset(asset)?;
+    tokio::select! {
+        _ = cancel.cancelled() => bail!("update download cancelled"),
+        result = async {
+            std::fs::create_dir_all(dir)?;
+            let mut file = tempfile::NamedTempFile::new_in(dir)?;
+            let mut response = client(Duration::from_secs(30 * 60))?.get(&asset.url).send().await?.error_for_status()?;
+            let mut digest = Sha256::new();
+            let mut received = 0;
+            while let Some(chunk) = response.chunk().await.context("the download was interrupted")? {
+                received += chunk.len() as u64;
+                ensure!(received <= asset.size, "download exceeds its declared size");
+                file.write_all(&chunk)?;
+                digest.update(&chunk);
+                progress(received, asset.size);
+            }
+            ensure!(received == asset.size, "the download is incomplete");
+            ensure!(hex_digest(&digest.finalize()).eq_ignore_ascii_case(&asset.sha256), "the download is corrupt (SHA-256 mismatch)");
+            file.as_file().sync_all()?;
+            let path = dir.join(&asset.name);
+            file.persist(&path).map_err(|e| e.error)?;
+            Ok(path)
+        } => result,
     }
-    let name = asset
-        .url
-        .rsplit('/')
-        .next()
-        .filter(|n| !n.is_empty())
-        .unwrap_or("zp-update");
-    std::fs::create_dir_all(dir)?;
-    let path = dir.join(name);
-    std::fs::write(&path, &bytes).with_context(|| format!("could not write {}", path.display()))?;
-    Ok(path)
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn versions() {
-        assert!(is_newer("0.2.0", "0.1.9"));
-        assert!(is_newer("v1.0", "0.9.9"));
-        assert!(is_newer("1.0.0", "1.0.0-beta.2"));
-        assert!(is_newer("1.0.0-rc.2", "1.0.0-rc.1"));
-        assert!(!is_newer("0.1.0", "0.1.0"));
-        assert!(!is_newer("0.1.0-beta", "0.1.0"));
-        assert!(!is_newer("0.0.9", "0.1.0"));
-    }
-
-    #[test]
-    fn feed_selection() {
-        let feed: Feed = serde_json::from_str(
-            r#"{"version": "9.0.0", "notes": "Big", "platforms": {"darwin-aarch64": {"url": "https://x/ZP.zip", "sha256": "ab"}}}"#,
-        )
-        .unwrap();
-        let update = update_from(&feed, "0.1.0", "darwin-aarch64").unwrap();
-        assert_eq!(
-            (update.version.as_str(), update.asset.url.as_str()),
-            ("9.0.0", "https://x/ZP.zip")
-        );
-        assert_eq!(
-            update_from(&feed, "0.1.0", "linux-x86_64"),
-            None,
-            "no build for the platform"
-        );
-        assert_eq!(update_from(&feed, "9.0.0", "darwin-aarch64"), None);
-        assert!(platform_key().contains('-'));
-    }
-
-    #[tokio::test]
-    async fn downloads_and_verifies() {
-        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let base = format!("http://{}", listener.local_addr().unwrap());
-        tokio::spawn(async move {
-            loop {
-                let Ok((mut socket, _)) = listener.accept().await else {
-                    return;
-                };
-                let mut buffer = [0u8; 2048];
-                let _ = socket.read(&mut buffer).await;
-                let body = b"new build";
-                let head = format!(
-                    "HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-length: {}\r\n\r\n",
-                    body.len()
-                );
-                let _ = socket.write_all(head.as_bytes()).await;
-                let _ = socket.write_all(body).await;
-            }
-        });
-        let dir = tempfile::tempdir().unwrap();
-        let good = Asset {
-            url: format!("{base}/ZP-9.zip"),
-            sha256: sha256_hex(b"new build").to_uppercase(),
-        };
-        let path = download(&good, dir.path()).await.unwrap();
-        assert_eq!(std::fs::read(&path).unwrap(), b"new build");
-        assert_eq!(path.file_name().unwrap(), "ZP-9.zip");
-        let bad = Asset {
-            sha256: "00".into(),
-            ..good
-        };
-        let error = download(&bad, dir.path()).await.unwrap_err();
-        assert!(error.to_string().contains("corrupt"));
-    }
-}
+mod tests;

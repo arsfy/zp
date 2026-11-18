@@ -320,6 +320,34 @@ pub fn close_active_window(cx: &mut App) {
     }
 }
 
+/// Whether restarting would interrupt work in any project.
+pub fn has_update_interruptions(cx: &mut App) -> bool {
+    let projects: Vec<_> = cx
+        .global::<Workspaces>()
+        .projects
+        .values()
+        .copied()
+        .collect();
+    projects.into_iter().any(|window| {
+        window
+            .update(cx, |view, _, cx| view.has_update_interruptions(cx))
+            .unwrap_or(false)
+    })
+}
+
+pub fn save_for_update(cx: &mut App) -> Result<()> {
+    let projects: Vec<_> = cx
+        .global::<Workspaces>()
+        .projects
+        .values()
+        .copied()
+        .collect();
+    for window in projects {
+        window.update(cx, |view, _, cx| view.save_tabs(cx))?;
+    }
+    AppStore::try_flush(cx)
+}
+
 /// Saves state and quits.
 pub fn quit(cx: &mut App) {
     cx.global_mut::<Workspaces>().quitting = true;

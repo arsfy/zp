@@ -2,7 +2,7 @@
 
 use gpui::{
     AnyView, App, ClickEvent, Context, Div, ElementId, IntoElement, MouseButton, Render,
-    SharedString, Stateful, Window, div, prelude::*, px,
+    SharedString, Stateful, Window, div, prelude::*, px, svg,
 };
 
 use crate::theme::ActiveTheme;
@@ -46,6 +46,65 @@ pub fn title_bar(id: impl Into<ElementId>) -> Stateful<Div> {
                 window.start_window_move();
             }
         })
+}
+
+/// The ZP logo (`assets/icon.png`), decoded once.
+pub fn app_logo(cx: &App) -> Option<std::sync::Arc<gpui::RenderImage>> {
+    static LOGO: std::sync::OnceLock<Option<std::sync::Arc<gpui::RenderImage>>> =
+        std::sync::OnceLock::new();
+    LOGO.get_or_init(|| {
+        gpui::Image::from_bytes(
+            gpui::ImageFormat::Png,
+            include_bytes!("../../../assets/icon.png").to_vec(),
+        )
+        .to_image_data(cx.svg_renderer())
+        .inspect_err(|error| tracing::warn!(%error, "could not decode the ZP logo"))
+        .ok()
+    })
+    .clone()
+}
+
+/// The Update button and the settings gear, at the end of a custom title row (macOS).
+pub fn title_bar_controls(cx: &App) -> Div {
+    window_controls(false, cx)
+}
+
+/// The same controls, compact, where the system draws the title bar (the status bar).
+pub fn status_bar_controls(cx: &App) -> Div {
+    window_controls(true, cx)
+}
+
+fn window_controls(compact: bool, cx: &App) -> Div {
+    let colors = cx.theme().colors.clone();
+    div()
+        .flex()
+        .items_center()
+        .gap(px(if compact { 4. } else { 8. }))
+        .flex_shrink_0()
+        .children(crate::updates::title_bar_button(compact, cx))
+        .child(
+            div()
+                .id("open-settings")
+                .size(px(if compact { 20. } else { 28. }))
+                .flex_shrink_0()
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded(px(4.))
+                .cursor_pointer()
+                .tooltip(tooltip("Settings"))
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .on_click(|_, _, cx| {
+                    cx.stop_propagation();
+                    crate::settings::SettingsWindow::open(cx);
+                })
+                .child(
+                    svg()
+                        .data(include_bytes!("../../../assets/icons/settings.svg"))
+                        .text_color(colors.text_muted)
+                        .size(px(if compact { 13. } else { 16. })),
+                ),
+        )
 }
 
 /// A key binding (`secondary-shift-n`) as shown to users: `⇧⌘N` on macOS,

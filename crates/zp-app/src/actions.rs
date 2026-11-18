@@ -4,7 +4,7 @@
 
 use std::path::PathBuf;
 
-use gpui::{App, KeyBinding, Menu, MenuItem, PromptLevel, actions};
+use gpui::{App, KeyBinding, Menu, MenuItem, actions};
 use gpui_elements::editable_text::actions::{DEFAULT_INPUT_CONTEXT, Enter, default_bindings};
 
 use crate::store::AppStore;
@@ -467,26 +467,7 @@ fn app_menus(cx: &App) -> Vec<Menu> {
 }
 
 fn show_about(_: &About, cx: &mut App) {
-    let Some(window) = cx
-        .active_window()
-        .or_else(|| cx.windows().into_iter().next())
-    else {
-        return;
-    };
-    let detail = format!("Version {}\nA native GUI agent harness.", zp_core::VERSION);
-    let result = window.update(cx, |_, window, cx| {
-        // The prompt is informational; its answer is not needed.
-        let _answer = window.prompt(
-            PromptLevel::Info,
-            zp_core::APP_NAME,
-            Some(&detail),
-            &["OK"],
-            cx,
-        );
-    });
-    if let Err(error) = result {
-        tracing::warn!(?error, "failed to show the About dialog");
-    }
+    crate::settings::SettingsWindow::open_at(crate::settings::Page::About, cx);
 }
 
 #[cfg(test)]

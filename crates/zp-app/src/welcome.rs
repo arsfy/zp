@@ -119,7 +119,24 @@ impl Render for WelcomeView {
             .bg(colors.background)
             .text_color(colors.text)
             .text_size(theme.metrics.font_size)
-            .when(CUSTOM_TITLE_BAR, |this| this.child(title_bar("title-bar")))
+            .relative()
+            .when(CUSTOM_TITLE_BAR, |this| {
+                this.child(
+                    title_bar("title-bar")
+                        .child(div().flex_1())
+                        .child(crate::ui::title_bar_controls(cx)),
+                )
+            })
+            // The system draws the title bar elsewhere: keep the controls in the corner.
+            .when(!CUSTOM_TITLE_BAR, |this| {
+                this.child(
+                    div()
+                        .absolute()
+                        .top_2()
+                        .right_3()
+                        .child(crate::ui::title_bar_controls(cx)),
+                )
+            })
             .child(
                 div()
                     .flex_1()
@@ -154,7 +171,7 @@ impl WelcomeView {
             .child(
                 div()
                     .text_color(colors.text_muted)
-                    .child("A native GUI agent harness"),
+                    .child("A lightweight, native and high performance GUI Harness"),
             )
             .child(
                 div()
