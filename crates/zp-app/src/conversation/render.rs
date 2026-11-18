@@ -1,5 +1,7 @@
 //! Rendering of the conversation: transcript rows, tool cards and the composer.
 
+use std::sync::LazyLock;
+
 use gpui::{
     Anchor, AnyElement, App, ClipboardItem, ColorExt as _, Context, DispatchPhase, Div, ElementId,
     FontWeight, IntoElement, MouseButton, Render, Rgba, SharedString, Window, anchored, canvas,
@@ -7,6 +9,7 @@ use gpui::{
     rgb_to_hsla, svg,
 };
 use gpui_elements::editable_text::{text_area, text_input};
+use regex::{Captures, Regex};
 use zp_ai::{AssistantContent, StopReason, ToolCall};
 use zp_core::changes::{RevertStatus, Scope};
 use zp_core::checkpoint::RecordedChange;
@@ -43,6 +46,28 @@ fn centered(content: impl IntoElement) -> gpui::Div {
         .justify_center()
         .px_4()
         .child(div().w_full().max_w(px(CONTENT_WIDTH)).child(content))
+}
+
+/// Gives compact JSON and request IDs soft break points in the displayed error.
+fn wrappable_error(text: &str) -> SharedString {
+    const CHUNK_LENGTH: usize = 12;
+    static LONG_RUN: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(&format!(r"[!-~]{{{},}}", CHUNK_LENGTH + 1)).unwrap());
+
+    LONG_RUN
+        .replace_all(text, |captures: &Captures<'_>| {
+            let run = &captures[0];
+            let mut wrapped = String::new();
+            for start in (0..run.len()).step_by(CHUNK_LENGTH) {
+                if start > 0 {
+                    wrapped.push('\u{200b}');
+                }
+                wrapped.push_str(&run[start..(start + CHUNK_LENGTH).min(run.len())]);
+            }
+            wrapped
+        })
+        .into_owned()
+        .into()
 }
 
 /// Height of the fade above the floating composer.
@@ -587,8 +612,15 @@ impl ConversationView {
         if !streaming && matches!(message.stop_reason, StopReason::Error | StopReason::Aborted) {
             let aborted = message.stop_reason == StopReason::Aborted;
             let can_retry = self.transcript.failed_response() == Some(row) && !self.running;
+            let error = if aborted {
+                "Stopped.".into()
+            } else {
+                let detail = message.error_message.as_deref().unwrap_or("request failed");
+                wrappable_error(&format!("Error: {detail}"))
+            };
             column = column.child(
                 div()
+                    .debug_selector(|| "response-error".into())
                     .flex()
                     .items_center()
                     .gap_3()
@@ -599,24 +631,22 @@ impl ConversationView {
                     .border_color(if aborted { colors.border } else { colors.error })
                     .child(
                         div()
+                            .debug_selector(|| "response-error-text".into())
                             .flex_1()
+                            .min_w_0()
+                            .whitespace_normal()
                             .text_color(if aborted {
                                 colors.text_muted
                             } else {
                                 colors.error
                             })
-                            .child(if aborted {
-                                "Stopped.".to_owned()
-                            } else {
-                                format!(
-                                    "Error: {}",
-                                    message.error_message.as_deref().unwrap_or("request failed")
-                                )
-                            }),
+                            .child(error),
                     )
                     .when(can_retry, |this| {
                         this.child(
                             ghost_button(id("retry", row), "Retry", cx)
+                                .debug_selector(|| "response-error-retry".into())
+                                .flex_shrink_0()
                                 .on_click(cx.listener(|this, _, _, cx| this.retry(cx))),
                         )
                     }),
@@ -1311,9 +1341,11 @@ impl ConversationView {
                 .when_some(self.run_error.clone(), |this, error| {
                     this.child(
                         div()
+                            .min_w_0()
+                            .whitespace_normal()
                             .text_size(px(12.))
                             .text_color(colors.error)
-                            .child(error),
+                            .child(wrappable_error(&error)),
                     )
                 })
                 .when_some(self.needs_key(cx), |this, provider| {
@@ -2019,12 +2051,14 @@ impl ConversationView {
 }
 
 #[cfg(test)]
-mod selection_tests {
+mod tests {
     use gpui::{Modifiers, MouseButton, TestAppContext, VisualTestContext};
     use zp_ai::{FauxProvider, FauxResponse};
 
     use crate::tests::project_dir;
     use crate::tests_conversation::{active, idle, open, send, setup_models};
+
+    use super::wrappable_error;
 
     #[gpui::test]
     fn messages_and_code_support_drag_selection_and_copy(cx: &mut TestAppContext) {
@@ -2079,6 +2113,45 @@ mod selection_tests {
         assert_eq!(
             cx.update(|_, cx| cx.read_from_clipboard().unwrap().text().unwrap()),
             "draft stays editable"
+        );
+    }
+
+    #[test]
+    fn api_errors_have_soft_breaks_in_long_runs_and_keep_existing_newlines() {
+        let error = "HTTP 400 Bad Request\n请求 ID: 012345abcdef012345abcdef0";
+        assert_eq!(
+            wrappable_error(error).as_ref(),
+            "HTTP 400 Bad Request\n请求 ID: 012345abcdef\u{200b}012345abcdef\u{200b}0"
+        );
+    }
+
+    #[gpui::test]
+    fn long_api_error_leaves_retry_inside_the_card(cx: &mut TestAppContext) {
+        let faux = FauxProvider::default();
+        faux.push(FauxResponse::Error(format!(
+            "HTTP 400 Bad Request: request_id={}",
+            "W".repeat(180)
+        )));
+        faux.push(FauxResponse::text("Success"));
+        let _data = setup_models(cx, &[&faux], false);
+        let (_dir, project) = project_dir();
+        let window = open(cx, &project);
+        let conversation = active(window, cx);
+        send(window, "Try a request", cx);
+        idle(&conversation, 2, cx);
+        cx.run_until_parked();
+
+        let mut visual = VisualTestContext::from_window(window.into(), cx);
+        let card = visual.debug_bounds("response-error").unwrap();
+        let text = visual.debug_bounds("response-error-text").unwrap();
+        let retry = visual.debug_bounds("response-error-retry").unwrap();
+        assert!(text.right() <= retry.left(), "{text:?} {retry:?}");
+        assert!(retry.right() < card.right(), "{retry:?} {card:?}");
+        visual.simulate_click(retry.center(), Modifiers::none());
+        idle(&conversation, 2, cx);
+        assert_eq!(
+            conversation.read_with(cx, |view, _| view.transcript().assistant(1).unwrap().text()),
+            "Success"
         );
     }
 }

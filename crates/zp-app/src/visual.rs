@@ -1147,8 +1147,10 @@ fn streaming_text_events() -> Vec<AgentEvent> {
 fn error_events() -> Vec<AgentEvent> {
     let mut failed = AssistantMessage::empty("faux", "faux", "faux-1");
     failed.stop_reason = StopReason::Error;
-    failed.error_message =
-        Some("HTTP 529 Overloaded: the service is temporarily overloaded".into());
+    failed.error_message = Some(format!(
+        "HTTP 529 Overloaded: the upstream service is temporarily overloaded and could not finish the request. Please try again after a short delay.\nRequest ID: {}",
+        "0123456789abcdef".repeat(12)
+    ));
     vec![
         AgentEvent::MessageEnd {
             message: AgentMessage::user("Summarize the README"),
