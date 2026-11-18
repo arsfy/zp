@@ -13,6 +13,7 @@ use zp_core::diff::{DEFAULT_CONTEXT, FileDiff};
 use zp_core::permissions::{AskReason, Decision, PermissionMode, PermissionPolicy, ToolKind};
 
 use super::files::ToolDiff;
+use super::render;
 use super::{ConversationEvent, ConversationView};
 use crate::approvals::PendingApproval;
 use crate::diff_view::{DiffColors, Gutters, render_unified_row, unified_rows};
@@ -331,6 +332,7 @@ impl ConversationView {
             .into_iter()
             .enumerate()
             .map(|(index, mode)| {
+                let mode_color = permission_mode_color(mode, cx);
                 div()
                     .id(("permission-mode", index))
                     .flex()
@@ -340,14 +342,14 @@ impl ConversationView {
                     .rounded(px(4.))
                     .cursor_pointer()
                     .hover_style(|s| s.bg(colors.surface_hover))
-                    .when_some(permission_mode_color(mode, cx), |this, color| {
-                        this.text_color(color)
-                    })
-                    .child(div().w(px(12.)).flex_shrink_0().child(if mode == current {
-                        "✓"
-                    } else {
-                        ""
-                    }))
+                    .when_some(mode_color, |this, color| this.text_color(color))
+                    .child(
+                        render::picker_checkmark(
+                            mode == current,
+                            mode_color.unwrap_or(colors.text),
+                        )
+                        .mt_0p5(),
+                    )
                     .child(
                         div()
                             .flex_1()

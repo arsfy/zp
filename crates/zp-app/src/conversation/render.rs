@@ -1,10 +1,10 @@
 //! Rendering of the conversation: transcript rows, tool cards and the composer.
 
 use gpui::{
-    Anchor, AnyElement, App, ClipboardItem, ColorExt as _, Context, DispatchPhase, ElementId,
-    FontWeight, IntoElement, MouseButton, Render, SharedString, Window, anchored, canvas, deferred,
-    div, linear_color_stop, linear_gradient, list, point, prelude::*, px, relative, rgb_to_hsla,
-    svg,
+    Anchor, AnyElement, App, ClipboardItem, ColorExt as _, Context, DispatchPhase, Div, ElementId,
+    FontWeight, IntoElement, MouseButton, Render, Rgba, SharedString, Window, anchored, canvas,
+    deferred, div, linear_color_stop, linear_gradient, list, point, prelude::*, px, relative,
+    rgb_to_hsla, svg,
 };
 use gpui_elements::editable_text::{text_area, text_input};
 use zp_ai::{AssistantContent, StopReason, ToolCall};
@@ -55,6 +55,13 @@ const ICON_EDIT: &[u8] = include_bytes!("../../../../assets/icons/pencil.svg");
 const ICON_BRANCH: &[u8] = include_bytes!("../../../../assets/icons/git-branch.svg");
 const ICON_FORK: &[u8] = include_bytes!("../../../../assets/icons/square-arrow-out-up-right.svg");
 const ICON_REVERT: &[u8] = include_bytes!("../../../../assets/icons/undo-2.svg");
+const ICON_DROPDOWN: &[u8] = include_bytes!("../../../../assets/icons/triangle-down.svg");
+
+pub(super) fn picker_checkmark(selected: bool, color: Rgba) -> Div {
+    div().size(px(12.)).flex_shrink_0().when(selected, |slot| {
+        slot.child(svg().data(ICON_CHECK).size_full().text_color(color))
+    })
+}
 
 /// A small square button showing an icon, with a tooltip.
 fn icon_button(
@@ -88,7 +95,7 @@ fn ghost_button(
 fn ghost_button_with_color(
     element_id: impl Into<ElementId>,
     label: impl Into<SharedString>,
-    color: Option<gpui::Rgba>,
+    color: Option<Rgba>,
     cx: &App,
 ) -> gpui::Stateful<gpui::Div> {
     let colors = &cx.theme().colors;
@@ -1036,7 +1043,7 @@ impl ConversationView {
                     .rounded(px(4.))
                     .cursor_pointer()
                     .hover_style(|s| s.bg(colors.surface_hover))
-                    .child(div().w(px(12.)).child(if selected { "✓" } else { "" }))
+                    .child(picker_checkmark(selected, colors.text))
                     .child(
                         div()
                             .flex_1()
@@ -1138,17 +1145,14 @@ impl ConversationView {
                 div()
                     .id(id("thinking-level", index))
                     .flex()
+                    .items_center()
                     .gap_2()
                     .px_2()
                     .py_1()
                     .rounded(px(4.))
                     .cursor_pointer()
                     .hover_style(|s| s.bg(colors.surface_hover))
-                    .child(
-                        div()
-                            .w(px(12.))
-                            .child(if level == current { "✓" } else { "" }),
-                    )
+                    .child(picker_checkmark(level == current, colors.text))
                     .child(level.as_str())
                     .on_click(cx.listener(move |this, _, window, cx| {
                         this.select_thinking(level, window, cx)
@@ -1205,6 +1209,11 @@ impl ConversationView {
 
         let picker_button = |picker: Picker, label: String, cx: &mut Context<Self>| {
             let open = self.picker == Some(picker);
+            let button_id = match picker {
+                Picker::Model => "model-button",
+                Picker::Thinking => "thinking-button",
+                Picker::Permissions => "permissions-button",
+            };
             let color = match picker {
                 Picker::Permissions => permission_mode_color(self.permission_mode(), cx),
                 _ => None,
@@ -1220,19 +1229,24 @@ impl ConversationView {
                     })
                 })
                 .child(
-                    ghost_button_with_color(
-                        match picker {
-                            Picker::Model => "model-button",
-                            Picker::Thinking => "thinking-button",
-                            Picker::Permissions => "permissions-button",
-                        },
-                        format!("{label} ▾"),
-                        color,
-                        cx,
-                    )
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.toggle_picker(picker, window, cx)
-                    })),
+                    ghost_button_with_color(button_id, label, color, cx)
+                        .group(button_id)
+                        .flex()
+                        .items_center()
+                        .gap_1()
+                        .child(
+                            svg()
+                                .data(ICON_DROPDOWN)
+                                .size(px(10.))
+                                .flex_shrink_0()
+                                .text_color(color.unwrap_or(colors.text_muted))
+                                .group_hover_style(button_id, |s| {
+                                    s.text_color(color.unwrap_or(colors.text))
+                                }),
+                        )
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.toggle_picker(picker, window, cx)
+                        })),
                 )
         };
 
@@ -1930,13 +1944,7 @@ impl ConversationView {
                         .when(selected, |this| this.bg(colors.surface_hover))
                         .hover_style(|s| s.bg(colors.surface_hover))
                         .when(options, |this| {
-                            this.child(
-                                div()
-                                    .w(px(12.))
-                                    .flex_shrink_0()
-                                    .text_size(px(12.))
-                                    .child(if item.current { "✓" } else { "" }),
-                            )
+                            this.child(picker_checkmark(item.current, colors.text))
                         })
                         .child(
                             div()
