@@ -217,6 +217,8 @@ pub struct ConversationView {
     questions: Vec<questions::QuestionCard>,
     /// Whether the task list above the composer shows every item.
     todos_open: bool,
+    /// Task updates the user hid from the composer.
+    dismissed_todo_calls: HashSet<String>,
     /// The sent message being edited, if any.
     editing: Option<MessageEdit>,
     /// Measured height of the floating composer.
@@ -328,6 +330,7 @@ impl ConversationView {
             approvals: Vec::new(),
             questions: Vec::new(),
             todos_open: false,
+            dismissed_todo_calls: HashSet::new(),
             editing: None,
             composer_height: Rc::default(),
             composer_input_width: Rc::default(),

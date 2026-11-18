@@ -144,9 +144,8 @@ impl Transcript {
         self.tools.get(id)
     }
 
-    /// The result details of the last successful call of `tool` (e.g. the current task
-    /// list).
-    pub fn latest_tool_details(&self, tool: &str) -> Option<&Value> {
+    /// The ID and result details of the last successful call of `tool`.
+    pub fn latest_tool_details(&self, tool: &str) -> Option<(&str, &Value)> {
         self.rows.iter().rev().find_map(|row| match row {
             Row::Assistant { message, .. } => {
                 let calls: Vec<_> = message.tool_calls().collect();
@@ -155,6 +154,7 @@ impl Transcript {
                     (call.name == tool && state.status == ToolStatus::Done)
                         .then_some(state.details.as_ref())
                         .flatten()
+                        .map(|details| (call.id.as_str(), details))
                 })
             }
             _ => None,

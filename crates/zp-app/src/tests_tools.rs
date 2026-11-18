@@ -83,7 +83,7 @@ fn todo_and_ask_run_without_approval_and_answers_reach_the_agent(cx: &mut TestAp
         assert_eq!(questions.len(), 2);
         assert_eq!(questions[0].options[1].description, "One per level");
         // The task list is shown while the agent works.
-        let todos = view.current_todos().unwrap();
+        let (_, todos) = view.current_todos().unwrap();
         assert_eq!((todos.completed(), todos.todos.len()), (0, 2));
         assert_eq!(todos.current().unwrap().content, "Pick a style");
     });
@@ -113,6 +113,47 @@ fn todo_and_ask_run_without_approval_and_answers_reach_the_agent(cx: &mut TestAp
         "Q: Which indent?\nA: Tabs\n\nQ: Anything else?\nA: Keep line endings"
     );
     assert!(!conversation.read_with(cx, |view, _| view.needs_attention()));
+}
+
+#[gpui::test]
+fn completed_tasks_stay_until_hidden_and_new_tasks_reappear(cx: &mut TestAppContext) {
+    let faux = FauxProvider::default();
+    faux.push(FauxResponse::tool_call(
+        "todo",
+        json!({"todos": [{"content": "Finish the first task", "status": "completed"}]}),
+    ));
+    faux.push(FauxResponse::text("Done"));
+    faux.push(FauxResponse::text("Still done"));
+    faux.push(FauxResponse::tool_call(
+        "todo",
+        json!({"todos": [{"content": "Start the next task", "status": "in_progress"}]}),
+    ));
+    faux.push(FauxResponse::text("Started"));
+    let _data = setup_models(cx, &[&faux], false);
+    let (_dir, project) = project_dir();
+    let window = open(cx, &project);
+    let conversation = active(window, cx);
+    let visible = |selector, cx: &mut TestAppContext| {
+        VisualTestContext::from_window(window.into(), cx)
+            .debug_bounds(selector)
+            .is_some()
+    };
+
+    send(window, "Finish the first task", cx);
+    idle(&conversation, 3, cx);
+    assert!(visible("todo-panel", cx));
+    click(window, "hide-completed-tasks", cx);
+    cx.run_until_parked();
+    assert!(!visible("todo-panel", cx));
+
+    send(window, "Confirm the first task is done", cx);
+    idle(&conversation, 5, cx);
+    assert!(!visible("todo-panel", cx));
+
+    send(window, "Start the next task", cx);
+    idle(&conversation, 8, cx);
+    assert!(visible("todo-panel", cx));
+    assert!(!visible("hide-completed-tasks", cx));
 }
 
 #[gpui::test]

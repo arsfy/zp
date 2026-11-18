@@ -89,7 +89,7 @@ pub(super) fn picker_checkmark(selected: bool, color: Rgba) -> Div {
 }
 
 /// A small square button showing an icon, with a tooltip.
-fn icon_button(
+pub(super) fn icon_button(
     element_id: impl Into<ElementId>,
     icon: &'static [u8],
     label: &'static str,

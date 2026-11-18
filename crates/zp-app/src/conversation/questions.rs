@@ -10,10 +10,13 @@ use gpui_elements::editable_text::{EditableTextState, StringStorage, text_input}
 use serde_json::Value;
 use zp_tools::{Answer, AskOutcome, Question, TodoList, TodoStatus};
 
+use super::render::icon_button;
 use super::{COMPOSER_CARD_RADIUS, ConversationEvent, ConversationView};
 use crate::approvals::PendingQuestions;
 use crate::theme::ActiveTheme;
 use crate::ui::{disclosure_icon, ui_font};
+
+const ICON_CLOSE: &[u8] = include_bytes!("../../../../assets/icons/x.svg");
 
 /// Questions of an `ask` call waiting for the user.
 pub struct QuestionCard {
@@ -393,27 +396,59 @@ impl ConversationView {
         }
     }
 
-    /// The latest task list of the transcript, if it still has open items or a run is
-    /// going.
-    pub(crate) fn current_todos(&self) -> Option<TodoList> {
-        let list = self
-            .transcript
-            .latest_tool_details("todo")
-            .and_then(|details| {
-                TodoList::from_details(details).filter(|list| !list.todos.is_empty())
-            })?;
-        (self.is_busy() || list.completed() < list.todos.len()).then_some(list)
+    /// The task list shown above the composer and the call that last updated it.
+    pub(crate) fn current_todos(&self) -> Option<(&str, TodoList)> {
+        let (call_id, details) = self.transcript.latest_tool_details("todo")?;
+        if self.dismissed_todo_calls.contains(call_id) {
+            return None;
+        }
+        let list = TodoList::from_details(details)?;
+        (!list.todos.is_empty()).then_some((call_id, list))
     }
 
     /// The current task list above the composer: one line, or every item when opened.
     pub(super) fn render_todo_panel(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let list = self.current_todos()?;
+        let (call_id, list) = self.current_todos()?;
         let colors = cx.theme().colors.clone();
         let open = self.todos_open;
+        let completed = list.completed();
         let current = list
             .current()
             .map(|item| item.content.clone())
             .unwrap_or_default();
+        let header = div()
+            .id("todo-panel")
+            .debug_selector(|| "todo-panel".into())
+            .flex_1()
+            .min_w_0()
+            .flex()
+            .items_center()
+            .gap_2()
+            .cursor_pointer()
+            .child(disclosure_icon(
+                open,
+                colors.text_muted,
+                (&ui_font(), px(12.)),
+                cx,
+            ))
+            .child(
+                div()
+                    .flex_shrink_0()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child(format!("Tasks {completed}/{}", list.todos.len())),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .text_color(colors.text_muted)
+                    .when(!open, |this| this.child(current)),
+            )
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.todos_open = !this.todos_open;
+                cx.notify();
+            }));
         Some(
             div()
                 .flex()
@@ -426,38 +461,30 @@ impl ConversationView {
                 .border_color(colors.border)
                 .bg(colors.surface)
                 .text_size(px(12.))
-                .child(
-                    div()
-                        .id("todo-panel")
-                        .debug_selector(|| "todo-panel".into())
-                        .flex()
-                        .items_center()
-                        .gap_2()
-                        .cursor_pointer()
-                        .child(disclosure_icon(
-                            open,
-                            colors.text_muted,
-                            (&ui_font(), px(12.)),
-                            cx,
-                        ))
-                        .child(div().font_weight(FontWeight::SEMIBOLD).child(format!(
-                            "Tasks {}/{}",
-                            list.completed(),
-                            list.todos.len()
-                        )))
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w_0()
-                                .truncate()
-                                .text_color(colors.text_muted)
-                                .when(!open, |this| this.child(current)),
+                .child(div().flex().items_center().gap_2().child(header).when(
+                    completed == list.todos.len(),
+                    |this| {
+                        let call_id = call_id.to_owned();
+                        this.child(
+                            icon_button(
+                                "hide-completed-tasks",
+                                ICON_CLOSE,
+                                "Hide completed tasks",
+                                cx,
+                            )
+                            .debug_selector(|| "hide-completed-tasks".into())
+                            .flex_shrink_0()
+                            .aria_label("Hide completed tasks")
+                            .on_click(cx.listener(
+                                move |this, _, _, cx| {
+                                    this.dismissed_todo_calls.insert(call_id.clone());
+                                    this.todos_open = false;
+                                    cx.notify();
+                                },
+                            )),
                         )
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.todos_open = !this.todos_open;
-                            cx.notify();
-                        })),
-                )
+                    },
+                ))
                 .when(open, |this| {
                     this.children(list.todos.iter().map(|item| todo_row(item, cx)))
                 })
