@@ -25,6 +25,8 @@ jobs:
       - uses: actions/checkout@v4
       - id: version
         run: python3 scripts/release.py --validate >> "$GITHUB_OUTPUT"
+      - name: Test release scripts
+        run: python3 scripts/test_release.py
       - name: Require update verification key
         run: test -n "$ZP_UPDATE_PUBLIC_KEY"
 
@@ -92,22 +94,33 @@ jobs:
 
   linux:
     needs: validate
-    runs-on: ubuntu-22.04
+    strategy:
+      matrix:
+        include:
+          - runner: ubuntu-22.04
+            arch: x86_64
+          - runner: ubuntu-22.04-arm
+            arch: aarch64
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - name: Dependencies
+        env:
+          APPIMAGETOOL_ARCH: ${{ matrix.arch }}
         run: |
           sudo apt-get update
           sudo apt-get install -y libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libvulkan-dev \
             libx11-xcb-dev libxcb1-dev libfontconfig-dev libdbus-1-dev libsecret-1-dev libfuse2
           sudo curl -fsSL -o /usr/local/bin/appimagetool \
-            https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
+            "https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-$APPIMAGETOOL_ARCH.AppImage"
           sudo chmod +x /usr/local/bin/appimagetool
       - run: scripts/package-linux.sh
+        env:
+          APPIMAGE_EXTRACT_AND_RUN: '1'
       - uses: actions/upload-artifact@v4
         with:
-          name: linux
+          name: linux-${{ matrix.arch }}
           if-no-files-found: error
           path: |
             dist/*.AppImage
@@ -155,13 +168,16 @@ jobs:
           gh release create "$RELEASE_TAG" --verify-tag --draft --generate-notes \
             --title "ZP $RELEASE_VERSION" --prerelease="$RELEASE_PRERELEASE" --latest=false
           gh release view "$RELEASE_TAG" --json body --jq .body > "$RUNNER_TEMP/release-notes.md"
-      - name: Sign update manifest
+      - name: Sign update manifest and prepare download links
         env:
           ZP_UPDATE_PRIVATE_KEY: ${{ secrets.ZP_UPDATE_PRIVATE_KEY }}
-        run: ZP_RELEASE_NOTES_FILE="$RUNNER_TEMP/release-notes.md" scripts/release.sh
+        run: |
+          ZP_RELEASE_NOTES_FILE="$RUNNER_TEMP/release-notes.md" scripts/release.sh \
+            --notes-output "$RUNNER_TEMP/published-release-notes.md"
       - name: Upload all assets and publish
         run: |
           gh release upload "$RELEASE_TAG" dist/*
           latest=true
           if [ "$RELEASE_PRERELEASE" = true ]; then latest=false; fi
-          gh release edit "$RELEASE_TAG" --draft=false --prerelease="$RELEASE_PRERELEASE" --latest="$latest"
+          gh release edit "$RELEASE_TAG" --draft=false --prerelease="$RELEASE_PRERELEASE" \
+            --latest="$latest" --notes-file "$RUNNER_TEMP/published-release-notes.md"

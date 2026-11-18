@@ -1,4 +1,4 @@
-"""Offline checks for release tags, package manifests and Ed25519 signatures."""
+"""Offline checks for release tags, package manifests, download links and signatures."""
 
 from contextlib import contextmanager
 import base64
@@ -43,8 +43,16 @@ class ReleaseTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             directory = Path(directory)
             names = [f"ZP-{version}-darwin-{arch}.{extension}" for arch in ["aarch64", "x86_64"] for extension in ["zip", "dmg"]]
-            names.extend([f"ZP-{version}-linux-x86_64.AppImage", f"ZP-{version}-linux-x86_64.tar.gz",
-                          f"zp_{version}_amd64.deb", f"ZP-{version}-windows-x86_64-setup.exe", f"ZP-{version}-windows-x86_64.zip"])
+            for arch, debarch in [("x86_64", "amd64"), ("aarch64", "arm64")]:
+                names.extend([
+                    f"ZP-{version}-linux-{arch}.AppImage",
+                    f"ZP-{version}-linux-{arch}.tar.gz",
+                    f"zp_{version}_{debarch}.deb",
+                ])
+            names.extend([
+                f"ZP-{version}-windows-x86_64-setup.exe",
+                f"ZP-{version}-windows-x86_64.zip",
+            ])
             for name in names:
                 (directory / name).write_bytes(b"package")
             with patch.dict(os.environ, {"ZP_RELEASE_NOTES": 'A "quoted" note\nwith a newline', "ZP_RELEASE_NOTES_FILE": ""}):
@@ -55,10 +63,54 @@ class ReleaseTests(unittest.TestCase):
                     self.assertEqual(package["size"], 7)
                     self.assertEqual(len(package["sha256"]), 64)
                     self.assertIn(f"/v{version}/", package["url"])
-            self.assertEqual(manifest["platforms"]["linux-x86_64"][2]["name"], f"zp_{version}_amd64.deb")
-            (directory / names[0]).unlink()
-            with self.assertRaises(ValueError):
-                release.generate(directory, version, "preview")
+            for arch, debarch in [("x86_64", "amd64"), ("aarch64", "arm64")]:
+                self.assertEqual(
+                    {package["kind"]: package["name"] for package in manifest["platforms"][f"linux-{arch}"]},
+                    {
+                        "archive": f"ZP-{version}-linux-{arch}.tar.gz",
+                        "app-image": f"ZP-{version}-linux-{arch}.AppImage",
+                        "deb": f"zp_{version}_{debarch}.deb",
+                    },
+                )
+            for name in [names[0], f"zp_{version}_arm64.deb", f"ZP-{version}-darwin-aarch64.dmg"]:
+                with self.subTest(missing=name):
+                    (directory / name).unlink()
+                    with self.assertRaisesRegex(ValueError, "Missing or empty release artifact"):
+                        release.generate(directory, version, "preview")
+                    (directory / name).write_bytes(b"package")
+
+    def test_downloads_follow_the_original_release_notes(self):
+        version = "0.3.0-rc.1"
+        original = "## What's Changed\n\n- Example change\n"
+        notes = release.notes_with_downloads(original, version)
+        self.assertTrue(notes.startswith(original + "\n#### Downloads\n"))
+        self.assertEqual(
+            [line for line in notes.splitlines() if line.startswith("##### ")],
+            ["##### macOS", "##### Linux", "##### Windows"],
+        )
+        expected = [
+            ("ARM", f"ZP-{version}-darwin-aarch64.dmg"),
+            ("x86_64", f"ZP-{version}-darwin-x86_64.dmg"),
+            ("x86_64", f"ZP-{version}-linux-x86_64.tar.gz"),
+            ("x86_64 AppImage", f"ZP-{version}-linux-x86_64.AppImage"),
+            ("x86_64 deb", f"zp_{version}_amd64.deb"),
+            ("ARM64", f"ZP-{version}-linux-aarch64.tar.gz"),
+            ("ARM64 AppImage", f"ZP-{version}-linux-aarch64.AppImage"),
+            ("ARM64 deb", f"zp_{version}_arm64.deb"),
+            ("x86_64", f"ZP-{version}-windows-x86_64.zip"),
+            ("x86_64 Setup", f"ZP-{version}-windows-x86_64-setup.exe"),
+        ]
+        downloads = notes.split("#### Downloads\n", 1)[1]
+        links = [
+            f"- {label}: [{name}](https://github.com/arsfy/zp/releases/download/v{version}/{name})"
+            for label, name in expected
+        ]
+        self.assertEqual(
+            [line for line in downloads.splitlines() if line.startswith("- ")],
+            links,
+        )
+        self.assertTrue(notes.endswith(links[-1] + "\n"))
+        self.assertTrue(release.notes_with_downloads("", version).startswith("#### Downloads\n"))
 
     def test_signature_matches_embedded_public_key(self):
         with tempfile.TemporaryDirectory() as directory:

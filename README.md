@@ -42,6 +42,9 @@ Run the `-setup.exe` installer, or extract the portable `.zip` anywhere and run 
 
 ### Linux
 
+Use the `aarch64` assets on ARM64 or the `x86_64` assets on Intel and AMD systems.
+The corresponding Debian packages use `arm64` and `amd64` in their filenames.
+
 ```sh
 # AppImage
 chmod +x ZP-<version>-linux-x86_64.AppImage

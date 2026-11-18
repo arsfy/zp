@@ -38,10 +38,13 @@ releases.
 ## Publication
 
 The workflow validates the tag, builds all platforms, and prepares a draft release
-with generated notes. It then
-generates `release.json`, signs its exact bytes as `release.json.sig`, uploads all
-packages, and publishes the draft. The manifest contains the version, channel,
-notes, platform and package type, filenames, sizes, URLs and SHA-256 hashes.
+with generated notes. Linux builds run natively on x86_64 and ARM64 and each
+produces a tarball, an AppImage, and a Debian package.
+
+The workflow generates `release.json`, signs its exact bytes as `release.json.sig`,
+and uploads all packages. It publishes the draft with a Downloads section after
+the generated notes. The signed manifest contains the original notes, version,
+channel, package types, filenames, sizes, URLs and SHA-256 hashes.
 
 An incomplete draft stays hidden from update discovery. Before retrying a failed
 publish job, inspect and remove its unpublished draft; published releases must

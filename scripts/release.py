@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Validate release tags and generate the signed updater manifest."""
+"""Validate release tags, sign the updater manifest and prepare release notes."""
 
 import argparse
 import base64
@@ -26,33 +26,75 @@ def release_version():
     return version, "preview" if "-" in version else "stable"
 
 
+def release_base_url(version):
+    return f"https://github.com/arsfy/zp/releases/download/v{version}"
+
+
+def release_packages(version):
+    """Group packages by OS, with their updater kind and optional download label."""
+    macos = []
+    for arch, label in [("aarch64", "ARM"), ("x86_64", "x86_64")]:
+        platform = f"darwin-{arch}"
+        stem = f"ZP-{version}-{platform}"
+        macos.extend([
+            (platform, "mac-app", f"{stem}.zip", None),
+            (platform, None, f"{stem}.dmg", label),
+        ])
+
+    linux = []
+    for arch, debarch, label in [("x86_64", "amd64", "x86_64"), ("aarch64", "arm64", "ARM64")]:
+        platform = f"linux-{arch}"
+        stem = f"ZP-{version}-{platform}"
+        linux.extend([
+            (platform, "archive", f"{stem}.tar.gz", label),
+            (platform, "app-image", f"{stem}.AppImage", f"{label} AppImage"),
+            # GitHub would rename `~`, so it stays inside the package metadata.
+            (platform, "deb", f"zp_{version}_{debarch}.deb", f"{label} deb"),
+        ])
+
+    windows = f"ZP-{version}-windows-x86_64"
+    return {
+        "macOS": macos,
+        "Linux": linux,
+        "Windows": [
+            ("windows-x86_64", "windows-portable", f"{windows}.zip", "x86_64"),
+            ("windows-x86_64", "windows-installer", f"{windows}-setup.exe", "x86_64 Setup"),
+        ],
+    }
+
+
+def notes_with_downloads(notes, version):
+    base = release_base_url(version)
+    lines = ["#### Downloads"]
+    for os_name, packages in release_packages(version).items():
+        lines.extend(["", f"##### {os_name}", ""])
+        lines.extend(
+            f"- {label}: [{name}]({base}/{name})"
+            for _, _, name, label in packages
+            if label is not None
+        )
+    downloads = "\n".join(lines) + "\n"
+    notes = notes.rstrip("\n")
+    return f"{notes}\n\n{downloads}" if notes.strip() else downloads
+
+
 def generate(directory, version, channel):
-    base = f"https://github.com/arsfy/zp/releases/download/v{version}"
+    base = release_base_url(version)
     platforms = {}
 
-    def add(platform, kind, name):
-        path = directory / name
-        if not path.is_file() or not path.stat().st_size:
-            raise ValueError(f"Missing or empty release artifact: {name}")
-        digest = hashlib.sha256()
-        with path.open("rb") as artifact:
-            for chunk in iter(lambda: artifact.read(1024 * 1024), b""):
-                digest.update(chunk)
-        platforms.setdefault(platform, []).append({
-            "name": name, "kind": kind, "url": f"{base}/{name}",
-            "size": path.stat().st_size, "sha256": digest.hexdigest(),
-        })
-
-    for arch in ["aarch64", "x86_64"]:
-        add(f"darwin-{arch}", "mac-app", f"ZP-{version}-darwin-{arch}.zip")
-        if not (directory / f"ZP-{version}-darwin-{arch}.dmg").is_file():
-            raise ValueError(f"Missing macOS {arch} DMG")
-    add("linux-x86_64", "app-image", f"ZP-{version}-linux-x86_64.AppImage")
-    add("linux-x86_64", "archive", f"ZP-{version}-linux-x86_64.tar.gz")
-    # Debian's `~` stays inside the package: GitHub would rename it in an asset name.
-    add("linux-x86_64", "deb", f"zp_{version}_amd64.deb")
-    add("windows-x86_64", "windows-installer", f"ZP-{version}-windows-x86_64-setup.exe")
-    add("windows-x86_64", "windows-portable", f"ZP-{version}-windows-x86_64.zip")
+    for packages in release_packages(version).values():
+        for platform, kind, name, _ in packages:
+            path = directory / name
+            if not path.is_file() or not (size := path.stat().st_size):
+                raise ValueError(f"Missing or empty release artifact: {name}")
+            if kind is None:
+                continue
+            with path.open("rb") as artifact:
+                digest = hashlib.file_digest(artifact, "sha256").hexdigest()
+            platforms.setdefault(platform, []).append({
+                "name": name, "kind": kind, "url": f"{base}/{name}",
+                "size": size, "sha256": digest,
+            })
     notes_file = os.environ.get("ZP_RELEASE_NOTES_FILE")
     notes = Path(notes_file).read_text() if notes_file else os.environ.get("ZP_RELEASE_NOTES", "")
     return {
@@ -85,6 +127,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--validate", action="store_true")
     parser.add_argument("--dist", default="dist")
+    parser.add_argument("--notes-output", type=Path, help="write release notes with download links")
     args = parser.parse_args()
     version, channel = release_version()
     if args.validate:
@@ -92,8 +135,11 @@ def main():
         return
     directory = Path(args.dist)
     manifest = directory / "release.json"
-    manifest.write_text(json.dumps(generate(directory, version, channel), indent=2) + "\n")
+    release = generate(directory, version, channel)
+    manifest.write_text(json.dumps(release, indent=2) + "\n")
     sign(manifest)
+    if args.notes_output:
+        args.notes_output.write_text(notes_with_downloads(release["notes"], version))
     print(f"Signed release manifest for ZP {version} ({channel})")
 
 
