@@ -197,6 +197,48 @@ pub fn button(
         .on_click(on_click)
 }
 
+/// A checkbox whose selected state is supplied by the caller.
+pub fn checkbox(id: &'static str, label: &str, checked: bool, cx: &App) -> Stateful<Div> {
+    use gpui::accesskit::{Role, Toggled};
+
+    let colors = &cx.theme().colors;
+    div()
+        .id(id)
+        .role(Role::CheckBox)
+        .aria_label(label.to_owned())
+        .aria_toggled(if checked {
+            Toggled::True
+        } else {
+            Toggled::False
+        })
+        .flex()
+        .items_center()
+        .gap_2()
+        .cursor_pointer()
+        .child(
+            div()
+                .size(px(14.))
+                .flex_shrink_0()
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded(px(3.))
+                .border_1()
+                .border_color(if checked {
+                    colors.accent
+                } else {
+                    colors.text_muted
+                })
+                .when(checked, |this| {
+                    this.bg(colors.accent)
+                        .text_color(colors.accent_text)
+                        .text_size(px(10.))
+                        .child("✓")
+                }),
+        )
+        .child(label.to_owned())
+}
+
 /// An uppercase section caption.
 pub fn section_header(label: impl Into<SharedString>, cx: &App) -> Div {
     div()

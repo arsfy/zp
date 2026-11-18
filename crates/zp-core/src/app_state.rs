@@ -1,7 +1,7 @@
 //! Persisted UI state (`~/.zp/state.json`): recent projects, which project windows were
 //! open, and each project's window geometry and panel layout.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, Result};
@@ -103,6 +103,9 @@ pub struct ProjectUiState {
     /// Open conversation tabs, in order.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub tabs: Vec<TabState>,
+    /// Session IDs hidden from this project's sidebar.
+    #[serde(skip_serializing_if = "BTreeSet::is_empty")]
+    pub hidden_sessions: BTreeSet<String>,
     /// Index of the active tab.
     pub active_tab: usize,
     /// Whether the user trusts the project; `None` until asked.

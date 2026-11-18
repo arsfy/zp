@@ -886,7 +886,9 @@ impl SettingsWindow {
     /// The dialog over the settings window, if open.
     pub(super) fn render_provider_dialog(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let dialog = self.dialog.as_ref()?;
-        let colors = cx.theme().colors.clone();
+        let theme = cx.theme();
+        let colors = theme.colors.clone();
+        let font_size = theme.metrics.font_size;
         let content = match dialog {
             ProviderDialog::Choose { filter } => self.render_choose(filter, cx),
             ProviderDialog::Key {
@@ -947,6 +949,7 @@ impl SettingsWindow {
                         .border_color(colors.border)
                         .bg(colors.surface)
                         .shadow_lg()
+                        .text_size(font_size)
                         // Fields scroll; a form's buttons stay in view.
                         .child(body)
                         .children(footer),
@@ -956,22 +959,22 @@ impl SettingsWindow {
     }
 
     fn dialog_title(title: String, subtitle: &str, cx: &App) -> impl IntoElement {
-        let colors = &cx.theme().colors;
+        let theme = cx.theme();
         div()
             .flex()
             .flex_col()
             .gap_0p5()
             .child(
                 div()
-                    .text_size(px(16.))
+                    .text_size(theme.metrics.dialog_title_size())
                     .font_weight(FontWeight::SEMIBOLD)
                     .child(title),
             )
             .when(!subtitle.is_empty(), |this| {
                 this.child(
                     div()
-                        .text_size(px(12.))
-                        .text_color(colors.text_muted)
+                        .text_size(theme.metrics.dialog_detail_size())
+                        .text_color(theme.colors.text_muted)
                         .child(subtitle.to_owned()),
                 )
             })

@@ -61,7 +61,6 @@ impl UpdateDialog {
             .py_1p5()
             .rounded(px(6.))
             .cursor_pointer()
-            .text_size(px(13.))
             .border_1()
             .when(primary, |this| {
                 this.bg(colors.accent)
@@ -92,7 +91,11 @@ impl Focusable for UpdateDialog {
 
 impl Render for UpdateDialog {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let colors = cx.theme().colors.clone();
+        let theme = cx.theme();
+        let colors = theme.colors.clone();
+        let font_size = theme.metrics.font_size;
+        let title_size = theme.metrics.dialog_title_size();
+        let detail_size = theme.metrics.dialog_detail_size();
         let accent = match self.level {
             PromptLevel::Info => None,
             PromptLevel::Warning => Some(colors.warning),
@@ -144,6 +147,7 @@ impl Render for UpdateDialog {
                     .bg(colors.surface)
                     .shadow_lg()
                     .text_color(colors.text)
+                    .text_size(font_size)
                     .child(
                         div()
                             .flex()
@@ -161,7 +165,7 @@ impl Render for UpdateDialog {
                                     .gap_2()
                                     .child(
                                         div()
-                                            .text_size(px(16.))
+                                            .text_size(title_size)
                                             .font_weight(gpui::FontWeight::SEMIBOLD)
                                             .when_some(accent, |this, color| this.text_color(color))
                                             .child(self.title.clone()),
@@ -172,11 +176,9 @@ impl Render for UpdateDialog {
                                                 .flex()
                                                 .flex_col()
                                                 .gap_0p5()
-                                                .text_size(px(13.))
-                                                .text_color(if index == 0 {
-                                                    colors.text
-                                                } else {
-                                                    colors.text_muted
+                                                .when(index > 0, |this| {
+                                                    this.text_size(detail_size)
+                                                        .text_color(colors.text_muted)
                                                 })
                                                 .children(
                                                     paragraph

@@ -10,9 +10,9 @@ use gpui::{
 use gpui_elements::editable_text::{EditableTextState, text_input};
 use zp_session::{Session, SessionInfo};
 
-use super::{ProjectWindow, RenameTarget, session_manager};
+use super::{ProjectWindow, RenameTarget, session_delete_dialog, session_manager};
 use crate::context_menu::ContextMenu;
-use crate::store::{AppPaths, FileTrash};
+use crate::store::{AppPaths, AppStore, FileTrash};
 use crate::theme::ActiveTheme;
 use crate::ui::{CUSTOM_TITLE_BAR, relative_time};
 
@@ -106,14 +106,16 @@ impl ProjectWindow {
         }));
     }
 
-    /// Listed sessions matching the search, most recent first.
+    /// Unhidden sessions matching the search, most recent first.
     pub(crate) fn visible_sessions(&self, cx: &App) -> Vec<SessionInfo> {
         let SessionList::Loaded(sessions) = &self.sidebar.sessions else {
             return Vec::new();
         };
         let query = self.sidebar.search.read(cx).as_str().trim().to_owned();
+        let project = AppStore::state(cx).projects.get(&self.root);
         sessions
             .iter()
+            .filter(|info| project.is_none_or(|state| !state.hidden_sessions.contains(&info.id)))
             .filter(|info| info.matches(&query))
             .cloned()
             .collect()
@@ -165,13 +167,13 @@ impl ProjectWindow {
     }
 
     pub(crate) fn open_selected_session(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let selected = self.sidebar.selected.clone().or_else(|| {
-            self.visible_sessions(cx)
-                .first()
-                .map(|info| info.path.clone())
-        });
-        if let Some(path) = selected {
-            self.open_session_file(&path, false, window, cx);
+        let sessions = self.visible_sessions(cx);
+        let selected = sessions
+            .iter()
+            .find(|info| self.sidebar.selected.as_ref() == Some(&info.path))
+            .or_else(|| sessions.first());
+        if let Some(info) = selected {
+            self.open_session_file(&info.path, false, window, cx);
         }
     }
 
@@ -201,16 +203,12 @@ impl ProjectWindow {
         let this = cx.entity().downgrade();
         let path = info.path.clone();
         let title = info.title().to_owned();
+        let deletion = info.clone();
         let menu = ContextMenu::new(window, cx, |menu| {
             let (open, rename, duplicate, delete) =
                 (this.clone(), this.clone(), this.clone(), this.clone());
-            let (open_path, rename_path, duplicate_path, delete_path, reveal_path) = (
-                path.clone(),
-                path.clone(),
-                path.clone(),
-                path.clone(),
-                path.clone(),
-            );
+            let (open_path, rename_path, duplicate_path, reveal_path) =
+                (path.clone(), path.clone(), path.clone(), path.clone());
             menu.item("Open in New Tab", move |window, cx| {
                 let _ = open.update(cx, |this, cx| {
                     this.open_session_file(&open_path, false, window, cx)
@@ -231,7 +229,9 @@ impl ProjectWindow {
             .item(reveal_label(), move |_, cx| cx.reveal_path(&reveal_path))
             .separator()
             .destructive_item("Delete", move |window, cx| {
-                let _ = delete.update(cx, |this, cx| this.delete_session(&delete_path, window, cx));
+                let _ = delete.update(cx, |this, cx| {
+                    this.confirm_delete_session(&deletion, window, cx)
+                });
             })
         });
         self.show_menu(menu, position, cx);
@@ -269,29 +269,68 @@ impl ProjectWindow {
         }
     }
 
-    /// Moves a session file to the trash (closing its tab).
-    pub(crate) fn delete_session(
+    fn confirm_delete_session(
         &mut self,
-        path: &Path,
+        info: &SessionInfo,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if let Some(index) = self.tab_for_file(path, cx) {
-            if self.tabs[index].conversation.read(cx).is_running() {
-                crate::workspace::report_error(
-                    "Could not delete",
-                    &anyhow::anyhow!("the session is running; stop it first"),
-                    cx,
-                );
+        self.focus_active(window, cx);
+        let answer = session_delete_dialog::show(info.title(), window, cx);
+        let id = info.id.clone();
+        let path = info.path.clone();
+        cx.spawn_in(window, async move |this, cx| {
+            let Some(decision) = answer.await else {
                 return;
-            }
-            self.close_tab(index, window, cx);
+            };
+            let _ = this.update_in(cx, |this, window, cx| match decision {
+                session_delete_dialog::Decision::Hide => this.hide_session(&id, &path, cx),
+                session_delete_dialog::Decision::Trash => this.trash_session(&path, window, cx),
+            });
+        })
+        .detach();
+    }
+
+    fn hide_session(&mut self, id: &str, path: &Path, cx: &mut Context<Self>) {
+        let inserted = AppStore::update(cx, |state| {
+            state
+                .project_mut(&self.root)
+                .hidden_sessions
+                .insert(id.to_owned())
+        });
+        if inserted && let Err(error) = AppStore::try_flush(cx) {
+            AppStore::update(cx, |state| {
+                state.project_mut(&self.root).hidden_sessions.remove(id);
+            });
+            crate::workspace::report_error("Could not hide the session", &error, cx);
+            return;
+        }
+        if self.sidebar.selected.as_deref() == Some(path) {
+            self.sidebar.selected = None;
+        }
+        cx.notify();
+    }
+
+    /// Moves a session file to the trash and closes its tab on success.
+    fn trash_session(&mut self, path: &Path, window: &mut Window, cx: &mut Context<Self>) {
+        let tab = self.tab_for_file(path, cx);
+        if tab.is_some_and(|index| self.tabs[index].conversation.read(cx).is_busy()) {
+            crate::workspace::report_error(
+                "Could not move the session to Trash",
+                &anyhow::anyhow!("the session is busy; stop it or wait for it to finish"),
+                cx,
+            );
+            return;
         }
         let trash = cx
             .try_global::<FileTrash>()
             .map_or(FileTrash::system().0, |t| t.0);
         if let Err(error) = trash(path) {
-            crate::workspace::report_error("Could not delete", &error, cx);
+            crate::workspace::report_error("Could not move the session to Trash", &error, cx);
+            return;
+        }
+        if let Some(index) = tab {
+            self.close_tab(index, window, cx);
         }
         if self.sidebar.selected.as_deref() == Some(path) {
             self.sidebar.selected = None;
@@ -323,7 +362,14 @@ impl ProjectWindow {
             SessionList::Loaded(_) => {
                 let sessions = self.visible_sessions(cx);
                 if sessions.is_empty() {
-                    muted("No matching sessions", cx)
+                    muted(
+                        if searching {
+                            "No matching sessions"
+                        } else {
+                            "No sessions yet"
+                        },
+                        cx,
+                    )
                 } else {
                     let mut list = div()
                         .id("sessions")

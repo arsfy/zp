@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use gpui::{Entity, TestAppContext, WindowHandle, point, px};
+use gpui::{Entity, Modifiers, TestAppContext, VisualTestContext, WindowHandle, point, px};
 use serde_json::json;
 use tempfile::TempDir;
 use zp_agent::AgentMessage;
@@ -687,7 +687,7 @@ fn sidebar_preview_open_search_and_menu(cx: &mut TestAppContext) {
     assert_eq!(Session::open(&first).unwrap().name(), Some("Parser v2"));
     assert!(titles_of(window, cx).contains(&"Parser v2".to_owned()));
 
-    // Duplicate opens a fork; Delete closes its tab and removes the file.
+    // Duplicate opens a fork and refreshes the sidebar.
     window
         .update(cx, |view, window, cx| {
             view.duplicate_session(&first, window, cx)
@@ -700,18 +700,109 @@ fn sidebar_preview_open_search_and_menu(cx: &mut TestAppContext) {
         .unwrap();
     assert_ne!(fork, first);
     assert_eq!(Session::open(&fork).unwrap().context().messages.len(), 2);
-    window
-        .update(cx, |view, window, cx| {
-            view.delete_session(&second, window, cx)
-        })
-        .unwrap();
-    cx.run_until_parked();
-    assert!(!second.exists());
-    assert_eq!(tab_count(window, cx), 3);
     let listed = window
         .update(cx, |view, _, cx| view.visible_sessions(cx).len())
         .unwrap();
-    assert_eq!(listed, 2, "the deleted one is gone, the fork is listed");
+    assert_eq!(listed, 3, "the fork is listed");
+}
+
+#[gpui::test]
+fn sidebar_delete_hides_by_default_and_trashes_only_when_checked(cx: &mut TestAppContext) {
+    let faux = FauxProvider::default();
+    let data = setup_models(cx, &[&faux], false);
+    let (_dir, project) = project_dir();
+    let hidden = write_session(&data, &project, "keep this history");
+    let trashed = write_session(&data, &project, "remove this history");
+    let window = open(cx, &project);
+    let sessions = |window: WindowHandle<ProjectWindow>, cx: &mut TestAppContext| {
+        window
+            .update(cx, |view, _, cx| view.visible_sessions(cx))
+            .unwrap()
+    };
+    let request_delete = |path: &Path, cx: &mut TestAppContext| {
+        let info = sessions(window, cx)
+            .into_iter()
+            .find(|info| info.path == path)
+            .unwrap();
+        let menu = window
+            .update(cx, |view, window, cx| {
+                view.session_menu(&info, point(px(10.), px(10.)), window, cx);
+                view.context_menu().unwrap()
+            })
+            .unwrap();
+        let delete = menu.read_with(cx, |menu, _| menu.handler("Delete"));
+        gpui::AnyWindowHandle::from(window)
+            .update(cx, |_, window, cx| delete(window, cx))
+            .unwrap();
+        cx.run_until_parked();
+    };
+    let click = |selector, cx: &mut TestAppContext| {
+        let mut visual = VisualTestContext::from_window(window.into(), cx);
+        let bounds = visual.debug_bounds(selector).unwrap();
+        visual.simulate_click(bounds.center(), Modifiers::none());
+        cx.run_until_parked();
+    };
+    let open_tab = |path: &Path, cx: &mut TestAppContext| {
+        window
+            .update(cx, |view, window, cx| {
+                view.open_session_file(path, false, window, cx)
+            })
+            .unwrap();
+    };
+
+    open_tab(&hidden, cx);
+    let original = std::fs::read(&hidden).unwrap();
+    request_delete(&hidden, cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    let title = visual.debug_bounds("delete-session-title").unwrap();
+    let checkbox = visual.debug_bounds("delete-session-file").unwrap();
+    assert!(
+        checkbox.size.height < title.size.height,
+        "the checkbox label should use body text sizing"
+    );
+    click("delete-session-file", cx);
+    click("cancel-session-delete", cx);
+    assert_eq!(sessions(window, cx).len(), 2);
+    assert!(hidden.exists());
+
+    request_delete(&hidden, cx);
+    click("confirm-session-delete", cx);
+    assert_eq!(
+        active(window, cx).read_with(cx, |view, _| view.session_file()),
+        Some(hidden.clone())
+    );
+    assert!(
+        std::fs::read(&hidden).unwrap() == original,
+        "hiding must leave the history file byte-for-byte intact"
+    );
+    let listed = sessions(window, cx);
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].path, trashed);
+    let state_path = zp_core::paths::state_file(data.path());
+    let state = zp_core::app_state::AppState::load(&state_path);
+    let id = Session::open(&hidden).unwrap().id().to_owned();
+    assert!(state.project(&project).hidden_sessions.contains(&id));
+
+    open_tab(&trashed, cx);
+    request_delete(&trashed, cx);
+    click("delete-session-file", cx);
+    click("confirm-session-delete", cx);
+    assert!(!trashed.exists());
+    assert_eq!(tab_count(window, cx), 2, "the trashed session's tab closed");
+    assert!(sessions(window, cx).is_empty());
+
+    window
+        .update(cx, |_, window, _| window.remove_window())
+        .unwrap();
+    cx.run_until_parked();
+    cx.update(|cx| AppStore::init(Some(state_path), cx));
+    let window = open(cx, &project);
+    assert!(sessions(window, cx).is_empty());
+    let manager = SessionManager::new(zp_core::paths::sessions_dir(data.path()));
+    let history = manager.list(&project).unwrap();
+    assert_eq!(history.len(), 1);
+    assert_eq!(history[0].path, hidden);
+    assert_eq!(history[0].message_count, 2);
 }
 
 #[gpui::test]

@@ -94,7 +94,9 @@ impl ReviewModelPicker {
 
 impl Render for ReviewModelPicker {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let colors = cx.theme().colors.clone();
+        let theme = cx.theme();
+        let colors = theme.colors.clone();
+        let font_size = theme.metrics.font_size;
         let choices = self.choices(cx);
         let empty = choices.is_empty();
         let no_providers = cx
@@ -152,6 +154,7 @@ impl Render for ReviewModelPicker {
                     .border_color(colors.border)
                     .bg(colors.surface)
                     .shadow_lg()
+                    .text_size(font_size)
                     .child(div().flex_shrink_0().child("Review model"))
                     .child(
                         text_input("review-model-filter")

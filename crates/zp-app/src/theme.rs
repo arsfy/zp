@@ -50,6 +50,18 @@ pub struct ThemeMetrics {
     pub mono_font: SharedString,
 }
 
+impl ThemeMetrics {
+    /// Text size for dialog headings.
+    pub fn dialog_title_size(&self) -> Pixels {
+        self.font_size + px(2.)
+    }
+
+    /// Text size for supporting details in dialogs.
+    pub fn dialog_detail_size(&self) -> Pixels {
+        self.font_size - px(1.)
+    }
+}
+
 /// The active UI theme.
 #[derive(Clone, Debug)]
 pub struct Theme {

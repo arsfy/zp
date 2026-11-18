@@ -1,6 +1,7 @@
 //! The window of one project: sessions sidebar, conversation tabs, changes panel and
 //! status bar.
 
+mod session_delete_dialog;
 mod sidebar;
 mod tabs;
 mod terminal_panel;

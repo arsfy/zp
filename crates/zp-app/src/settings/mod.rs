@@ -21,7 +21,7 @@ use zp_core::settings::{BlockDisplay, ThemeChoice, TranscriptSettings};
 use crate::review_model_picker::{ReviewModelEvent, ReviewModelPicker};
 use crate::store::{AppModels, AppSettings};
 use crate::theme::ActiveTheme;
-use crate::ui::{CUSTOM_TITLE_BAR, title_bar};
+use crate::ui::{CUSTOM_TITLE_BAR, checkbox, title_bar};
 
 #[cfg(test)]
 pub use providers::EndpointTest;
@@ -982,37 +982,6 @@ fn radio(
                     .child(description.to_owned()),
             ),
         )
-}
-
-fn checkbox(id: &'static str, label: &str, checked: bool, cx: &App) -> gpui::Stateful<gpui::Div> {
-    let colors = cx.theme().colors.clone();
-    div()
-        .id(id)
-        .flex()
-        .items_center()
-        .gap_2()
-        .cursor_pointer()
-        .child(
-            div()
-                .size(px(14.))
-                .flex()
-                .items_center()
-                .justify_center()
-                .rounded(px(3.))
-                .border_1()
-                .border_color(if checked {
-                    colors.accent
-                } else {
-                    colors.text_muted
-                })
-                .when(checked, |this| {
-                    this.bg(colors.accent)
-                        .text_color(colors.accent_text)
-                        .text_size(px(10.))
-                        .child("✓")
-                }),
-        )
-        .child(label.to_owned())
 }
 
 fn segmented(
