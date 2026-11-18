@@ -65,6 +65,10 @@ pub struct UpstreamModel {
     /// Pricing per million tokens.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cost: Option<ModelCost>,
+    /// Routes the model is served on, relative to the provider's base URL, e.g.
+    /// `/chat/completions`, `/responses`, `/messages` (gateways such as Command Code).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoints: Option<Vec<String>>,
 }
 
 impl UpstreamModel {
@@ -255,6 +259,8 @@ fn parse_openai_entry(entry: &Value) -> Option<UpstreamModel> {
     model.text_output = strings(architecture.and_then(|a| a.get("output_modalities")))
         .map(|output| output.iter().any(|m| m == "text"));
 
+    model.endpoints = strings(field("supported_endpoints")).filter(|e| !e.is_empty());
+
     if let Some(parameters) = strings(field("supported_parameters")) {
         let has = |name: &str| parameters.iter().any(|p| p == name);
         model.tools = Some(has("tools"));
@@ -358,7 +364,8 @@ mod tests {
                     "pricing": {"prompt": "0.0000005", "completion": "0.000002", "input_cache_read": "0.00000005"},
                     "supported_parameters": ["tools", "reasoning", "max_tokens"]
                 },
-                {"id": "openrouter/auto", "pricing": {"prompt": "-1", "completion": "-1"}, "supported_parameters": ["max_tokens"]}
+                {"id": "openrouter/auto", "pricing": {"prompt": "-1", "completion": "-1"}, "supported_parameters": ["max_tokens"]},
+                {"id": "claude-x", "context_length": 1000000, "supported_endpoints": ["/messages"]}
             ]
         }));
         let ids: Vec<_> = models.iter().map(|m| m.id.as_str()).collect();
@@ -368,8 +375,14 @@ mod tests {
                 "plain",
                 "groq-model",
                 "vendor/router-model",
-                "openrouter/auto"
+                "openrouter/auto",
+                "claude-x"
             ]
+        );
+        assert_eq!(models[0].endpoints, None);
+        assert_eq!(
+            models[4].endpoints.as_deref(),
+            Some(&["/messages".to_owned()][..])
         );
         assert_eq!(models[1].context_window, Some(131_072));
         assert_eq!(models[1].max_tokens, Some(32_768));

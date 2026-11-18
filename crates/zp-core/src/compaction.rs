@@ -134,10 +134,14 @@ pub fn estimate_tokens(message: &AgentMessage) -> u64 {
 
 /// The current context size: the last successful response's reported usage plus an
 /// estimate of what came after it (everything estimated without one).
+///
+/// Usage without any prompt tokens counts as unreported: a request always has a prompt,
+/// and some gateways send `prompt_tokens: 0` for certain models, which would otherwise make
+/// the context look empty and never trigger compaction.
 pub fn context_tokens(messages: &[AgentMessage]) -> u64 {
     let last = messages.iter().rposition(|message| {
         message.as_assistant().is_some_and(|a| {
-            a.usage.total_tokens > 0
+            a.usage.total_input() > 0
                 && !matches!(a.stop_reason, StopReason::Error | StopReason::Aborted)
         })
     });
@@ -583,13 +587,26 @@ mod tests {
     fn estimates_and_thresholds() {
         assert_eq!(estimate_tokens(&AgentMessage::user("abcdefgh")), 2);
         let mut answered = AssistantMessage::empty("faux", "faux", "faux-1");
-        answered.usage.total_tokens = 1000;
+        answered.usage.input = 990;
+        answered.usage.output = 10;
+        answered.usage.update_total();
         let messages = vec![
             AgentMessage::user("x".repeat(400)),
-            answered.into(),
+            answered.clone().into(),
             AgentMessage::user("y".repeat(40)),
         ];
         assert_eq!(context_tokens(&messages), 1010);
+
+        // A later response that reports no prompt tokens is estimated instead.
+        let mut unreported = answered;
+        unreported.usage.input = 0;
+        unreported.usage.update_total();
+        unreported.content = vec![zp_ai::AssistantContent::Text(zp_ai::TextContent {
+            text: "z".repeat(80),
+        })];
+        let mut messages = messages;
+        messages.push(unreported.into());
+        assert_eq!(context_tokens(&messages), 1010 + 20);
         let s = CompactionSettings::default();
         assert!(!should_compact(100_000, 128_000, &s));
         assert!(should_compact(120_000, 128_000, &s));

@@ -17,7 +17,8 @@ use crate::oauth::{LoginInteraction, OAuthFlow};
 use crate::options::StreamOptions;
 use crate::provider::Provider;
 use crate::sync::{
-    ModelsDevCatalog, ModelsDevFetch, SyncError, UpstreamModels, fetch_models_dev, resolve_models,
+    ModelsDevCatalog, ModelsDevFetch, Reference, SyncError, UpstreamModels, fetch_models_dev,
+    resolve_models,
 };
 use crate::types::{AssistantMessage, Context};
 
@@ -194,7 +195,20 @@ impl Models {
             if dev.is_none() && upstream.is_none() {
                 return provider.models();
             }
-            let resolved: Arc<[Model]> = resolve_models(provider.as_ref(), dev, upstream).into();
+            let reference = Reference {
+                catalog: layers.models_dev.as_deref(),
+                builtin: if upstream.is_some() {
+                    self.providers()
+                        .iter()
+                        .filter(|other| other.id() != provider.id())
+                        .flat_map(|other| other.models().iter().cloned().collect::<Vec<_>>())
+                        .collect()
+                } else {
+                    Vec::new()
+                },
+            };
+            let resolved: Arc<[Model]> =
+                resolve_models(provider.as_ref(), dev, upstream, &reference).into();
             (resolved, layers.generation)
         };
         let mut layers = self.write_layers();

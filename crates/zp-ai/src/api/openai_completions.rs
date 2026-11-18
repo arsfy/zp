@@ -110,6 +110,8 @@ pub(crate) struct Compat {
     pub(crate) zai_tool_stream: bool,
     pub(crate) anthropic_cache_control: bool,
     pub(crate) send_session_header: bool,
+    /// `reasoning_effort: "minimal"` is accepted; otherwise `low` is sent instead.
+    pub(crate) supports_minimal_effort: bool,
 }
 
 impl Compat {
@@ -126,7 +128,11 @@ impl Compat {
         let is_cerebras = provider == "cerebras" || base_url.contains("cerebras.ai");
         let is_nvidia = provider == "nvidia" || base_url.contains("integrate.api.nvidia.com");
         let is_grok = provider == "xai" || base_url.contains("api.x.ai");
-        let non_standard = is_zai
+        // Command Code routes to many vendors: some reject the `developer` role (Qwen), and
+        // `reasoning_effort` only takes off|low|medium|high|xhigh|max.
+        let is_command_code = base_url.contains("api.commandcode.ai");
+        let non_standard = is_command_code
+            || is_zai
             || is_moonshot
             || is_deepseek
             || is_together
@@ -135,6 +141,7 @@ impl Compat {
             || is_grok
             || base_url.contains("chutes.ai");
         let use_max_tokens = is_deepseek
+            || is_command_code
             || is_moonshot
             || is_zai
             || is_together
@@ -185,6 +192,7 @@ impl Compat {
                 .map(|format| format == "anthropic")
                 .unwrap_or(is_openrouter && model.id.starts_with("anthropic/")),
             send_session_header: is_openrouter,
+            supports_minimal_effort: !is_command_code,
         }
     }
 }
@@ -248,7 +256,15 @@ fn apply_reasoning(
         return;
     }
     let level = model.clamp_thinking_level(requested);
-    let effort = (level != ThinkingLevel::Off).then(|| mapped_level(model, level));
+    let effort = (level != ThinkingLevel::Off)
+        .then(|| mapped_level(model, level))
+        .map(|effort| {
+            if effort == "minimal" && !compat.supports_minimal_effort {
+                "low".to_owned()
+            } else {
+                effort
+            }
+        });
     // `off` is configurable unless the model maps it to null (always reasoning).
     let off_value = model.thinking_level_value(ThinkingLevel::Off);
     let can_disable = off_value != Some(None);
@@ -903,6 +919,27 @@ mod tests {
         let compat = Compat::resolve(&explicit);
         assert!(compat.supports_store);
         assert_eq!(compat.thinking_format, ThinkingFormat::Zai);
+    }
+
+    #[test]
+    fn command_code_quirks() {
+        let mut gateway = model("command-code", "https://api.commandcode.ai/provider/v1");
+        gateway.reasoning = true;
+        let compat = Compat::resolve(&gateway);
+        assert!(!compat.supports_developer_role);
+        assert_eq!(compat.max_tokens_field, MaxTokensField::MaxTokens);
+        assert_eq!(compat.thinking_format, ThinkingFormat::Openai);
+        let effort = |level| {
+            let options = StreamOptions {
+                thinking: level,
+                ..StreamOptions::default()
+            };
+            build_request(&gateway, &context(), &options, &compat)["reasoning_effort"].clone()
+        };
+        // The gateway rejects `minimal`; `off` leaves the model's default.
+        assert_eq!(effort(ThinkingLevel::Minimal), "low");
+        assert_eq!(effort(ThinkingLevel::High), "high");
+        assert_eq!(effort(ThinkingLevel::Off), Value::Null);
     }
 
     #[test]

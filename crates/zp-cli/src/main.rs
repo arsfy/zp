@@ -450,7 +450,10 @@ pub(crate) fn select_model(models: &Models, spec: Option<&str>) -> Result<Model>
 
 fn format_tokens(tokens: u64) -> String {
     match tokens {
-        t if t >= 1_000_000 => format!("{}M", t as f64 / 1_000_000.0),
+        t if t >= 1_000_000 => {
+            let text = format!("{:.2}", t as f64 / 1_000_000.0);
+            format!("{}M", text.trim_end_matches('0').trim_end_matches('.'))
+        }
         t if t >= 1_000 => format!("{}k", t / 1_000),
         t => t.to_string(),
     }

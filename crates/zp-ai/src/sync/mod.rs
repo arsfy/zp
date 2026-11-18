@@ -18,7 +18,7 @@ mod upstream;
 
 use std::fmt;
 
-pub(crate) use merge::resolve_models;
+pub(crate) use merge::{Reference, resolve_models};
 pub use models_dev::{
     MODELS_DEV_URL, ModelsDevCatalog, ModelsDevCost, ModelsDevCostTier, ModelsDevFetch,
     ModelsDevLimits, ModelsDevModalities, ModelsDevModel, ModelsDevProvider, ModelsDevRates,

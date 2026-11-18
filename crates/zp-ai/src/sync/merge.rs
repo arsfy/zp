@@ -10,11 +10,17 @@
 //!   snapshots keep their alias, `:variant` ids their base) and listed unknown models are
 //!   added, described by models.dev when possible and by the list entry otherwise. Limits,
 //!   modalities and base prices the provider reports win over the other layers.
+//! - Listed models neither the catalog nor the provider's models.dev entry describe (models
+//!   of gateways that resell other vendors' models) borrow capabilities from a [`Reference`]:
+//!   the same model in another provider's built-in catalog or models.dev entry.
+//! - A listing that names the routes a model is served on (`supported_endpoints`) moves the
+//!   model to a protocol it supports, e.g. Claude to `/messages` on a gateway whose default is
+//!   Chat Completions.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
-use super::{ModelsDevModel, ModelsDevProvider, UpstreamModel, UpstreamModels};
-use crate::model::{InputModality, Model, ModelCompat, ModelCost};
+use super::{ModelsDevCatalog, ModelsDevModel, ModelsDevProvider, UpstreamModel, UpstreamModels};
+use crate::model::{Api, InputModality, Model, ModelCompat, ModelCost, ThinkingLevel};
 use crate::provider::Provider;
 
 /// Context window assumed when nothing reports one.
@@ -24,11 +30,64 @@ const DEFAULT_MAX_TOKENS: u64 = 16_384;
 /// Shortest id prefix that makes a model a template for another.
 const MIN_SHARED_PREFIX: usize = 4;
 
+/// What is known about models outside a provider's own layers.
+#[derive(Default)]
+pub(crate) struct Reference<'a> {
+    /// The whole models.dev catalog (all linked providers).
+    pub(crate) catalog: Option<&'a ModelsDevCatalog>,
+    /// Built-in catalog models of the other providers.
+    pub(crate) builtin: Vec<Model>,
+}
+
+/// Lowercased id and the id without its `vendor/` prefix.
+fn match_keys(id: &str) -> (String, String) {
+    let lower = id.to_ascii_lowercase();
+    let bare = lower.rsplit('/').next().unwrap_or(&lower).to_owned();
+    (lower, bare)
+}
+
+/// Finds the first candidate whose id equals `id` (case-insensitively), else the first
+/// whose id without the vendor prefix does.
+fn find_same_model<'a, T>(
+    id: &str,
+    candidates: impl Iterator<Item = &'a T> + Clone,
+    id_of: impl Fn(&T) -> &str,
+) -> Option<&'a T> {
+    let (lower, bare) = match_keys(id);
+    candidates
+        .clone()
+        .find(|c| id_of(c).eq_ignore_ascii_case(&lower))
+        .or_else(|| {
+            candidates
+                .into_iter()
+                .find(|c| match_keys(id_of(c)).1 == bare)
+        })
+}
+
+impl Reference<'_> {
+    /// The same model in another built-in catalog, served over `api`.
+    fn builtin(&self, id: &str, api: Api) -> Option<&Model> {
+        find_same_model(id, self.builtin.iter().filter(|m| m.api == api), |m| &m.id)
+    }
+
+    /// The same model on models.dev under any provider.
+    fn models_dev(&self, id: &str) -> Option<&ModelsDevModel> {
+        let catalog = self.catalog?;
+        let models = catalog
+            .providers
+            .values()
+            .flat_map(|provider| provider.models.values())
+            .filter(|info| info.is_chat() && info.tool_call);
+        find_same_model(id, models, |info| &info.id)
+    }
+}
+
 /// The effective model list of `provider`.
 pub(crate) fn resolve_models(
     provider: &dyn Provider,
     dev: Option<&ModelsDevProvider>,
     upstream: Option<&UpstreamModels>,
+    reference: &Reference<'_>,
 ) -> Vec<Model> {
     let dev_model = |id: &str| dev.and_then(|dev| dev.models.get(id));
     let mut models: Vec<Model> = provider
@@ -61,6 +120,9 @@ pub(crate) fn resolve_models(
         for model in &mut models {
             if let Some(entry) = listed.get(model.id.as_str()) {
                 overlay_upstream(model, entry);
+                if let Some(endpoints) = &entry.endpoints {
+                    route(model, endpoints);
+                }
             }
         }
         present = models.iter().map(|m| m.id.clone()).collect();
@@ -72,10 +134,16 @@ pub(crate) fn resolve_models(
                 // Listed means available, so deprecated models count here.
                 Some(info) => (info.is_chat() && info.tool_call)
                     .then(|| templates.describe_models_dev(info))
-                    .flatten(),
+                    .flatten()
+                    .map(|mut model| {
+                        if let Some(endpoints) = &entry.endpoints {
+                            route(&mut model, endpoints);
+                        }
+                        model
+                    }),
                 None => entry
                     .looks_like_chat()
-                    .then(|| templates.describe_upstream(entry))
+                    .then(|| templates.describe_upstream(entry, reference))
                     .flatten(),
             };
             if let Some(model) = model {
@@ -124,6 +192,71 @@ fn overlay_upstream(model: &mut Model, entry: &UpstreamModel) {
             ..cost.clone()
         };
     }
+}
+
+/// The protocol served on a listed route (`/v1/…` prefixes ignored).
+fn api_of_endpoint(endpoint: &str) -> Option<Api> {
+    let path = endpoint.trim().trim_end_matches('/');
+    let path = path.strip_prefix("/v1").unwrap_or(path);
+    match path {
+        "/chat/completions" => Some(Api::OpenAiCompletions),
+        "/responses" => Some(Api::OpenAiResponses),
+        "/messages" => Some(Api::AnthropicMessages),
+        _ => None,
+    }
+}
+
+/// The base URL for `to` on a gateway whose routes share one prefix: OpenAI-style clients
+/// append `/chat/completions` to `…/v1`, the Anthropic client appends `/v1/messages` to the
+/// root. `None` when the URL does not have that shape.
+fn rebase(base_url: &str, from: Api, to: Api) -> Option<String> {
+    let anthropic = |api| api == Api::AnthropicMessages;
+    let base = base_url.trim_end_matches('/');
+    match (anthropic(from), anthropic(to)) {
+        (false, true) => base.strip_suffix("/v1").map(str::to_owned),
+        (true, false) => Some(format!("{base}/v1")),
+        _ => Some(base.to_owned()),
+    }
+}
+
+/// Moves `model` to a protocol it is served on, when the listing names its routes and the
+/// current protocol is not among them. Protocol settings of the old protocol are dropped.
+fn route(model: &mut Model, endpoints: &[String]) {
+    let served: Vec<Api> = endpoints
+        .iter()
+        .filter_map(|e| api_of_endpoint(e))
+        .collect();
+    if served.is_empty() || served.contains(&model.api) {
+        return;
+    }
+    let target = [
+        Api::OpenAiCompletions,
+        Api::OpenAiResponses,
+        Api::AnthropicMessages,
+    ]
+    .into_iter()
+    .filter(|api| served.contains(api))
+    .find_map(|api| Some((api, rebase(&model.base_url, model.api, api)?)));
+    if let Some((api, base_url)) = target {
+        model.api = api;
+        model.base_url = base_url;
+        model.compat = ModelCompat::default();
+        model.thinking_level_map = None;
+    }
+}
+
+/// A thinking map borrowed from another provider: which levels exist carries over, but the
+/// value that turns reasoning off is provider-specific (`none`, `off`, a toggle), so `off`
+/// falls back to sending nothing.
+fn borrowed_thinking_map(
+    map: Option<BTreeMap<ThinkingLevel, Option<String>>>,
+) -> Option<BTreeMap<ThinkingLevel, Option<String>>> {
+    map.map(|mut map| {
+        if matches!(map.get(&ThinkingLevel::Off), Some(Some(_))) {
+            map.remove(&ThinkingLevel::Off);
+        }
+        map
+    })
 }
 
 /// Whether a known model is covered by the upstream list.
@@ -279,17 +412,64 @@ impl Templates {
         Some(model)
     }
 
-    fn describe_upstream(&self, entry: &UpstreamModel) -> Option<Model> {
+    fn describe_upstream(&self, entry: &UpstreamModel, reference: &Reference<'_>) -> Option<Model> {
         let (template, _) = self.pick(&entry.id, None)?;
         let mut model = self.instantiate(template, &entry.id, entry.name.as_deref());
+        model.cost = entry.cost.clone().unwrap_or_default();
+        model.thinking_level_map = None;
+        if let Some(endpoints) = &entry.endpoints {
+            route(&mut model, endpoints);
+        }
+
+        // What the listing leaves out comes from the same model elsewhere, if known: the
+        // capabilities and thinking levels from a built-in catalog (which knows the
+        // protocol), limits and modalities preferably from models.dev (kept current).
+        let peer = reference.builtin(&entry.id, model.api);
+        let info = reference.models_dev(&entry.id);
+        if let Some(peer) = peer
+            && model.api == Api::AnthropicMessages
+        {
+            // Same protocol: its settings (e.g. adaptive thinking) apply as they are.
+            model.compat = peer.compat.clone();
+        }
+        let (reasoning, map) = match (peer, info) {
+            (Some(peer), _) => (
+                peer.reasoning,
+                borrowed_thinking_map(peer.thinking_level_map.clone()),
+            ),
+            (None, Some(info)) => (
+                info.reasoning,
+                borrowed_thinking_map(info.thinking_level_map()),
+            ),
+            (None, None) => (false, None),
+        };
+        let (input, context, output) = match (info, peer) {
+            (Some(info), _) => (
+                (!info.modalities.input.is_empty()).then(|| info.input_modalities()),
+                Some(info.limit.context),
+                Some(info.limit.output),
+            ),
+            (None, Some(peer)) => (
+                Some(peer.input.clone()),
+                Some(peer.context_window),
+                Some(peer.max_tokens),
+            ),
+            (None, None) => (None, None, None),
+        };
+        model.reasoning = entry.reasoning.unwrap_or(reasoning);
+        model.thinking_level_map = map.filter(|_| model.reasoning);
         model.input = entry
             .input
             .clone()
+            .or(input)
             .unwrap_or_else(|| vec![InputModality::Text]);
-        model.cost = entry.cost.clone().unwrap_or_default();
-        (model.context_window, model.max_tokens) = limits(entry.context_window, entry.max_tokens);
-        model.reasoning = entry.reasoning.unwrap_or(false);
-        model.thinking_level_map = None;
+        let context = entry.context_window.or(context.filter(|&n| n > 0));
+        let output = entry.max_tokens.or_else(|| {
+            output
+                .filter(|&n| n > 0)
+                .map(|n| context.map_or(n, |c| n.min(c)))
+        });
+        (model.context_window, model.max_tokens) = limits(context, output);
         Some(model)
     }
 }
@@ -376,7 +556,7 @@ mod tests {
     #[test]
     fn catalog_only_is_unchanged() {
         let provider = provider();
-        let models = resolve_models(&provider, None, None);
+        let models = resolve_models(&provider, None, None, &Reference::default());
         let mut expected: Vec<Model> = provider.models().to_vec();
         expected.sort_by(|a, b| a.id.cmp(&b.id));
         assert_eq!(models, expected);
@@ -386,7 +566,12 @@ mod tests {
     fn models_dev_refreshes_and_adds() {
         let provider = provider();
         let dev = dev();
-        let models = resolve_models(&provider, dev.provider("router-dev"), None);
+        let models = resolve_models(
+            &provider,
+            dev.provider("router-dev"),
+            None,
+            &Reference::default(),
+        );
         assert_eq!(
             ids(&models),
             [
@@ -458,7 +643,12 @@ mod tests {
             UpstreamModel::new("text-embedding-x"),
             groq_like,
         ]);
-        let models = resolve_models(&provider, dev.provider("router-dev"), Some(&upstream));
+        let models = resolve_models(
+            &provider,
+            dev.provider("router-dev"),
+            Some(&upstream),
+            &Reference::default(),
+        );
         assert_eq!(
             ids(&models),
             [
@@ -483,8 +673,84 @@ mod tests {
         // An empty list is treated as a failed listing, not "nothing available".
         let empty = UpstreamModels::new(Vec::new());
         assert_eq!(
-            resolve_models(&provider, None, Some(&empty)).len(),
+            resolve_models(&provider, None, Some(&empty), &Reference::default()).len(),
             provider.models().len()
+        );
+    }
+
+    #[test]
+    fn gateway_models_borrow_capabilities_and_routes() {
+        let provider = HttpProvider::new("gw", "Gateway", Vec::<String>::new(), Vec::new())
+            .with_api_endpoint(Api::OpenAiCompletions, "https://gw/provider/v1");
+        let mut claude = catalog_model("claude-x", Api::AnthropicMessages, "https://api");
+        claude.reasoning = true;
+        claude.compat.force_adaptive_thinking = Some(true);
+        claude.max_tokens = 128_000;
+        let catalog = ModelsDevCatalog::parse(
+            &serde_json::to_vec(&json!({"other": {"id": "other", "models": {
+                "reasoner": {
+                    "id": "reasoner", "reasoning": true, "tool_call": true,
+                    "modalities": {"input": ["text", "image"], "output": ["text"]},
+                    "reasoning_options": [{"type": "effort", "values": ["none", "low", "high"]}],
+                    "limit": {"context": 200000, "output": 64000}
+                }
+            }}}))
+            .unwrap(),
+            |_| true,
+        )
+        .unwrap();
+        let reference = Reference {
+            catalog: Some(&catalog),
+            builtin: vec![claude],
+        };
+        let listed = |id: &str, endpoints: &[&str]| {
+            let mut entry = UpstreamModel::new(id);
+            entry.context_window = Some(1_000_000);
+            entry.endpoints = Some(endpoints.iter().map(|e| (*e).to_owned()).collect());
+            entry
+        };
+        let upstream = UpstreamModels::new(vec![
+            listed("claude-x", &["/messages"]),
+            listed("vendor/Reasoner", &["/chat/completions", "/responses"]),
+            listed("vendor/plain", &["/chat/completions"]),
+        ]);
+        let models = resolve_models(&provider, None, Some(&upstream), &reference);
+        let find = |id: &str| models.iter().find(|m| m.id == id).unwrap();
+
+        // Served on /messages only: Anthropic protocol at the gateway root, with the
+        // built-in model's protocol settings.
+        let claude = find("claude-x");
+        assert_eq!(claude.api, Api::AnthropicMessages);
+        assert_eq!(claude.base_url, "https://gw/provider");
+        assert_eq!(claude.compat.force_adaptive_thinking, Some(true));
+        assert!(claude.reasoning);
+        assert_eq!(
+            (
+                claude.context_window,
+                claude.max_tokens,
+                claude.provider.as_str()
+            ),
+            (1_000_000, 128_000, "gw")
+        );
+
+        // Described by models.dev under another provider (vendor prefix and case ignored).
+        let reasoner = find("vendor/Reasoner");
+        assert_eq!(reasoner.api, Api::OpenAiCompletions);
+        assert_eq!(reasoner.base_url, "https://gw/provider/v1");
+        assert!(reasoner.reasoning && reasoner.supports_images());
+        assert_eq!(
+            reasoner.supported_thinking_levels(),
+            [ThinkingLevel::Off, ThinkingLevel::Low, ThinkingLevel::High]
+        );
+        // `off` sends nothing rather than another provider's value.
+        assert_eq!(reasoner.thinking_level_value(ThinkingLevel::Off), None);
+        assert_eq!(reasoner.max_tokens, 64_000);
+
+        let plain = find("vendor/plain");
+        assert!(!plain.reasoning);
+        assert_eq!(
+            (plain.context_window, plain.max_tokens),
+            (1_000_000, 16_384)
         );
     }
 
@@ -494,7 +760,7 @@ mod tests {
             .with_api_endpoint(Api::OpenAiCompletions, "http://localhost:11434/v1")
             .without_api_key();
         let upstream = UpstreamModels::new(vec![UpstreamModel::new("qwen3:8b")]);
-        let models = resolve_models(&provider, None, Some(&upstream));
+        let models = resolve_models(&provider, None, Some(&upstream), &Reference::default());
         assert_eq!(ids(&models), ["qwen3:8b"]);
         assert_eq!(models[0].base_url, "http://localhost:11434/v1");
         assert_eq!(models[0].provider, "local");
