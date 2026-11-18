@@ -10,8 +10,8 @@ pub(crate) mod providers;
 
 use gpui::{
     AnyElement, App, AppContext as _, ColorExt as _, Context, Entity, FocusHandle, Focusable,
-    FontWeight, Global, IntoElement, Render, SharedString, Subscription, Window, WindowBounds,
-    WindowHandle, div, prelude::*, px, rgb_to_hsla, size,
+    FontWeight, Global, IntoElement, Render, SharedString, Subscription, Task, Window,
+    WindowBounds, WindowHandle, div, prelude::*, px, rgb_to_hsla, size,
 };
 use gpui_elements::editable_text::{EditableTextState, StringStorage, text_area, text_input};
 use zp_ai::ThinkingLevel;
@@ -133,8 +133,10 @@ impl Global for OpenSettings {}
 
 pub struct SettingsWindow {
     page: Page,
-    /// Feedback of the last change: the text and whether it is an error.
+    /// A failed change, warning or progress note: the text and whether it is an error.
     notice: Option<(String, bool)>,
+    /// The version info was just copied (shows a check on the copy button for a moment).
+    version_copied: Option<Task<()>>,
     // General
     model_menu_open: bool,
     model_filter: Entity<EditableTextState>,
@@ -238,6 +240,7 @@ impl SettingsWindow {
         Self {
             page,
             notice: None,
+            version_copied: None,
             model_menu_open: false,
             model_filter,
             model_search,
@@ -278,11 +281,10 @@ impl SettingsWindow {
         self.notice.as_ref()
     }
 
-    fn report(&mut self, result: anyhow::Result<String>, cx: &mut Context<Self>) {
-        self.notice = Some(match result {
-            Ok(message) => (message, false),
-            Err(error) => (format!("{error:#}"), true),
-        });
+    /// Shows a failed change above the page. A change that worked shows itself in the
+    /// controls, so it only clears an earlier error.
+    fn report(&mut self, result: anyhow::Result<()>, cx: &mut Context<Self>) {
+        self.notice = result.err().map(|error| (format!("{error:#}"), true));
         cx.notify();
     }
 
@@ -290,41 +292,22 @@ impl SettingsWindow {
 
     pub fn set_default_model(&mut self, spec: Option<String>, cx: &mut Context<Self>) {
         self.model_menu_open = false;
-        let result =
-            AppSettings::update(cx, |settings| settings.default_model = spec.clone()).map(|()| {
-                match spec {
-                    Some(spec) => format!("New conversations use {spec}"),
-                    None => "New conversations use the last used model".to_owned(),
-                }
-            });
+        let result = AppSettings::update(cx, |settings| settings.default_model = spec);
         self.report(result, cx);
     }
 
     pub fn set_default_thinking(&mut self, level: ThinkingLevel, cx: &mut Context<Self>) {
-        let result = AppSettings::update(cx, |s| s.default_thinking = Some(level))
-            .map(|()| format!("Default thinking level: {level}"));
+        let result = AppSettings::update(cx, |s| s.default_thinking = Some(level));
         self.report(result, cx);
     }
 
     pub fn set_notifications(&mut self, on: bool, cx: &mut Context<Self>) {
-        let result = AppSettings::update(cx, |s| s.notifications = Some(on)).map(|()| {
-            if on {
-                "Notifications on".to_owned()
-            } else {
-                "Notifications off".to_owned()
-            }
-        });
+        let result = AppSettings::update(cx, |s| s.notifications = Some(on));
         self.report(result, cx);
     }
 
     pub fn set_generate_titles(&mut self, on: bool, cx: &mut Context<Self>) {
-        let result = AppSettings::update(cx, |s| s.generate_titles = Some(on)).map(|()| {
-            if on {
-                "Conversations are named by a model".to_owned()
-            } else {
-                "Conversations are named after their first message".to_owned()
-            }
-        });
+        let result = AppSettings::update(cx, |s| s.generate_titles = Some(on));
         self.report(result, cx);
     }
 
@@ -351,8 +334,7 @@ impl SettingsWindow {
             self.open_review_model_picker(true, window, cx);
             return;
         }
-        let result = AppSettings::update(cx, |s| s.permissions.mode = Some(mode))
-            .map(|()| format!("Default permission mode: {}", mode.label()));
+        let result = AppSettings::update(cx, |s| s.permissions.mode = Some(mode));
         self.report(result, cx);
     }
 
@@ -400,14 +382,12 @@ impl SettingsWindow {
                     s.permissions.mode = Some(PermissionMode::AutoReview);
                 }
             })
-            .map(|()| format!("Review model: {spec}"))
         };
         self.report(result, cx);
     }
 
     pub fn set_review_thinking(&mut self, level: ThinkingLevel, cx: &mut Context<Self>) {
-        let result = AppSettings::update(cx, |s| s.permissions.review_thinking = Some(level))
-            .map(|()| format!("Review thinking level: {level}"));
+        let result = AppSettings::update(cx, |s| s.permissions.review_thinking = Some(level));
         self.report(result, cx);
     }
 
@@ -433,8 +413,7 @@ impl SettingsWindow {
         let result = AppSettings::update(cx, |s| {
             s.permissions.allow_commands = commands;
             s.permissions.additional_directories = directories;
-        })
-        .map(|()| "Permissions saved".to_owned());
+        });
         self.report(result, cx);
     }
 
@@ -447,9 +426,8 @@ impl SettingsWindow {
     // ----- Appearance ------------------------------------------------------------------
 
     pub fn set_theme(&mut self, theme: ThemeChoice, cx: &mut Context<Self>) {
-        let result = AppSettings::update(cx, |s| s.theme = Some(theme)).map(|()| String::new());
+        let result = AppSettings::update(cx, |s| s.theme = Some(theme));
         self.report(result, cx);
-        self.notice = None;
     }
 
     /// Sets whether `block`s start expanded and collapse when done.
@@ -459,8 +437,7 @@ impl SettingsWindow {
         display: BlockDisplay,
         cx: &mut Context<Self>,
     ) {
-        let result = AppSettings::update(cx, |s| block.set(&mut s.transcript, display))
-            .map(|()| format!("{}: {}", block.label(), display.label()));
+        let result = AppSettings::update(cx, |s| block.set(&mut s.transcript, display));
         self.report(result, cx);
     }
 

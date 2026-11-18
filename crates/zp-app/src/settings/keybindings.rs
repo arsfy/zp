@@ -80,14 +80,10 @@ impl SettingsWindow {
                 })
                 .map(|other| other.label)
         });
-        let message = match (&keys, taken) {
-            (Some(keys), _) if keys.is_empty() => format!("Removed the shortcut of {label}"),
-            (Some(keys), Some(other)) => {
-                format!("{label}: {} (also used by {other})", shortcut_label(keys))
-            }
-            (Some(keys), None) => format!("{label}: {}", shortcut_label(keys)),
-            (None, _) => format!("Reset the shortcut of {label}"),
-        };
+        // A clash is worth a word; an ordinary change shows in the list itself.
+        let clash = keys.as_deref().zip(taken).map(|(keys, other)| {
+            format!("{label}: {} is also used by {other}", shortcut_label(keys))
+        });
         let action = action.to_owned();
         let result = AppSettings::update(cx, |settings| match keys {
             Some(keys) => {
@@ -96,9 +92,12 @@ impl SettingsWindow {
             None => {
                 settings.keybindings.remove(&action);
             }
-        })
-        .map(|()| message);
+        });
+        let saved = result.is_ok();
         self.report(result, cx);
+        if let Some(clash) = clash.filter(|_| saved) {
+            self.notice = Some((clash, false));
+        }
     }
 
     pub(super) fn render_keybindings(&self, cx: &mut Context<Self>) -> AnyElement {

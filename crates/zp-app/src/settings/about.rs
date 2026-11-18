@@ -10,6 +10,7 @@ use crate::updates::{self, AppUpdate, UpdateState};
 const DOT_INSET: f32 = 20.0;
 
 const ICON_COPY: &[u8] = include_bytes!("../../../../assets/icons/copy.svg");
+const ICON_CHECK: &[u8] = include_bytes!("../../../../assets/icons/check.svg");
 const ICON_GITHUB: &[u8] = include_bytes!("../../../../assets/icons/github.svg");
 const ICON_EXTERNAL: &[u8] =
     include_bytes!("../../../../assets/icons/square-arrow-out-up-right.svg");
@@ -17,19 +18,27 @@ const ICON_REFRESH: &[u8] = include_bytes!("../../../../assets/icons/rotate-cw.s
 
 impl SettingsWindow {
     pub fn set_update_channel(&mut self, channel: UpdateChannel, cx: &mut Context<Self>) {
-        let result = updates::set_channel(channel, cx).map(|()| String::new());
+        let result = updates::set_channel(channel, cx);
         self.report(result, cx);
     }
 
     pub fn set_auto_updates(&mut self, on: bool, cx: &mut Context<Self>) {
-        let result =
-            AppSettings::update(cx, |s| s.check_for_updates = Some(on)).map(|()| String::new());
+        let result = AppSettings::update(cx, |s| s.check_for_updates = Some(on));
         self.report(result, cx);
     }
 
     fn copy_version_info(&mut self, cx: &mut Context<Self>) {
         cx.write_to_clipboard(ClipboardItem::new_string(version_info()));
-        self.report(Ok("Version info copied".to_owned()), cx);
+        self.version_copied = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(1500))
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.version_copied = None;
+                cx.notify();
+            });
+        }));
+        cx.notify();
     }
 
     pub(super) fn render_about(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -110,11 +119,21 @@ impl SettingsWindow {
                             .text_color(colors.text_muted)
                             .child(platform)
                             .child(
-                                icon_button("copy-version", ICON_COPY, cx)
-                                    .tooltip(crate::ui::tooltip("Copy version info"))
-                                    .on_click(
-                                        cx.listener(|this, _, _, cx| this.copy_version_info(cx)),
-                                    ),
+                                icon_button(
+                                    "copy-version",
+                                    if self.version_copied.is_some() {
+                                        ICON_CHECK
+                                    } else {
+                                        ICON_COPY
+                                    },
+                                    cx,
+                                )
+                                .tooltip(crate::ui::tooltip(if self.version_copied.is_some() {
+                                    "Copied"
+                                } else {
+                                    "Copy version info"
+                                }))
+                                .on_click(cx.listener(|this, _, _, cx| this.copy_version_info(cx))),
                             ),
                     ),
             )

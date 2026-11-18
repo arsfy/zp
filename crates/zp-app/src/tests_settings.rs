@@ -578,6 +578,13 @@ fn permission_settings_apply_to_open_projects(cx: &mut TestAppContext) {
         saved(&data).permissions.allow_commands,
         ["cargo test", "git status"]
     );
+    // A change that worked announces nothing and clears the earlier error.
+    assert_eq!(
+        window
+            .update(cx, |view, _, _| view.notice().cloned())
+            .unwrap(),
+        None
+    );
     let policy = cx.update(|cx| crate::approvals::project_policy(&project, cx));
     assert_eq!(policy.allow_commands, ["cargo test", "git status"]);
     assert_eq!(policy.review_thinking, ThinkingLevel::Off);

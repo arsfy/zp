@@ -337,15 +337,7 @@ impl SettingsWindow {
                 if current {
                     self.close_dialog(cx);
                 }
-                let name = cx
-                    .global::<AppModels>()
-                    .models
-                    .provider(provider)
-                    .map_or_else(|| provider.to_owned(), |p| p.name().to_owned());
-                self.report(
-                    Ok(format!("Signed in to {name}; refreshing its models")),
-                    cx,
-                );
+                self.report(Ok(()), cx);
             }
             Err(error) => {
                 if let Some(ProviderDialog::Login(login)) = &mut self.dialog
@@ -390,10 +382,9 @@ impl SettingsWindow {
     /// Signs out of `provider` (deletes the stored tokens).
     pub fn sign_out(&mut self, provider: &str, cx: &mut Context<Self>) {
         let credentials = cx.global::<AppModels>().credentials.clone();
-        let result = credentials.remove(provider).map(|()| {
-            AppModels::credential_changed(cx, provider);
-            format!("Signed out of {provider}")
-        });
+        let result = credentials
+            .remove(provider)
+            .map(|()| AppModels::credential_changed(cx, provider));
         self.report(result, cx);
     }
 
@@ -437,12 +428,7 @@ impl SettingsWindow {
             Ok(()) => {
                 AppModels::credential_changed(cx, &provider);
                 self.close_dialog(cx);
-                self.report(
-                    Ok(format!(
-                        "Saved the key of {provider}; refreshing its models"
-                    )),
-                    cx,
-                );
+                self.report(Ok(()), cx);
             }
             Err(error) => {
                 if let Some(ProviderDialog::Key { error: slot, .. }) = &mut self.dialog {
@@ -456,10 +442,9 @@ impl SettingsWindow {
     /// Deletes the stored key of `provider`.
     pub fn remove_key(&mut self, provider: &str, cx: &mut Context<Self>) {
         let credentials = cx.global::<AppModels>().credentials.clone();
-        let result = credentials.remove(provider).map(|()| {
-            AppModels::credential_changed(cx, provider);
-            format!("Removed the key of {provider}")
-        });
+        let result = credentials
+            .remove(provider)
+            .map(|()| AppModels::credential_changed(cx, provider));
         self.report(result, cx);
     }
 
@@ -507,7 +492,7 @@ impl SettingsWindow {
         };
         let editing = form.editing.clone();
         let key = form.key.read(cx).as_str().trim().to_owned();
-        let result = (|| -> anyhow::Result<String> {
+        let result = (|| -> anyhow::Result<()> {
             let mut def = form.definition(cx)?;
             if let Some(id) = &editing {
                 def.id.clone_from(id);
@@ -530,12 +515,12 @@ impl SettingsWindow {
                 cx.global::<AppModels>().credentials.set(&def.id, &key)?;
             }
             AppModels::credential_changed(cx, &def.id);
-            Ok(format!("Saved provider {}", def.id))
+            Ok(())
         })();
         match result {
-            Ok(message) => {
+            Ok(()) => {
                 self.close_dialog(cx);
-                self.report(Ok(message), cx);
+                self.report(Ok(()), cx);
             }
             Err(error) => {
                 if let Some(ProviderDialog::Custom(form)) = &mut self.dialog {
@@ -631,7 +616,7 @@ impl SettingsWindow {
                 if let Some(cache) = AppModels::catalog_cache(cx) {
                     cache.clear_upstream(&cx.global::<AppModels>().models, id)?;
                 }
-                Ok(format!("Removed provider {id}"))
+                Ok(())
             });
         self.report(result, cx);
     }
