@@ -1,3 +1,26 @@
+## v0.1.0-rc.3 19 Nov 2026
+
+#### Conversation
+
+- Code blocks in Markdown are syntax-highlighted, with a light or dark theme to match the app. Long blocks are highlighted in the background and very large ones stay plain.
+- Tool cards and thinking blocks that open only while in progress stay open for at least 1.5 seconds, so quick commands and short thoughts no longer flash open and shut.
+- Thinking blocks no longer show leading or trailing blank lines, and an expanded block with no text shows only its header.
+- The transcript keeps its scroll position when rows are remeasured while a response is streaming.
+- Long API errors (compact JSON, request IDs) wrap inside the response card instead of pushing the **Retry** button out of view.
+- The tasks card stays above the composer after all tasks are done, until you close it with its × button.
+
+#### Sessions
+
+- A new session appears in the sidebar as soon as its first message is saved, instead of after the run finishes.
+- Deleting a session asks first: **Hide Session** removes it from this project's sidebar and keeps the file, while **Move to Trash** also moves the session file to Trash, which can reduce local usage totals. A busy session cannot be moved to Trash.
+- The sidebar says "No sessions yet" when a project has none, and "No matching sessions" only while searching.
+
+#### Packaging and updates
+
+- Linux builds are also published for ARM64 (`aarch64` tarball and AppImage, `arm64` Debian package).
+- Release notes on GitHub end with a Downloads section linking each package.
+- Clicking the update button in the title bar opens the update dialog reliably; previously the click could do nothing.
+
 ## v0.1.0-rc.2 18 Nov 2026 `0d59eaa`
 
 #### Providers and models
