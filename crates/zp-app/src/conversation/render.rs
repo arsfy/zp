@@ -665,6 +665,7 @@ impl ConversationView {
     ) -> AnyElement {
         let colors = cx.theme().colors.clone();
         let expanded = self.thinking_is_expanded(row, block, cx);
+        let text = text.trim();
         div()
             .flex()
             .flex_col()
@@ -692,14 +693,17 @@ impl ConversationView {
                         this.toggle_thinking_block(row, block, expanded, cx)
                     })),
             )
-            .when(expanded, |this| {
+            .when(expanded && !text.is_empty(), |this| {
                 this.child(
                     div()
                         .pl_3()
                         .border_l_2()
                         .border_color(colors.border)
                         .text_color(colors.text_muted)
-                        .child(text.to_owned()),
+                        .child(gpui::Text::new(
+                            id(format!("thinking-text-{row}"), block),
+                            text.to_owned().into(),
+                        )),
                 )
             })
             .into_any_element()
@@ -2052,13 +2056,101 @@ impl ConversationView {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Instant;
+
     use gpui::{Modifiers, MouseButton, TestAppContext, VisualTestContext};
-    use zp_ai::{FauxProvider, FauxResponse};
+    use zp_agent::AgentEvent;
+    use zp_ai::{
+        AssistantContent, AssistantMessage, AssistantMessageEvent, FauxProvider, FauxResponse,
+    };
 
     use crate::tests::project_dir;
     use crate::tests_conversation::{active, idle, open, send, setup_models};
 
     use super::wrappable_error;
+
+    #[gpui::test]
+    fn thinking_trims_display_edges_without_losing_streamed_separators(cx: &mut TestAppContext) {
+        let faux = FauxProvider::default();
+        let _data = setup_models(cx, &[&faux], false);
+        let (_dir, project) = project_dir();
+        let window = open(cx, &project);
+        let conversation = active(window, cx);
+        window
+            .update(cx, |_, window, _| window.set_a11y_forced(true))
+            .unwrap();
+        conversation.update(cx, |view, cx| {
+            let message = AssistantMessage::empty("faux", "faux", "faux-1");
+            let now = Instant::now();
+            view.apply_events(
+                vec![
+                    (
+                        now,
+                        AgentEvent::MessageStart {
+                            message: message.into(),
+                        },
+                    ),
+                    (
+                        now,
+                        AgentEvent::MessageUpdate {
+                            event: AssistantMessageEvent::ThinkingStart {
+                                index: 0,
+                                redacted: false,
+                            },
+                        },
+                    ),
+                ],
+                cx,
+            );
+            view.toggle_thinking_block(0, 0, false, cx);
+        });
+
+        let leading = " \r\n\t\u{3000}";
+        let first = "First thought\n\n  ";
+        let second = "Second thought \r\n\t\n\n";
+        for (delta, expected) in [
+            (leading, None),
+            (first, Some("First thought")),
+            (second, Some("First thought\n\n  Second thought")),
+        ] {
+            conversation.update(cx, |view, cx| {
+                view.apply_events(
+                    vec![(
+                        Instant::now(),
+                        AgentEvent::MessageUpdate {
+                            event: AssistantMessageEvent::ThinkingDelta {
+                                index: 0,
+                                delta: delta.into(),
+                            },
+                        },
+                    )],
+                    cx,
+                );
+            });
+            cx.run_until_parked();
+            let displayed = window
+                .update(cx, |_, window, _| {
+                    window
+                        .a11y_tree()
+                        .unwrap()
+                        .nodes
+                        .iter()
+                        .filter_map(|(_, node)| node.value())
+                        .find(|value| *value == leading || value.contains("First thought"))
+                        .map(str::to_owned)
+                })
+                .unwrap();
+            assert_eq!(displayed.as_deref(), expected);
+        }
+        conversation.read_with(cx, |view, _| {
+            let AssistantContent::Thinking(thinking) =
+                &view.transcript().assistant(0).unwrap().content[0]
+            else {
+                panic!("expected a thinking block");
+            };
+            assert_eq!(thinking.thinking, format!("{leading}{first}{second}"));
+        });
+    }
 
     #[gpui::test]
     fn messages_and_code_support_drag_selection_and_copy(cx: &mut TestAppContext) {
