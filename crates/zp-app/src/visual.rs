@@ -432,7 +432,10 @@ fn update_settings(cx: &mut VisualTestAppContext, root: &std::path::Path, out: &
             cx.global_mut::<AppUpdate>().state = UpdateState::Available(update.clone());
         });
         if width > 1000. {
-            cx.update(|cx| crate::updates::offer(&update, cx));
+            let button = point(px(1210.), px(17.));
+            cx.simulate_mouse_move(window.into(), button, None, Modifiers::none());
+            pump(cx, Duration::from_millis(800));
+            cx.simulate_click(window.into(), button, Modifiers::none());
             pump(cx, Duration::from_millis(300));
             cx.capture_screenshot(window.into())
                 .unwrap()

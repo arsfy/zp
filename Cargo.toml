@@ -31,7 +31,7 @@ gpui_tokio = { package = "gpui_ce_tokio", git = "https://github.com/gpui-ce/gpui
 alacritty_terminal = "0.26"
 anyhow = "1"
 base64 = "0.23"
-chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
 globset = "0.4"
 ignore = "0.4"
 pulldown-cmark = { version = "0.13", default-features = false }

@@ -201,6 +201,12 @@ pub fn check(manual: bool, cx: &mut App) {
     .detach();
 }
 
+/// Shows a dialog in the active window. The answer is an error when the dialog could not
+/// be shown or was closed without one.
+///
+/// The dialog opens once the current effects are flushed: callers are often click handlers
+/// of that very window, which is busy dispatching the click, so updating it right away
+/// fails and the click would seem to do nothing.
 fn prompt(
     level: PromptLevel,
     title: &str,
@@ -211,17 +217,36 @@ fn prompt(
     let window = cx
         .active_window()
         .or_else(|| cx.windows().into_iter().next())?;
-    window
-        .update(cx, |_, window, cx| {
+    let (sender, receiver) = futures::channel::oneshot::channel();
+    let title = title.to_owned();
+    let detail = detail.to_owned();
+    let answers: Vec<String> = answers.iter().map(|a| (*a).to_owned()).collect();
+    cx.defer(move |cx| {
+        let shown = window.update(cx, |_, window, cx| {
             // Update dialogs show the ZP logo; tests answer the platform's test prompts.
             #[cfg(not(test))]
             cx.set_prompt_builder(dialog::build);
-            let answer = window.prompt(level, title, Some(detail), answers, cx);
+            let answers: Vec<&str> = answers.iter().map(String::as_str).collect();
+            let answer = window.prompt(level, &title, Some(&detail), &answers, cx);
             #[cfg(not(test))]
             cx.reset_prompt_builder();
             answer
-        })
-        .ok()
+        });
+        match shown {
+            Ok(answer) => cx
+                .spawn(async move |_| {
+                    if let Ok(answer) = answer.await {
+                        let _ = sender.send(answer);
+                    }
+                })
+                .detach(),
+            Err(error) => {
+                tracing::warn!(%error, "could not show the update dialog");
+                drop(sender);
+            }
+        }
+    });
+    Some(receiver)
 }
 
 pub fn offer(update: &Update, cx: &mut App) {
@@ -620,11 +645,6 @@ pub fn title_bar_button(compact: bool, cx: &App) -> Option<impl IntoElement> {
             .text_color(colors.accent_text)
             .cursor_pointer()
             .child(label)
-            .tooltip(crate::ui::tooltip(if downloading {
-                "Cancel update download"
-            } else {
-                "Update ZP"
-            }))
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .on_click(move |_, _, cx| {
                 cx.stop_propagation();

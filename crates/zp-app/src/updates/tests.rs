@@ -50,6 +50,22 @@ fn update_waits_for_confirmation_and_later_preserves_the_offer(cx: &mut TestAppC
 }
 
 #[gpui::test]
+fn the_update_button_opens_the_dialog_from_its_own_window(cx: &mut TestAppContext) {
+    let _data = setup_models(cx, &[&FauxProvider::default()], false);
+    let (_directory, project) = crate::tests::project_dir();
+    let window = open(cx, &project);
+    available(cx);
+    // Like the title bar's click handler: inside an update of the window that shows the
+    // dialog (which could not be updated again right then).
+    window.update(cx, |_, _, cx| activate(cx)).unwrap();
+    cx.run_until_parked();
+    assert!(cx.has_pending_prompt());
+    cx.simulate_prompt_answer("Later");
+    cx.run_until_parked();
+    assert!(!cx.update(|cx| cx.global::<AppUpdate>().dialog_open));
+}
+
+#[gpui::test]
 fn an_old_dialog_cannot_install_after_channel_changes(cx: &mut TestAppContext) {
     let data = setup_models(cx, &[&FauxProvider::default()], false);
     let (_directory, project) = crate::tests::project_dir();
