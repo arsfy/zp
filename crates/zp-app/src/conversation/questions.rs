@@ -10,7 +10,7 @@ use gpui_elements::editable_text::{EditableTextState, StringStorage, text_input}
 use serde_json::Value;
 use zp_tools::{Answer, AskOutcome, Question, TodoList, TodoStatus};
 
-use super::{ConversationEvent, ConversationView};
+use super::{COMPOSER_CARD_RADIUS, ConversationEvent, ConversationView};
 use crate::approvals::PendingQuestions;
 use crate::theme::ActiveTheme;
 use crate::ui::{disclosure_icon, ui_font};
@@ -421,7 +421,7 @@ impl ConversationView {
                 .gap_0p5()
                 .px_3()
                 .py_1p5()
-                .rounded(px(6.))
+                .rounded(px(COMPOSER_CARD_RADIUS))
                 .border_1()
                 .border_color(colors.border)
                 .bg(colors.surface)

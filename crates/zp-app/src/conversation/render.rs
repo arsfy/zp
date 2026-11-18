@@ -16,7 +16,7 @@ use zp_core::checkpoint::RecordedChange;
 
 use super::permissions::permission_mode_color;
 use super::transcript::{Row, ToolStatus};
-use super::{ConversationEvent, ConversationView, Picker};
+use super::{COMPOSER_CARD_RADIUS, ConversationEvent, ConversationView, Picker};
 use crate::actions::KEY_SEND;
 use crate::diff_view::{DiffColors, Gutters, render_unified_row};
 use crate::markdown::{IdGen, MarkdownStyle, render_markdown};
@@ -1519,7 +1519,7 @@ impl ConversationView {
             ))
             .flex()
             .flex_col()
-            .rounded(px(8.))
+            .rounded(px(COMPOSER_CARD_RADIUS))
             .border_1()
             .border_color(colors.border)
             .bg(colors.surface)

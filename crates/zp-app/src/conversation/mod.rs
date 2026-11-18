@@ -43,6 +43,8 @@ use crate::store::{AppModels, AppPaths};
 const FRAME_INTERVAL: Duration = Duration::from_millis(33);
 /// Status updates are less frequent than streamed text and stop when the task ends.
 const STATUS_INTERVAL: Duration = Duration::from_millis(250);
+/// Corner radius of the composer and the Tasks card above it.
+const COMPOSER_CARD_RADIUS: f32 = 8.0;
 /// Shortest time a tool card or thinking block stays open when it opened only because it
 /// was in progress (the "collapse when done" display): quick commands and short thoughts
 /// would otherwise flash open and shut.
