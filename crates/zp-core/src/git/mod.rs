@@ -373,6 +373,7 @@ pub(crate) mod tests {
         run(&root, &["config", "user.name", "t"]);
         run(&root, &["config", "user.email", "t@t"]);
         run(&root, &["config", "commit.gpgsign", "false"]);
+        run(&root, &["config", "core.autocrlf", "false"]);
         (dir, root)
     }
 

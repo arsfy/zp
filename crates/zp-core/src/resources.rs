@@ -708,7 +708,7 @@ mod tests {
         assert!(skill.contains("# PDF\nRun scripts/x.sh\n</skill>\n\nextract a.pdf"));
         assert!(skill.contains(&format!(
             "References are relative to {}.",
-            data.path().join("skills/pdf").display()
+            data.path().join("skills").join("pdf").display()
         )));
 
         let prompt = trusted.skills_prompt();

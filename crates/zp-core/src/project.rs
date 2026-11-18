@@ -167,7 +167,10 @@ mod tests {
         assert_eq!(project_name(Path::new("/work/my-app/")), "my-app");
         let dir = tempfile::tempdir().unwrap();
         let normalized = normalize_project_path(&dir.path().join(".")).unwrap();
-        assert_eq!(normalized, std::fs::canonicalize(dir.path()).unwrap());
+        assert_eq!(
+            normalized,
+            strip_verbatim(std::fs::canonicalize(dir.path()).unwrap())
+        );
         let file = dir.path().join("f");
         std::fs::write(&file, "").unwrap();
         assert!(normalize_project_path(&file).is_err());
