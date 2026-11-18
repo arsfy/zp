@@ -1,5 +1,6 @@
 # Builds the Windows installer and a zip of ZP into dist\.
-# Needs Inno Setup (iscc.exe) on PATH for the installer; ImageMagick (magick) for the icon.
+# Needs Inno Setup (iscc.exe) on PATH for the installer. The icon is the committed
+# packaging\windows\zp.ico (generated from assets\icon.png).
 $ErrorActionPreference = "Stop"
 Set-Location (Join-Path $PSScriptRoot "..")
 
@@ -12,11 +13,10 @@ $exe = Resolve-Path "target\release\zp.exe"
 
 Compress-Archive -Force -Path $exe -DestinationPath "dist\ZP-$version-windows-x86_64.zip"
 
-if (Get-Command magick -ErrorAction SilentlyContinue) {
-    magick assets\icon.png -define icon:auto-resize=256,64,48,32,16 packaging\windows\zp.ico
-}
 if (Get-Command iscc -ErrorAction SilentlyContinue) {
-    iscc /DVersion=$version /DNumericVersion=$numericVersion /DSource=$exe /DOutput=(Resolve-Path dist) packaging\windows\zp.iss
+    $source = $exe.Path
+    $output = (Resolve-Path dist).Path
+    iscc "/DVersion=$version" "/DNumericVersion=$numericVersion" "/DSource=$source" "/DOutput=$output" packaging\windows\zp.iss
     if ($LASTEXITCODE -ne 0) { throw "Installer build failed" }
 } else {
     Write-Warning "iscc (Inno Setup) not found; only the zip was built"

@@ -16,7 +16,7 @@ mkdir -p dist
 stage=$(mktemp -d)/zp-$version
 mkdir -p "$stage"
 cp "$binary" "$stage/zp"
-cp packaging/linux/zp.desktop assets/icon.png LICENSE "$stage/"
+cp packaging/linux/zp.desktop assets/icon.png LICENSE-MIT LICENSE-APACHE "$stage/"
 tar -C "$(dirname "$stage")" -czf "dist/ZP-$version-linux-$arch.tar.gz" "zp-$version"
 
 # AppImage.
