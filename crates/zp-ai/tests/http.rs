@@ -152,6 +152,37 @@ async fn client_errors_are_not_retried() {
 }
 
 #[tokio::test]
+async fn generic_proxy_errors_keep_details() {
+    let failed = Reply::status(
+        400,
+        r#"{"error":{"message":"openai_error","type":"bad_response_status_code","param":"max_tokens"}}"#,
+    );
+    // Some proxies answer a streaming request with a JSON error and status 200.
+    let ok_but_error = Reply::json(&json!({"error": {"message": "model not found: foo"}}));
+    let (url, _) = serve(vec![failed, ok_but_error]).await;
+    let model = model("openai-completions", &format!("{url}/v1"));
+
+    let message = models(&model)
+        .complete(&model, &context(), StreamOptions::default())
+        .await;
+    let error = message.error_message.unwrap();
+    assert!(
+        error.starts_with("HTTP 400 Bad Request: openai_error"),
+        "{error}"
+    );
+    assert!(error.contains("max_tokens"), "{error}");
+
+    let message = models(&model)
+        .complete(&model, &context(), StreamOptions::default())
+        .await;
+    assert_eq!(message.stop_reason, StopReason::Error);
+    assert_eq!(
+        message.error_message.as_deref(),
+        Some("model not found: foo")
+    );
+}
+
+#[tokio::test]
 async fn cancellation_mid_stream_aborts() {
     let reply = Reply {
         parts: vec![

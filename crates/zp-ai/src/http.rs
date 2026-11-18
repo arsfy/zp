@@ -71,24 +71,109 @@ fn retry_delay(response: &Response, attempt: u32) -> Duration {
         .min(Duration::from_secs(30))
 }
 
+/// Longest raw response excerpt included in an error message.
+const RAW_EXCERPT_LIMIT: usize = 2000;
+
 /// Extracts a readable message from an error response body.
 pub(crate) fn describe_error_body(status: StatusCode, body: &str) -> String {
-    let detail = serde_json::from_str::<Value>(body)
-        .ok()
-        .and_then(|value| {
-            let error = value.get("error").unwrap_or(&value);
-            error
-                .get("message")
-                .and_then(Value::as_str)
-                .map(str::to_owned)
-                .or_else(|| error.as_str().map(str::to_owned))
-        })
-        .unwrap_or_else(|| body.trim().chars().take(2000).collect());
+    let detail = match serde_json::from_str::<Value>(body) {
+        Ok(value) => describe_error_json(&value),
+        Err(_) => excerpt(body.trim()),
+    };
     if detail.is_empty() {
         format!("HTTP {status}")
     } else {
         format!("HTTP {status}: {detail}")
     }
+}
+
+/// Describes a JSON error payload: `{"error": {...}}`, `{"error": "..."}` or the error object
+/// itself. Proxies often put only a generic code such as `openai_error` in `message`, or wrap
+/// the upstream error in `metadata.raw` (OpenRouter); then the details are appended so the
+/// real cause is visible.
+pub(crate) fn describe_error_json(value: &Value) -> String {
+    let error = match value.get("error") {
+        Some(error) if error.is_object() || error.is_string() => error,
+        _ => value,
+    };
+    let text = |key: &str| {
+        error
+            .get(key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+    };
+    let message = error.as_str().map(str::trim).or_else(|| {
+        ["message", "msg", "detail", "error_description", "error_msg"]
+            .into_iter()
+            .find_map(text)
+    });
+    let code = text("code").map(str::to_owned).or_else(|| {
+        error
+            .get("code")
+            .filter(|code| code.is_number())
+            .map(Value::to_string)
+    });
+    let kind = text("type").filter(|kind| *kind != "error");
+
+    let mut parts = Vec::new();
+    if let Some(message) = message {
+        parts.push(message.to_owned());
+    }
+    let upstream = error.pointer("/metadata/raw").and_then(|raw| match raw {
+        Value::String(raw) => Some(raw.trim().to_owned()).filter(|raw| !raw.is_empty()),
+        Value::Null => None,
+        raw => Some(raw.to_string()),
+    });
+    if let Some(upstream) = &upstream {
+        let provider = error
+            .pointer("/metadata/provider_name")
+            .and_then(Value::as_str);
+        parts.push(match provider {
+            Some(provider) => format!("upstream {provider}: {}", excerpt(upstream)),
+            None => format!("upstream: {}", excerpt(upstream)),
+        });
+    }
+    let informative = message.is_some_and(|message| {
+        !is_generic_error(message) && Some(message) != kind && Some(message) != code.as_deref()
+    });
+    if !informative && upstream.is_none() {
+        // Nothing readable: show the payload itself (it carries type, code, param, ...).
+        parts.push(excerpt(&value.to_string()));
+    }
+    parts.join(" — ")
+}
+
+/// Messages that name an error class instead of explaining it.
+fn is_generic_error(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    let identifier = !message.contains(char::is_whitespace)
+        && (message.contains('_') || message.contains('.'))
+        && message
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-'));
+    identifier
+        || matches!(
+            lower.trim_end_matches('.'),
+            "error"
+                | "unknown error"
+                | "internal error"
+                | "internal server error"
+                | "upstream error"
+                | "provider returned error"
+                | "bad request"
+                | "bad response status code"
+        )
+}
+
+/// At most [`RAW_EXCERPT_LIMIT`] characters of `text`.
+fn excerpt(text: &str) -> String {
+    let mut chars = text.chars();
+    let mut out: String = chars.by_ref().take(RAW_EXCERPT_LIMIT).collect();
+    if chars.next().is_some() {
+        out.push('…');
+    }
+    out
 }
 
 /// POSTs a JSON body, retrying rate limits and transient failures before the response
@@ -204,6 +289,28 @@ pub(crate) async fn drive_sse(
     cancel: &CancellationToken,
     mut on_event: impl FnMut(SseEvent) -> Result<(), String>,
 ) -> Result<(), HttpError> {
+    let is_json = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.contains("json"));
+    if is_json {
+        // Some proxies answer a streaming request with a plain JSON error and status 200.
+        let text = tokio::select! {
+            () = cancel.cancelled() => return Err(HttpError::Cancelled),
+            text = response.text() => text.map_err(|error| format!("reading response failed: {error}"))?,
+        };
+        return Err(match serde_json::from_str::<Value>(&text) {
+            Ok(value) if value.get("error").is_some_and(|e| !e.is_null()) => {
+                describe_error_json(&value)
+            }
+            _ => format!(
+                "expected an event stream, got JSON: {}",
+                excerpt(text.trim())
+            ),
+        }
+        .into());
+    }
     let mut decoder = SseDecoder::new();
     let mut body = response.bytes_stream();
     loop {
@@ -250,5 +357,32 @@ mod tests {
             "HTTP 401 Unauthorized: nope"
         );
         assert_eq!(describe_error_body(status, ""), "HTTP 401 Unauthorized");
+    }
+
+    #[test]
+    fn generic_errors_show_the_payload() {
+        let body = r#"{"error":{"message":"openai_error","type":"bad_response_status_code","code":"bad_response_status_code"}}"#;
+        let text = describe_error_body(StatusCode::BAD_REQUEST, body);
+        assert!(
+            text.starts_with("HTTP 400 Bad Request: openai_error — {"),
+            "{text}"
+        );
+        assert!(text.contains("bad_response_status_code"), "{text}");
+
+        let body = r#"{"error":{"type":"openai_error","code":500}}"#;
+        let text = describe_error_body(StatusCode::INTERNAL_SERVER_ERROR, body);
+        assert!(text.contains(r#""type":"openai_error""#), "{text}");
+
+        let body = r#"{"error":{"message":"Provider returned error","code":400,"metadata":{"raw":"{\"error\":\"context too long\"}","provider_name":"Acme"}}}"#;
+        assert_eq!(
+            describe_error_body(StatusCode::BAD_REQUEST, body),
+            r#"HTTP 400 Bad Request: Provider returned error — upstream Acme: {"error":"context too long"}"#
+        );
+
+        let value: Value = serde_json::from_str(
+            r#"{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}"#,
+        )
+        .unwrap();
+        assert_eq!(describe_error_json(&value), "Overloaded");
     }
 }

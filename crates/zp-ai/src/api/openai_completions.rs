@@ -611,13 +611,8 @@ impl<'a> Decoder<'a> {
         }
         let chunk: Value = serde_json::from_str(data)
             .map_err(|error| format!("could not parse stream chunk: {error}; data={data}"))?;
-        if let Some(error) = chunk.get("error").filter(|e| !e.is_null()) {
-            let message = error
-                .get("message")
-                .and_then(Value::as_str)
-                .map(str::to_owned)
-                .unwrap_or_else(|| error.to_string());
-            return Err(message);
+        if chunk.get("error").is_some_and(|e| !e.is_null()) {
+            return Err(crate::http::describe_error_json(&chunk));
         }
         if sink.message().response_id.is_none()
             && let Some(id) = chunk["id"].as_str()

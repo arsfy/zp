@@ -146,6 +146,14 @@ fn friendly_error(message: String) -> String {
     }
 }
 
+/// Prefixes `detail` with the error's string `code` unless it already mentions it.
+fn with_code(error: &Value, detail: String) -> String {
+    match error.get("code").and_then(Value::as_str) {
+        Some(code) if !code.is_empty() && !detail.contains(code) => format!("{code}: {detail}"),
+        _ => detail,
+    }
+}
+
 /// Keeps `[A-Za-z0-9_-]`, at most 64 characters, without trailing underscores.
 fn sanitize_id(id: &str) -> String {
     let sanitized: String = id
@@ -523,15 +531,9 @@ impl<'a> Decoder<'a> {
             }
             "response.failed" => {
                 let response = &event["response"];
-                let message = match (
-                    response.pointer("/error/code").and_then(Value::as_str),
-                    response.pointer("/error/message").and_then(Value::as_str),
-                ) {
-                    (code, Some(message)) => {
-                        format!("{}: {message}", code.unwrap_or("error"))
-                    }
-                    (Some(code), None) => code.to_owned(),
-                    (None, None) => response
+                let message = match response.get("error").filter(|e| !e.is_null()) {
+                    Some(error) => with_code(error, crate::http::describe_error_json(error)),
+                    None => response
                         .pointer("/incomplete_details/reason")
                         .and_then(Value::as_str)
                         .map_or_else(
@@ -542,17 +544,12 @@ impl<'a> Decoder<'a> {
                 return Err(friendly_error(message));
             }
             "error" => {
-                let code = event["code"]
-                    .as_str()
-                    .or_else(|| event.pointer("/error/code").and_then(Value::as_str));
-                let message = event["message"]
-                    .as_str()
-                    .or_else(|| event.pointer("/error/message").and_then(Value::as_str))
-                    .unwrap_or("unknown error");
-                return Err(friendly_error(match code {
-                    Some(code) => format!("Error {code}: {message}"),
-                    None => message.to_owned(),
-                }));
+                let error = event
+                    .get("error")
+                    .filter(|e| e.is_object())
+                    .unwrap_or(&event);
+                let message = with_code(error, crate::http::describe_error_json(&event));
+                return Err(friendly_error(message));
             }
             _ => {}
         }
@@ -725,13 +722,10 @@ impl<'a> Decoder<'a> {
             ),
             Some("failed" | "cancelled") => (
                 StopReason::Error,
-                Some(
-                    response
-                        .pointer("/error/message")
-                        .and_then(Value::as_str)
-                        .unwrap_or("The response failed")
-                        .to_owned(),
-                ),
+                Some(match response.get("error").filter(|e| !e.is_null()) {
+                    Some(error) => crate::http::describe_error_json(error),
+                    None => "The response failed".to_owned(),
+                }),
             ),
             _ => (StopReason::Stop, None),
         };

@@ -519,16 +519,10 @@ impl<'a> Decoder<'a> {
         sink: &mut EventSink,
     ) -> Result<(), String> {
         if event_name == Some("error") {
-            let message = serde_json::from_str::<Value>(data)
-                .ok()
-                .and_then(|value| {
-                    value
-                        .pointer("/error/message")
-                        .and_then(Value::as_str)
-                        .map(str::to_owned)
-                })
-                .unwrap_or_else(|| data.to_owned());
-            return Err(message);
+            return Err(match serde_json::from_str::<Value>(data) {
+                Ok(value) => crate::http::describe_error_json(&value),
+                Err(_) => data.trim().to_owned(),
+            });
         }
         if data.trim().is_empty() {
             return Ok(());
@@ -565,13 +559,7 @@ impl<'a> Decoder<'a> {
                 }
             }
             "message_stop" => self.stopped = true,
-            "error" => {
-                let message = event
-                    .pointer("/error/message")
-                    .and_then(Value::as_str)
-                    .unwrap_or("unknown provider error");
-                return Err(message.to_owned());
-            }
+            "error" => return Err(crate::http::describe_error_json(&event)),
             _ => {}
         }
         Ok(())
