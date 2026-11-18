@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use chrono::{DateTime, Local, TimeZone as _};
 use gpui::{
     AnyElement, App, ClickEvent, Context, Entity, Focusable as _, FontWeight, IntoElement,
-    MouseButton, MouseDownEvent, Pixels, Point, Window, div, prelude::*, px, rgb_to_hsla,
+    MouseButton, MouseDownEvent, Pixels, Point, Task, Window, div, prelude::*, px, rgb_to_hsla,
 };
 use gpui_elements::editable_text::{EditableTextState, text_input};
 use zp_session::{Session, SessionInfo};
@@ -65,6 +65,7 @@ pub(super) struct Sidebar {
     pub search: Entity<EditableTextState>,
     /// The highlighted session (keyboard navigation, last opened).
     pub selected: Option<PathBuf>,
+    load_task: Option<Task<()>>,
 }
 
 impl Sidebar {
@@ -73,6 +74,7 @@ impl Sidebar {
             sessions: SessionList::Loading,
             search,
             selected: None,
+            load_task: None,
         }
     }
 
@@ -82,14 +84,17 @@ impl Sidebar {
 impl ProjectWindow {
     pub(crate) fn load_sessions(&mut self, cx: &mut Context<Self>) {
         let Some(dir) = AppPaths::sessions_dir(cx) else {
+            self.sidebar.load_task = None;
             self.sidebar.sessions = SessionList::Unavailable("No data directory".into());
+            cx.notify();
             return;
         };
         let root = self.root.clone();
         let listing = cx
             .background_executor()
             .spawn(async move { zp_session::SessionManager::new(dir).list(&root) });
-        cx.spawn(async move |this, cx| {
+        // Replacing the task prevents an older listing from overwriting a fresher one.
+        self.sidebar.load_task = Some(cx.spawn(async move |this, cx| {
             let result = listing.await;
             let _ = this.update(cx, |this, cx| {
                 this.sidebar.sessions = match result {
@@ -98,8 +103,7 @@ impl ProjectWindow {
                 };
                 cx.notify();
             });
-        })
-        .detach();
+        }));
     }
 
     /// Listed sessions matching the search, most recent first.
@@ -351,6 +355,7 @@ impl ProjectWindow {
                         list = list.child(
                             div()
                                 .id(("session", index))
+                                .debug_selector(move || format!("sidebar-session-{index}"))
                                 .flex()
                                 .flex_col()
                                 .px_1p5()

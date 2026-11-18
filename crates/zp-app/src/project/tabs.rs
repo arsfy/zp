@@ -128,7 +128,9 @@ impl ProjectWindow {
                         this.save_tabs(cx);
                         this.load_sessions(cx);
                     }
-                    ConversationEvent::TitleChanged => this.load_sessions(cx),
+                    ConversationEvent::SessionCreated | ConversationEvent::TitleChanged => {
+                        this.load_sessions(cx)
+                    }
                     ConversationEvent::Activity => {
                         if this.tabs[index].preview {
                             this.tabs[index].preview = false;

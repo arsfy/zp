@@ -527,6 +527,60 @@ fn closing_a_running_tab_asks_first(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+fn sidebar_shows_a_new_session_while_its_first_run_is_pending(cx: &mut TestAppContext) {
+    let faux = FauxProvider::default();
+    faux.push(FauxResponse::tool_call(
+        "ask",
+        json!({"questions": [{"question": "Continue?"}]}),
+    ));
+    faux.push(FauxResponse::text("Done"));
+    let _data = setup_models(cx, &[&faux], false);
+    let (_dir, project) = project_dir();
+    let window = open(cx, &project);
+    cx.dispatch_action(window.into(), NewChat);
+    let conversation = active(window, cx);
+    let sessions = |cx: &mut TestAppContext| {
+        window
+            .update(cx, |view, _, cx| view.visible_sessions(cx))
+            .unwrap()
+    };
+
+    assert!(sessions(cx).is_empty());
+    send(window, "New sidebar session", cx);
+    wait_until(cx, |cx| {
+        conversation.read_with(cx, |view, _| !view.pending_questions().is_empty())
+    });
+    let path = conversation
+        .read_with(cx, |view, _| {
+            assert!(view.is_running());
+            view.session_file()
+        })
+        .expect("the first prompt has been saved");
+    let listed = sessions(cx);
+    assert_eq!(
+        listed.len(),
+        1,
+        "the saved session appears before the run finishes"
+    );
+    assert_eq!(listed[0].path, path);
+    assert_eq!(listed[0].title(), "New sidebar session");
+    assert!(
+        gpui::VisualTestContext::from_window(window.into(), cx)
+            .debug_bounds("sidebar-session-0")
+            .is_some()
+    );
+
+    conversation.update(cx, |view, cx| {
+        let (call, _) = &view.pending_questions()[0];
+        view.answer_questions(call, cx);
+    });
+    idle(&conversation, 3, cx);
+    let listed = sessions(cx);
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].message_count, 3);
+}
+
+#[gpui::test]
 fn sidebar_preview_open_search_and_menu(cx: &mut TestAppContext) {
     let faux = FauxProvider::default();
     let data = setup_models(cx, &[&faux], false);

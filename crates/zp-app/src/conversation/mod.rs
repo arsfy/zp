@@ -73,6 +73,8 @@ pub type SessionHandoff = Rc<RefCell<Option<Session>>>;
 pub enum ConversationEvent {
     /// Model, reasoning level, usage or running state changed.
     StatusChanged,
+    /// The session file was written for the first time.
+    SessionCreated,
     /// A run finished (the session file changed).
     RunFinished,
     /// The session was named.
@@ -432,6 +434,10 @@ impl ConversationView {
         let subscription = coding.agent().subscribe(move |event| {
             let _ = sender.unbounded_send((Instant::now(), event.clone()));
         });
+        let mut awaiting_first_save = {
+            let session = coding.session();
+            session.file().is_some() && !session.is_persisted()
+        };
         let pump = cx.spawn(async move |this, cx| {
             while let Some(first) = receiver.next().await {
                 let mut batch = vec![first];
@@ -439,7 +445,19 @@ impl ConversationView {
                     batch.push(event);
                 }
                 if this
-                    .update(cx, |this, cx| this.apply_events(batch, cx))
+                    .update(cx, |this, cx| {
+                        // The coding session saves each completed message before forwarding it.
+                        if awaiting_first_save
+                            && batch
+                                .iter()
+                                .any(|(_, event)| matches!(event, AgentEvent::MessageEnd { .. }))
+                            && this.session_file().is_some()
+                        {
+                            awaiting_first_save = false;
+                            cx.emit(ConversationEvent::SessionCreated);
+                        }
+                        this.apply_events(batch, cx);
+                    })
                     .is_err()
                 {
                     break;
