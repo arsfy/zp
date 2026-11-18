@@ -251,16 +251,31 @@ fn terminal_links_search_selection_and_context_menu(cx: &mut TestAppContext) {
             .unwrap()
     );
 
-    cx.simulate_keystrokes(
-        window.into(),
-        if cfg!(target_os = "macos") {
-            "cmd-a cmd-c"
-        } else {
-            "ctrl-shift-a ctrl-shift-c"
-        },
-    );
-    let copied = cx.update(|cx| cx.read_from_clipboard().unwrap().text().unwrap());
-    assert!(copied.contains(LINK));
+    // Select all, then copy. ConPTY repaints the screen a moment after a resize or focus
+    // change (here: the search bar closing), and its line clears drop a selection that
+    // covers them; retry until a copy gets through.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        cx.simulate_keystrokes(
+            window.into(),
+            if cfg!(target_os = "macos") {
+                "cmd-a cmd-c"
+            } else {
+                "ctrl-shift-a ctrl-shift-c"
+            },
+        );
+        let copied = cx.update(|cx| cx.read_from_clipboard().and_then(|item| item.text()));
+        if copied.as_deref().is_some_and(|text| text.contains(LINK)) {
+            break;
+        }
+        let selected = terminal.read_with(cx, |view, _| view.term.lock().selection.is_some());
+        assert!(
+            Instant::now() < deadline,
+            "select all and copy failed (selection kept: {selected}, clipboard: {copied:?})"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+        cx.run_until_parked();
+    }
     terminal.update(cx, |view, cx| view.scroll_display(Scroll::Bottom, cx));
     cx.run_until_parked();
     let point = terminal.read_with(cx, |view, _| {

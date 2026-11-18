@@ -73,6 +73,7 @@ fn staging_keeps_controls_and_file_rows_in_place(cx: &mut TestAppContext) {
     git(&project, &["config", "user.name", "Tester"]);
     git(&project, &["config", "user.email", "t@example.com"]);
     git(&project, &["config", "commit.gpgsign", "false"]);
+    git(&project, &["config", "core.autocrlf", "false"]);
     for name in ["a.txt", "b.txt"] {
         std::fs::write(project.join(name), "before\n").unwrap();
     }
@@ -146,6 +147,8 @@ fn stage_commit_push_uncommit_history_branches_and_discard(cx: &mut TestAppConte
         ("user.name", "Tester"),
         ("user.email", "t@example.com"),
         ("commit.gpgsign", "false"),
+        // Windows runners convert to CRLF on checkout by default.
+        ("core.autocrlf", "false"),
     ] {
         git(&project, &["config", key, value]);
     }
