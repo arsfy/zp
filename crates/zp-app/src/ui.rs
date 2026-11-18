@@ -1,8 +1,8 @@
 //! Small shared UI pieces.
 
 use gpui::{
-    AnyView, App, ClickEvent, Context, Div, ElementId, IntoElement, MouseButton, Render,
-    SharedString, Stateful, Window, div, prelude::*, px, svg,
+    AnyView, App, ClickEvent, Context, Div, ElementId, Font, IntoElement, MouseButton, Pixels,
+    Render, Rgba, SharedString, Stateful, Svg, Window, div, font, prelude::*, px, svg,
 };
 
 use crate::theme::ActiveTheme;
@@ -235,6 +235,57 @@ pub fn tooltip(
 ) -> impl Fn(&mut Window, &mut App) -> AnyView + 'static {
     let text = text.into();
     move |_, cx| cx.new(|_| TextTooltip(text.clone())).into()
+}
+
+const ICON_DISCLOSURE_OPEN: &[u8] = include_bytes!("../../../assets/icons/chevron-down.svg");
+const ICON_DISCLOSURE_CLOSED: &[u8] = include_bytes!("../../../assets/icons/chevron-right.svg");
+
+/// The font of ordinary UI text (the platform's system font).
+pub fn ui_font() -> Font {
+    font(".SystemUIFont")
+}
+
+/// How far below the middle of its line box the baseline of `font` at `size` sits.
+///
+/// gpui centers a font's ascent + descent in the line box, so this is
+/// `(ascent - descent) / 2`. It differs between fonts: mixing e.g. Segoe UI with Consolas in
+/// an `items_center` row puts their baselines a few pixels apart.
+fn baseline_below_middle(cx: &App, font: &Font, size: Pixels) -> Pixels {
+    let text_system = cx.text_system();
+    let id = text_system.resolve_font(font);
+    (text_system.ascent(id, size) - text_system.descent(id, size)) / 2.
+}
+
+/// Vertical offset (for `.relative().top(…)`) that puts the baseline of single-line text
+/// in `text` font and size on the baseline of `reference` text, when both are items of the
+/// same `items_center` flex row.
+pub fn baseline_shift(cx: &App, reference: (&Font, Pixels), text: (&Font, Pixels)) -> Pixels {
+    baseline_below_middle(cx, reference.0, reference.1) - baseline_below_middle(cx, text.0, text.1)
+}
+
+/// Vertical offset (for `.relative().top(…)`) that centers an icon on the x-height of
+/// `text` when both are items of the same `items_center` flex row.
+pub fn icon_shift(cx: &App, text: (&Font, Pixels)) -> Pixels {
+    let text_system = cx.text_system();
+    let id = text_system.resolve_font(text.0);
+    baseline_below_middle(cx, text.0, text.1) - text_system.x_height(id, text.1) / 2.
+}
+
+/// A disclosure chevron (right when collapsed, down when expanded), lined up with `text`
+/// in an `items_center` row. An icon instead of ▸/▾: those glyphs come from a fallback
+/// font whose metrics differ per platform, which made them sit visibly off-center.
+pub fn disclosure_icon(expanded: bool, color: Rgba, text: (&Font, Pixels), cx: &App) -> Svg {
+    svg()
+        .data(if expanded {
+            ICON_DISCLOSURE_OPEN
+        } else {
+            ICON_DISCLOSURE_CLOSED
+        })
+        .size(px(12.))
+        .flex_shrink_0()
+        .relative()
+        .top(icon_shift(cx, text))
+        .text_color(color)
 }
 
 /// `1234` → `1.2k`, `2500000` → `2.5M`.

@@ -13,6 +13,7 @@ use zp_tools::{Answer, AskOutcome, Question, TodoList, TodoStatus};
 use super::{ConversationEvent, ConversationView};
 use crate::approvals::PendingQuestions;
 use crate::theme::ActiveTheme;
+use crate::ui::{disclosure_icon, ui_font};
 
 /// Questions of an `ask` call waiting for the user.
 pub struct QuestionCard {
@@ -430,13 +431,15 @@ impl ConversationView {
                         .id("todo-panel")
                         .debug_selector(|| "todo-panel".into())
                         .flex()
+                        .items_center()
                         .gap_2()
                         .cursor_pointer()
-                        .child(div().text_color(colors.text_muted).child(if open {
-                            "▾"
-                        } else {
-                            "▸"
-                        }))
+                        .child(disclosure_icon(
+                            open,
+                            colors.text_muted,
+                            (&ui_font(), px(12.)),
+                            cx,
+                        ))
                         .child(div().font_weight(FontWeight::SEMIBOLD).child(format!(
                             "Tasks {}/{}",
                             list.completed(),

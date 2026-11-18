@@ -20,7 +20,7 @@ use crate::markdown::{IdGen, MarkdownStyle, render_markdown};
 use crate::selectable_text::SelectableText;
 use crate::store::AppSettings;
 use crate::theme::ActiveTheme;
-use crate::ui::model_display_name;
+use crate::ui::{baseline_shift, disclosure_icon, model_display_name, ui_font};
 
 /// Readable width of the transcript and composer.
 const CONTENT_WIDTH: f32 = 820.0;
@@ -157,6 +157,7 @@ impl ConversationView {
                         div()
                             .id(ElementId::Name(key.into()))
                             .flex()
+                            .items_center()
                             .gap_2()
                             .px_3()
                             .py_1p5()
@@ -164,7 +165,12 @@ impl ConversationView {
                             .text_size(px(12.))
                             .text_color(colors.text_muted)
                             .hover_style(|s| s.bg(colors.surface_hover))
-                            .child(if expanded { "▾" } else { "▸" })
+                            .child(disclosure_icon(
+                                expanded,
+                                colors.text_muted,
+                                (&ui_font(), px(12.)),
+                                cx,
+                            ))
                             .child("Earlier messages were summarized to save context")
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.toggle_tool(&toggle_key, ix, expanded, cx)
@@ -633,11 +639,17 @@ impl ConversationView {
                         block as u64,
                     ))
                     .flex()
+                    .items_center()
                     .gap_1()
                     .text_color(colors.text_muted)
                     .italic()
                     .cursor_pointer()
-                    .child(if expanded { "▾" } else { "▸" })
+                    .child(disclosure_icon(
+                        expanded,
+                        colors.text_muted,
+                        (&ui_font(), cx.theme().metrics.font_size),
+                        cx,
+                    ))
                     .child(if live { "Thinking…" } else { "Thinking" })
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.toggle_thinking_block(row, block, expanded, cx)
@@ -738,6 +750,16 @@ impl ConversationView {
             div().text_color(status_color).child(status_text)
         };
 
+        // Name, arguments and status mix fonts and sizes; line their baselines up with the
+        // name (fonts place the baseline differently, most visibly on Windows).
+        let ui_font = ui_font();
+        let name_size = cx.theme().metrics.font_size;
+        let small = px(12.);
+        let name_text = (&ui_font, name_size);
+        let mono_font = gpui::font(mono.clone());
+        let mono_shift = baseline_shift(cx, name_text, (&mono_font, small));
+        let small_shift = baseline_shift(cx, name_text, (&ui_font, small));
+
         let call_id = call.id.clone();
         let header = div()
             .id(ElementId::Name(format!("tool-{}", call.id).into()))
@@ -746,13 +768,10 @@ impl ConversationView {
             .gap_2()
             .px_3()
             .py_1p5()
+            .text_size(name_size)
             .cursor_pointer()
             .hover_style(|s| s.bg(colors.surface_hover))
-            .child(
-                div()
-                    .text_color(colors.text_muted)
-                    .child(if expanded { "▾" } else { "▸" }),
-            )
+            .child(disclosure_icon(expanded, colors.text_muted, name_text, cx))
             .child(
                 div()
                     .font_weight(FontWeight::SEMIBOLD)
@@ -763,18 +782,29 @@ impl ConversationView {
                     .flex_1()
                     .min_w_0()
                     .truncate()
+                    .relative()
+                    .top(mono_shift)
                     .font_family(mono.clone())
-                    .text_size(px(12.))
+                    .text_size(small)
                     .text_color(colors.text_muted)
                     .child(zp_tools::describe_call(&call.name, &call.arguments, 160)),
             )
-            .child(div().flex_shrink_0().text_size(px(12.)).child(status_label))
+            .child(
+                div()
+                    .flex_shrink_0()
+                    .relative()
+                    .top(small_shift)
+                    .text_size(small)
+                    .child(status_label),
+            )
             .when(reverted, |header| {
                 header.child(
                     div()
                         .debug_selector(|| "tool-reverted".into())
                         .flex_shrink_0()
-                        .text_size(px(12.))
+                        .relative()
+                        .top(small_shift)
+                        .text_size(small)
                         .text_color(colors.text_muted)
                         .child("Reverted"),
                 )
