@@ -769,6 +769,25 @@ impl ConversationView {
         self.text_selection.clone()
     }
 
+    /// Whether every tool call has finished, and the number of rows (screenshots).
+    #[cfg(feature = "visual-tests")]
+    pub fn transcript_tool_done(&self) -> bool {
+        (0..self.transcript.len()).any(|row| {
+            self.transcript.assistant(row).is_some_and(|message| {
+                message.tool_calls().any(|call| {
+                    self.transcript
+                        .tool(&call.id)
+                        .is_some_and(|state| state.status == transcript::ToolStatus::Done)
+                })
+            })
+        })
+    }
+
+    #[cfg(feature = "visual-tests")]
+    pub fn transcript_rows(&self) -> usize {
+        self.transcript.len()
+    }
+
     /// Feeds scripted agent events, as if a run were in progress (screenshots).
     #[cfg(feature = "visual-tests")]
     pub fn inject(&mut self, events: Vec<AgentEvent>, running: bool, cx: &mut Context<Self>) {

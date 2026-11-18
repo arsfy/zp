@@ -146,6 +146,11 @@ pub fn run(out: PathBuf) {
         println!("review model screenshots written to {}", out.display());
         return;
     }
+    if std::env::var("ZP_VISUAL_SCENE").as_deref() == Ok("tool-done") {
+        tool_done(&mut cx, &root, &out);
+        println!("tool done screenshots written to {}", out.display());
+        return;
+    }
     if std::env::var("ZP_VISUAL_SCENE").as_deref() == Ok("live-status") {
         for (name, width, height) in [("desktop", 1280., 820.), ("compact", 800., 620.)] {
             let window = cx
@@ -445,6 +450,100 @@ fn update_settings(cx: &mut VisualTestAppContext, root: &std::path::Path, out: &
         cx.update_window(window.into(), |_, window, _| window.remove_window())
             .unwrap();
     }
+}
+
+/// A quick command whose follow-up response is slow to start (a local OpenAI-compatible
+/// server that answers the second request after 5 s): the card must show `done` as soon as
+/// the command ends, not when the next response arrives.
+fn tool_done(cx: &mut VisualTestAppContext, root: &std::path::Path, out: &std::path::Path) {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let listener = runtime
+        .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
+        .unwrap();
+    let base_url = format!("http://{}/v1", listener.local_addr().unwrap());
+    runtime.spawn(async move {
+        let mut requests = 0;
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            requests += 1;
+            let first = requests == 1;
+            tokio::spawn(async move {
+                let mut buffer = vec![0u8; 1 << 16];
+                let _ = socket.read(&mut buffer).await;
+                let body = if first {
+                    concat!(
+                        "data: {\"id\":\"c1\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"bash\",\"arguments\":\"{\\\"command\\\":\\\"echo hi\\\"}\"}}]}}]}\n\n",
+                        "data: {\"id\":\"c1\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+                        "data: [DONE]\n\n"
+                    )
+                } else {
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    concat!(
+                        "data: {\"id\":\"c2\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"Finished.\"}}]}\n\n",
+                        "data: {\"id\":\"c2\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+                        "data: [DONE]\n\n"
+                    )
+                };
+                let reply = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\ncontent-length: {}\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = socket.write_all(reply.as_bytes()).await;
+            });
+        }
+    });
+    cx.update(|cx| {
+        let models = cx.global::<AppModels>().models.clone();
+        zp_core::providers::register_custom_providers(
+            &models,
+            &[zp_core::settings::CustomProvider {
+                id: "local".into(),
+                name: "Local".into(),
+                base_url,
+                api: None,
+                headers: Default::default(),
+                models: vec!["m".into()],
+            }],
+        );
+        crate::store::AppSettings::update(cx, |s| s.default_model = Some("local/m".into()))
+            .unwrap();
+    });
+    let window = cx
+        .open_offscreen_window(size(px(1100.), px(700.)), |window, cx| {
+            cx.new(|cx| ProjectWindow::new(root.to_path_buf(), window, cx))
+        })
+        .unwrap();
+    pump(cx, Duration::from_millis(200));
+    cx.simulate_input(window.into(), "say hi");
+    cx.dispatch_action(window.into(), SendMessage);
+    let conversation = cx.update(|cx| {
+        window
+            .read(cx)
+            .unwrap()
+            .active_conversation()
+            .unwrap()
+            .clone()
+    });
+    let started = std::time::Instant::now();
+    loop {
+        pump(cx, Duration::from_millis(20));
+        let done = cx.update(|cx| conversation.read(cx).transcript_tool_done());
+        if done || started.elapsed() > Duration::from_secs(20) {
+            break;
+        }
+    }
+    let ended = started.elapsed();
+    pump(cx, Duration::from_millis(150));
+    let rows = cx.update(|cx| conversation.read(cx).transcript_rows());
+    println!("tool done after {ended:?}; rows when captured: {rows}");
+    cx.capture_screenshot(window.into())
+        .unwrap()
+        .save(out.join("tool-done.png"))
+        .unwrap();
+    drop(runtime);
 }
 
 fn data_dir_of(data: &tempfile::TempDir) -> PathBuf {
