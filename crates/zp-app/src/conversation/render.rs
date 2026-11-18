@@ -677,14 +677,41 @@ impl ConversationView {
 
     /// Whether a thinking block is expanded: the user's choice, else the settings.
     pub(crate) fn thinking_is_expanded(&self, row: usize, block: usize, cx: &App) -> bool {
-        self.thinking_expanded
-            .get(&(row, block))
-            .copied()
-            .unwrap_or_else(|| {
-                AppSettings::transcript(cx)
-                    .thinking()
-                    .expanded(self.transcript.thinking_is_running(row, block))
-            })
+        if let Some(expanded) = self.thinking_expanded.get(&(row, block)) {
+            return *expanded;
+        }
+        self.open_while_in_progress(
+            super::HeldBlock::Thinking { row, block },
+            AppSettings::transcript(cx).thinking(),
+            self.transcript.thinking_is_running(row, block),
+            cx,
+        )
+    }
+
+    /// Whether a block shown `display`-wise is open; `running` while in progress. A block
+    /// that opened only because it was in progress stays open for [`super::MIN_EXPANDED`]
+    /// at least, so it does not flash open and shut (`schedule_collapses` redraws it).
+    fn open_while_in_progress(
+        &self,
+        block: super::HeldBlock,
+        display: zp_core::settings::BlockDisplay,
+        running: bool,
+        cx: &App,
+    ) -> bool {
+        // The executor's clock, which the collapse timers run on too.
+        let now = cx.background_executor().now();
+        let mut held = self.held_open.borrow_mut();
+        if running && display.expanded(true) {
+            held.entry(block.clone()).or_insert(super::Held {
+                since: now,
+                collapsing: false,
+            });
+        }
+        let held_open = !running
+            && held
+                .get(&block)
+                .is_some_and(|held| now < held.since + super::MIN_EXPANDED);
+        held_open || display.expanded(running)
     }
 
     /// Whether a tool card is expanded: the user's choice, else failed calls and what the
@@ -714,7 +741,10 @@ impl ConversationView {
         } else {
             display.other_tools()
         };
-        matches!(status, Some(ToolStatus::Error)) || kind.expanded(running)
+        if matches!(status, Some(ToolStatus::Error)) {
+            return true;
+        }
+        self.open_while_in_progress(super::HeldBlock::Tool(call.id.clone()), kind, running, cx)
     }
 
     fn render_tool(&self, row: usize, call: &ToolCall, cx: &mut Context<Self>) -> AnyElement {

@@ -175,6 +175,11 @@ impl Transcript {
     }
 
     /// Whether `row` is the response being streamed.
+    /// The row of the response being streamed, if any.
+    pub fn streaming_row(&self) -> Option<usize> {
+        self.streaming.as_ref().map(|(row, _)| *row)
+    }
+
     pub fn is_streaming(&self, row: usize) -> bool {
         self.streaming
             .as_ref()

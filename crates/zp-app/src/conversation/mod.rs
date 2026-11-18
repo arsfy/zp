@@ -43,6 +43,27 @@ use crate::store::{AppModels, AppPaths};
 const FRAME_INTERVAL: Duration = Duration::from_millis(33);
 /// Status updates are less frequent than streamed text and stop when the task ends.
 const STATUS_INTERVAL: Duration = Duration::from_millis(250);
+/// Shortest time a tool card or thinking block stays open when it opened only because it
+/// was in progress (the "collapse when done" display): quick commands and short thoughts
+/// would otherwise flash open and shut.
+pub(crate) const MIN_EXPANDED: Duration = Duration::from_millis(1500);
+
+/// A transcript block that opens while it is in progress.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum HeldBlock {
+    /// A tool card, by call id.
+    Tool(String),
+    /// A thinking block of a response row.
+    Thinking { row: usize, block: usize },
+}
+
+/// When a block was first shown open because it was in progress.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Held {
+    pub(crate) since: Instant,
+    /// Its collapse has been scheduled.
+    pub(crate) collapsing: bool,
+}
 
 /// A session handed over to the window (e.g. a fork to open in a new tab).
 pub type SessionHandoff = Rc<RefCell<Option<Session>>>;
@@ -172,6 +193,12 @@ pub struct ConversationView {
     thinking_expanded: HashMap<(usize, usize), bool>,
     /// Tool cards the user toggled, by call id (overrides the default).
     tool_expanded: HashMap<String, bool>,
+    /// Blocks shown open because they were in progress. Those that collapse when done stay
+    /// open for [`MIN_EXPANDED`] at least.
+    pub(crate) held_open: RefCell<HashMap<HeldBlock, Held>>,
+    /// Held blocks that were redrawn to collapse (tests).
+    #[cfg(test)]
+    block_collapses: usize,
     /// The transcript display settings rows were last measured with.
     display: zp_core::settings::TranscriptSettings,
     markdown_cache: RefCell<HashMap<u64, Rc<Vec<Block>>>>,
@@ -286,6 +313,9 @@ impl ConversationView {
             picker_closed_at: None,
             thinking_expanded: HashMap::new(),
             tool_expanded: HashMap::new(),
+            held_open: RefCell::new(HashMap::new()),
+            #[cfg(test)]
+            block_collapses: 0,
             display: crate::store::AppSettings::transcript(cx),
             markdown_cache: RefCell::default(),
             tool_diffs: RefCell::default(),
@@ -462,10 +492,75 @@ impl ConversationView {
             self.change_log_cache.borrow_mut().take();
             cx.emit(ConversationEvent::FilesChanged);
         }
+        self.schedule_collapses(cx);
         if changes.finished && self.running {
             self.finish_run(cx);
         }
         cx.notify();
+    }
+
+    /// Whether a held block is still in progress: a running (or still being written)
+    /// tool call, or a thinking block that still receives text.
+    pub(crate) fn block_in_progress(&self, block: &HeldBlock) -> bool {
+        match block {
+            HeldBlock::Tool(id) => match self.transcript.tool(id).map(|state| state.status) {
+                Some(transcript::ToolStatus::Running) => true,
+                Some(_) => false,
+                None => self.transcript.streaming_row().is_some_and(|row| {
+                    self.transcript
+                        .assistant(row)
+                        .is_some_and(|message| message.tool_calls().any(|call| &call.id == id))
+                }),
+            },
+            HeldBlock::Thinking { row, block } => self.transcript.thinking_is_running(*row, *block),
+        }
+    }
+
+    /// The row a held block is drawn in.
+    fn held_row(&self, block: &HeldBlock) -> Option<usize> {
+        match block {
+            HeldBlock::Tool(id) => self.transcript.row_of_tool(id).or_else(|| {
+                self.transcript.streaming_row().filter(|&row| {
+                    self.transcript
+                        .assistant(row)
+                        .is_some_and(|message| message.tool_calls().any(|call| &call.id == id))
+                })
+            }),
+            HeldBlock::Thinking { row, .. } => Some(*row),
+        }
+    }
+
+    /// Redraws each held block that is no longer in progress once it has been open for
+    /// [`MIN_EXPANDED`] (rendering keeps it open until then), so it collapses on time.
+    fn schedule_collapses(&mut self, cx: &mut Context<Self>) {
+        let now = cx.background_executor().now();
+        let done: Vec<(HeldBlock, Duration)> = {
+            let mut held = self.held_open.borrow_mut();
+            held.iter_mut()
+                .filter(|(block, held)| !held.collapsing && !self.block_in_progress(block))
+                .filter_map(|(block, held)| {
+                    held.collapsing = true;
+                    let remaining = (held.since + MIN_EXPANDED).checked_duration_since(now)?;
+                    (!remaining.is_zero()).then(|| (block.clone(), remaining))
+                })
+                .collect()
+        };
+        for (block, remaining) in done {
+            cx.spawn(async move |this, cx| {
+                cx.background_executor().timer(remaining).await;
+                let _ = this.update(cx, |this, cx| {
+                    if let Some(row) = this.held_row(&block) {
+                        this.list_state.remeasure_items(row..row + 1);
+                        #[cfg(test)]
+                        {
+                            this.block_collapses += 1;
+                        }
+                        cx.notify();
+                    }
+                });
+            })
+            .detach();
+        }
     }
 
     /// Tracks the streaming response; returns whether the output speed was updated.
@@ -564,6 +659,7 @@ impl ConversationView {
         if let Some(coding) = &self.coding {
             self.transcript = Transcript::from_messages(&coding.agent().messages());
             self.editing = None;
+            self.held_open.borrow_mut().clear();
             self.list_state.reset(self.transcript.len() + 1);
             self.list_state.set_follow_mode(gpui::FollowMode::Tail);
         }
@@ -890,7 +986,8 @@ impl ConversationView {
             return;
         };
         if let Some(previous) = self.editing.take() {
-            self.list_state.remeasure_items(previous.row..previous.row + 1);
+            self.list_state
+                .remeasure_items(previous.row..previous.row + 1);
         }
         let input = cx.new(|cx| EditableTextState::new(StringStorage::from(text.clone()), cx));
         input.update(cx, |input, cx| input.move_to(text.len(), cx));
@@ -1641,11 +1738,11 @@ mod tests {
             .unwrap();
         });
         conversation.update(cx, |view, cx| {
-            let mut message = AssistantMessage::empty("faux", "faux", "faux-1");
+            let message = AssistantMessage::empty("faux", "faux", "faux-1");
             apply(
                 view,
                 AgentEvent::MessageStart {
-                    message: message.clone().into(),
+                    message: message.into(),
                 },
                 cx,
             );
@@ -1670,10 +1767,21 @@ mod tests {
                 },
                 cx,
             );
-            assert!(!view.thinking_is_expanded(0, 0, cx));
+            assert!(
+                view.thinking_is_expanded(0, 0, cx),
+                "a block that opened while thinking stays open a moment"
+            );
             assert!(view.transcript.is_streaming(0));
+        });
+        cx.executor().advance_clock(MIN_EXPANDED);
+        cx.run_until_parked();
+        conversation.update(cx, |view, cx| {
+            assert!(!view.thinking_is_expanded(0, 0, cx));
+            assert_eq!(view.block_collapses, 1, "redrawn when the hold ends");
             view.toggle_thinking_block(0, 0, false, cx);
             assert!(view.thinking_is_expanded(0, 0, cx));
+            // The finished response, completed with the streamed calls below.
+            let mut message = AssistantMessage::empty("faux", "faux", "faux-1");
 
             for (index, call) in calls.iter().enumerate() {
                 apply(
@@ -1734,6 +1842,24 @@ mod tests {
                     },
                     cx,
                 );
+                assert!(
+                    view.tool_is_expanded(0, call, false, cx),
+                    "a card that opened while running stays open a moment"
+                );
+            }
+        });
+        // Then the cards collapse (apart from the one the user opened), redrawn on time.
+        cx.run_until_parked();
+        let collapses = conversation.read_with(cx, |view, _| view.block_collapses);
+        cx.executor().advance_clock(MIN_EXPANDED);
+        cx.run_until_parked();
+        assert_eq!(
+            conversation.read_with(cx, |view, _| view.block_collapses),
+            collapses + calls.len(),
+            "each held card is redrawn when its hold ends"
+        );
+        conversation.update(cx, |view, cx| {
+            for call in &calls {
                 assert_eq!(
                     view.tool_is_expanded(0, call, false, cx),
                     call.name == "edit"
