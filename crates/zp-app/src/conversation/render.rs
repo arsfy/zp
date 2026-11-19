@@ -25,7 +25,10 @@ use crate::markdown::{IdGen, MarkdownStyle, render_markdown};
 use crate::selectable_text::SelectableText;
 use crate::store::AppSettings;
 use crate::theme::ActiveTheme;
-use crate::ui::{baseline_shift, disclosure_icon, model_display_name, ui_font};
+use crate::ui::{
+    TAB_WIDTH, TERMINAL_TAB_WIDTH, baseline_shift, disclosure_icon, expand_tabs,
+    model_display_name, ui_font,
+};
 
 /// Readable width of the transcript and composer.
 const CONTENT_WIDTH: f32 = 820.0;
@@ -57,7 +60,7 @@ fn wrappable_error(text: &str) -> SharedString {
         LazyLock::new(|| Regex::new(&format!(r"[!-~]{{{},}}", CHUNK_LENGTH + 1)).unwrap());
 
     LONG_RUN
-        .replace_all(text, |captures: &Captures<'_>| {
+        .replace_all(&expand_tabs(text, TAB_WIDTH), |captures: &Captures<'_>| {
             let run = &captures[0];
             let mut wrapped = String::new();
             for start in (0..run.len()).step_by(CHUNK_LENGTH) {
@@ -570,7 +573,7 @@ impl ConversationView {
             .child(SelectableText::new(
                 id("user-text", row),
                 (row, 0, 0),
-                text.to_owned().into(),
+                expand_tabs(text, TAB_WIDTH).into_owned().into(),
                 self.text_selection.clone(),
                 "\n\n",
             ))
@@ -695,7 +698,7 @@ impl ConversationView {
                             .text_color(colors.text_muted)
                             .child(gpui::Text::new(
                                 id(format!("thinking-text-{row}"), block),
-                                text.to_owned().into(),
+                                expand_tabs(text, TAB_WIDTH).into_owned().into(),
                             )),
                     )
                     .into_any_element()
@@ -888,7 +891,13 @@ impl ConversationView {
                     .font_family(mono.clone())
                     .text_size(small)
                     .text_color(colors.text_muted)
-                    .child(zp_tools::describe_call(&call.name, &call.arguments, 160)),
+                    .child(
+                        expand_tabs(
+                            &zp_tools::describe_call(&call.name, &call.arguments, 160),
+                            TAB_WIDTH,
+                        )
+                        .into_owned(),
+                    ),
             )
             .child(
                 div()
@@ -1012,6 +1021,12 @@ impl ConversationView {
                     )),
                 )
             };
+            let tab_width = if call.name == "bash" {
+                TERMINAL_TAB_WIDTH
+            } else {
+                TAB_WIDTH
+            };
+            let shown = expand_tabs(&shown, tab_width).into_owned();
             let empty = shown.trim().is_empty();
             div()
                 .px_3()

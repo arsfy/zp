@@ -332,6 +332,39 @@ pub fn disclosure_icon(openness: f32, color: Rgba, text: (&Font, Pixels), cx: &A
         .text_color(color)
 }
 
+/// Columns between tab stops in code and messages; command output uses a terminal's
+/// [`TERMINAL_TAB_WIDTH`].
+pub const TAB_WIDTH: usize = 4;
+pub const TERMINAL_TAB_WIDTH: usize = 8;
+
+/// Text as drawn: tabs become spaces up to the next tab stop, every `width` columns.
+/// gpui has no tab stops and draws a tab as a missing-glyph box.
+pub fn expand_tabs(text: &str, width: usize) -> std::borrow::Cow<'_, str> {
+    if !text.contains('\t') {
+        return text.into();
+    }
+    let mut expanded = String::with_capacity(text.len() + width);
+    let mut column = 0;
+    for c in text.chars() {
+        match c {
+            '\t' => {
+                let spaces = width - column % width;
+                expanded.extend(std::iter::repeat_n(' ', spaces));
+                column += spaces;
+            }
+            '\n' | '\r' => {
+                expanded.push(c);
+                column = 0;
+            }
+            c => {
+                expanded.push(c);
+                column += 1;
+            }
+        }
+    }
+    expanded.into()
+}
+
 /// `1234` → `1.2k`, `2500000` → `2.5M`.
 pub fn format_tokens(tokens: u64) -> String {
     match tokens {
@@ -344,6 +377,16 @@ pub fn format_tokens(tokens: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tabs_expand_to_the_next_tab_stop() {
+        assert_eq!(expand_tabs("no tabs", 4), "no tabs");
+        assert_eq!(expand_tabs("\tx", 4), "    x");
+        assert_eq!(
+            expand_tabs("arsfy/zp\t1\tfalse\nab\tc", 8),
+            "arsfy/zp        1       false\nab      c"
+        );
+    }
 
     #[test]
     fn shortcut_labels() {

@@ -29,7 +29,8 @@ impl Inline {
             return;
         }
         let start = self.text.len();
-        self.text.push_str(text);
+        self.text
+            .push_str(&crate::ui::expand_tabs(text, crate::ui::TAB_WIDTH));
         let end = self.text.len();
         if style == SpanStyle::default() {
             return;

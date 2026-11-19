@@ -480,7 +480,10 @@ impl ConversationView {
                             .bg(colors.code_background)
                             .font_family(mono.clone())
                             .text_size(px(12.))
-                            .child(format!("$ {command}")),
+                            .child(format!(
+                                "$ {}",
+                                crate::ui::expand_tabs(&command, crate::ui::TAB_WIDTH)
+                            )),
                     )
                 })
                 .when_some(approval.preview.clone(), |this, preview| {

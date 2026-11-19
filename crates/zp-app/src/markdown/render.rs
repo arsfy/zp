@@ -8,6 +8,7 @@ use gpui::{
 use super::parse::{Block, Inline};
 use crate::selectable_text::{SelectableText, TextSelection};
 use crate::theme::ActiveTheme;
+use crate::ui::{TAB_WIDTH, expand_tabs};
 
 /// Colors and fonts used for markdown.
 #[derive(Clone)]
@@ -273,8 +274,10 @@ fn code_block(
                 .font_family(style.mono_font.clone())
                 .text_size(px(12.))
                 .child({
-                    let code = ids.text(text.to_owned().into());
-                    match super::highlight::highlight(language, text, style.dark) {
+                    // Copy keeps the tabs; the block shows them as spaces.
+                    let text = expand_tabs(text, TAB_WIDTH);
+                    let code = ids.text(text.to_string().into());
+                    match super::highlight::highlight(language, &text, style.dark) {
                         Some(highlights) => code.highlights((*highlights).clone()),
                         None => code,
                     }
