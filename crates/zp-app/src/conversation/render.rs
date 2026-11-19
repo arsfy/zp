@@ -1,12 +1,13 @@
 //! Rendering of the conversation: transcript rows, tool cards and the composer.
 
 use std::sync::LazyLock;
+use std::time::Duration;
 
 use gpui::{
-    Anchor, AnyElement, App, ClipboardItem, ColorExt as _, Context, DispatchPhase, Div, ElementId,
-    FontWeight, IntoElement, MouseButton, Render, Rgba, SharedString, Window, anchored, canvas,
-    deferred, div, linear_color_stop, linear_gradient, list, point, prelude::*, px, relative,
-    rgb_to_hsla, svg,
+    Anchor, Animation, AnimationExt as _, AnyElement, App, ClipboardItem, ColorExt as _, Context,
+    DispatchPhase, Div, ElementId, FontWeight, IntoElement, MouseButton, Render, Rgba,
+    SharedString, Window, anchored, canvas, deferred, div, ease_out_quint, linear_color_stop,
+    linear_gradient, list, point, prelude::*, px, relative, rgb_to_hsla, svg,
 };
 use gpui_elements::editable_text::{text_area, text_input};
 use regex::{Captures, Regex};
@@ -14,6 +15,7 @@ use zp_ai::{AssistantContent, StopReason, ToolCall};
 use zp_core::changes::{RevertStatus, Scope};
 use zp_core::checkpoint::RecordedChange;
 
+use super::disclosure::collapsible;
 use super::permissions::permission_mode_color;
 use super::transcript::{Row, ToolStatus};
 use super::{COMPOSER_CARD_RADIUS, ConversationEvent, ConversationView, Picker};
@@ -68,6 +70,15 @@ fn wrappable_error(text: &str) -> SharedString {
         })
         .into_owned()
         .into()
+}
+
+/// How far a popover rises, and the session tree slides in, as they open.
+const POPOVER_RISE: f32 = 4.;
+const TREE_SLIDE: f32 = 24.;
+
+/// The opening of a popover or panel: quick, slowing to a stop.
+fn popover_animation() -> Animation {
+    Animation::new(Duration::from_millis(150)).with_easing(ease_out_quint())
 }
 
 /// Height of the fade above the floating composer.
@@ -140,12 +151,7 @@ fn ghost_button_with_color(
 }
 
 impl ConversationView {
-    fn render_row(
-        &mut self,
-        ix: usize,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
+    fn render_row(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         if ix >= self.transcript.len() {
             // Room for the floating composer at the end.
             return div()
@@ -168,15 +174,27 @@ impl ConversationView {
                 let colors = cx.theme().colors.clone();
                 let key = format!("compaction-{ix}");
                 let expanded = self.tool_expanded.get(&key).copied().unwrap_or(false);
+                let openness = self.disclosures.openness(key.clone(), expanded, cx);
                 let toggle_key = key.clone();
-                let summary = expanded.then(|| {
+                let summary = collapsible(&openness, || {
                     let blocks = self.parsed_markdown(text);
                     let mut ids = IdGen::new(
                         format!("compaction-md-{ix}"),
                         (ix, 0),
                         self.text_selection.clone(),
                     );
-                    render_markdown(&blocks, &MarkdownStyle::from_theme(cx), &mut ids)
+                    let markdown =
+                        render_markdown(&blocks, &MarkdownStyle::from_theme(cx), &mut ids);
+                    Some(
+                        div()
+                            .px_3()
+                            .pb_2()
+                            .pt_1()
+                            .border_t_1()
+                            .border_color(colors.border)
+                            .child(markdown)
+                            .into_any_element(),
+                    )
                 });
                 div()
                     .flex()
@@ -198,7 +216,7 @@ impl ConversationView {
                             .text_color(colors.text_muted)
                             .hover_style(|s| s.bg(colors.surface_hover))
                             .child(disclosure_icon(
-                                expanded,
+                                openness.value,
                                 colors.text_muted,
                                 (&ui_font(), px(12.)),
                                 cx,
@@ -208,17 +226,7 @@ impl ConversationView {
                                 this.toggle_tool(&toggle_key, ix, expanded, cx)
                             })),
                     )
-                    .when_some(summary, |this, summary| {
-                        this.child(
-                            div()
-                                .px_3()
-                                .pb_2()
-                                .pt_1()
-                                .border_t_1()
-                                .border_color(colors.border)
-                                .child(summary),
-                        )
-                    })
+                    .children(summary)
                     .into_any_element()
             }
             Some(Row::Notice { kind, text, .. }) if kind == zp_core::changes::FILE_RESTORE_TYPE => {
@@ -258,7 +266,7 @@ impl ConversationView {
             None => div().into_any_element(),
         };
         let footer = row.and_then(|row| self.render_row_footer(ix, &row, cx));
-        centered(
+        let row = centered(
             div()
                 .py_1()
                 .flex()
@@ -268,7 +276,13 @@ impl ConversationView {
                 .children(footer)
                 .children(self.render_turn_changes(ix, cx)),
         )
-        .into_any_element()
+        .into_any_element();
+        // A block opening or closing: draw it again next frame (rows on screen are
+        // remeasured on every draw, so the row follows its height).
+        if self.disclosures.take_animating() {
+            window.request_animation_frame();
+        }
+        row
     }
 
     /// Whether row `ix` ends a turn (the next row is not part of the same answer).
@@ -666,10 +680,30 @@ impl ConversationView {
         let colors = cx.theme().colors.clone();
         let expanded = self.thinking_is_expanded(row, block, cx);
         let text = text.trim();
+        let openness = self
+            .disclosures
+            .openness(format!("thinking-{row}-{block}"), expanded, cx);
+        let body = collapsible(&openness, || {
+            (!text.is_empty()).then(|| {
+                div()
+                    .pt_1()
+                    .child(
+                        div()
+                            .pl_3()
+                            .border_l_2()
+                            .border_color(colors.border)
+                            .text_color(colors.text_muted)
+                            .child(gpui::Text::new(
+                                id(format!("thinking-text-{row}"), block),
+                                text.to_owned().into(),
+                            )),
+                    )
+                    .into_any_element()
+            })
+        });
         div()
             .flex()
             .flex_col()
-            .gap_1()
             .child(
                 div()
                     .id(ElementId::NamedInteger(
@@ -683,7 +717,7 @@ impl ConversationView {
                     .italic()
                     .cursor_pointer()
                     .child(disclosure_icon(
-                        expanded,
+                        openness.value,
                         colors.text_muted,
                         (&ui_font(), cx.theme().metrics.font_size),
                         cx,
@@ -693,19 +727,7 @@ impl ConversationView {
                         this.toggle_thinking_block(row, block, expanded, cx)
                     })),
             )
-            .when(expanded && !text.is_empty(), |this| {
-                this.child(
-                    div()
-                        .pl_3()
-                        .border_l_2()
-                        .border_color(colors.border)
-                        .text_color(colors.text_muted)
-                        .child(gpui::Text::new(
-                            id(format!("thinking-text-{row}"), block),
-                            text.to_owned().into(),
-                        )),
-                )
-            })
+            .children(body)
             .into_any_element()
     }
 
@@ -792,6 +814,9 @@ impl ConversationView {
             .and_then(RecordedChange::from_details);
         let reverted = change.is_some() && self.change_log().tool_reverted(&call.id);
         let expanded = self.tool_is_expanded(row, call, change.is_some(), cx);
+        let openness = self
+            .disclosures
+            .openness(format!("tool-{}", call.id), expanded, cx);
 
         let approval = self.render_approval(&call.id, cx);
         let question = self.render_questions(&call.id, cx);
@@ -842,7 +867,12 @@ impl ConversationView {
             .text_size(name_size)
             .cursor_pointer()
             .hover_style(|s| s.bg(colors.surface_hover))
-            .child(disclosure_icon(expanded, colors.text_muted, name_text, cx))
+            .child(disclosure_icon(
+                openness.value,
+                colors.text_muted,
+                name_text,
+                cx,
+            ))
             .child(
                 div()
                     .font_weight(FontWeight::SEMIBOLD)
@@ -912,20 +942,57 @@ impl ConversationView {
                 cx.listener(move |this, _, _, cx| this.toggle_tool(&call_id, row, expanded, cx)),
             );
 
-        let diff_body = change
-            .as_ref()
-            .filter(|_| expanded)
-            .map(|change| self.render_inline_diff(&call.id, change, cx));
-        let details_body = state
-            .filter(|state| state.status == ToolStatus::Done && expanded && question.is_none())
+        let waiting = approval.is_some() || question.is_some();
+        let content = collapsible(&openness, || {
+            self.render_tool_body(call, change.as_ref(), waiting, question.is_some(), cx)
+        });
+
+        div()
+            .flex()
+            .flex_col()
+            .rounded(px(6.))
+            .border_1()
+            .border_color(if matches!(status, Some(ToolStatus::Error)) {
+                colors.error
+            } else {
+                colors.border
+            })
+            .bg(colors.surface)
+            .overflow_hidden()
+            .when(approval.is_some(), |this| this.border_color(colors.warning))
+            .when(question.is_some(), |this| this.border_color(colors.accent))
+            .child(header)
+            .children(approval)
+            .children(question)
+            .children(content)
+            .into_any_element()
+    }
+
+    /// What an open tool card shows under its header: the diff of a file change, the
+    /// tool's own details, or its output.
+    fn render_tool_body(
+        &self,
+        call: &ToolCall,
+        change: Option<&RecordedChange>,
+        waiting: bool,
+        asking: bool,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let colors = cx.theme().colors.clone();
+        let mono = cx.theme().metrics.mono_font.clone();
+        let state = self.transcript.tool(&call.id);
+        let status = state.map(|state| state.status);
+        if let Some(change) = change {
+            return Some(self.render_inline_diff(&call.id, change, cx));
+        }
+        let details = state
+            .filter(|state| state.status == ToolStatus::Done && !asking)
             .and_then(|state| state.details.as_ref())
             .and_then(|details| self.render_tool_details(&call.name, details, cx));
-        let body = (expanded
-            && diff_body.is_none()
-            && details_body.is_none()
-            && approval.is_none()
-            && question.is_none())
-        .then(|| {
+        if details.is_some() {
+            return details;
+        }
+        (!waiting).then(|| {
             let output = state.map(|state| state.output.as_str()).unwrap_or_default();
             let lines: Vec<&str> = output.lines().collect();
             let (shown, note) = if lines.len() <= OUTPUT_PREVIEW_LINES {
@@ -972,29 +1039,8 @@ impl ConversationView {
                         })
                         .child(shown)
                 })
-        });
-
-        div()
-            .flex()
-            .flex_col()
-            .rounded(px(6.))
-            .border_1()
-            .border_color(if matches!(status, Some(ToolStatus::Error)) {
-                colors.error
-            } else {
-                colors.border
-            })
-            .bg(colors.surface)
-            .overflow_hidden()
-            .when(approval.is_some(), |this| this.border_color(colors.warning))
-            .when(question.is_some(), |this| this.border_color(colors.accent))
-            .child(header)
-            .children(approval)
-            .children(question)
-            .children(diff_body)
-            .children(details_body)
-            .children(body)
-            .into_any_element()
+                .into_any_element()
+        })
     }
 
     /// The diff of a file change under its tool card (the first lines; the rest in the
@@ -1226,6 +1272,7 @@ impl ConversationView {
     }
 
     /// Wraps menu content in a floating panel that opens upward from its anchor.
+    /// A menu above a composer button; it fades in and rises slightly as it opens.
     pub(super) fn popover(&self, content: gpui::Div, cx: &mut Context<Self>) -> AnyElement {
         let colors = cx.theme().colors.clone();
         deferred(
@@ -1245,7 +1292,13 @@ impl ConversationView {
                             this.picker = None;
                             this.picker_closed_at = Some(std::time::Instant::now());
                             cx.notify();
-                        })),
+                        }))
+                        .with_animation("popover-open", popover_animation(), |popover, t| {
+                            popover
+                                .opacity(t)
+                                .relative()
+                                .top(px(POPOVER_RISE * (1. - t)))
+                        }),
                 ),
         )
         .priority(1)
@@ -1746,7 +1799,6 @@ impl ConversationView {
             .id("session-tree")
             .absolute()
             .top_0()
-            .right_0()
             .bottom_0()
             .w(px(340.))
             .flex()
@@ -1793,12 +1845,16 @@ impl ConversationView {
                     .text_size(px(12.))
                     .children(items),
             )
+            // Slides in from the right edge as it opens.
+            .with_animation("session-tree-open", popover_animation(), |panel, t| {
+                panel.right(px(-TREE_SLIDE * (1. - t))).opacity(t)
+            })
             .into_any_element()
     }
 }
 
 impl Render for ConversationView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.text_selection.begin_frame();
         let display = AppSettings::transcript(cx);
         if display != self.display {
@@ -1903,6 +1959,13 @@ impl Render for ConversationView {
             .child(self.render_composer(cx))
             .when(self.tree_open, |this| this.child(self.render_tree(cx)))
             .children(self.review_model_picker.clone())
+            .map(|this| {
+                // The task list opening or closing above the composer.
+                if self.disclosures.take_animating() {
+                    window.request_animation_frame();
+                }
+                this
+            })
     }
 }
 
@@ -2068,6 +2131,76 @@ mod tests {
     use crate::tests_conversation::{active, idle, open, send, setup_models};
 
     use super::wrappable_error;
+    use crate::conversation::disclosure::DURATION;
+
+    #[gpui::test]
+    fn tool_cards_slide_open_and_shut(cx: &mut TestAppContext) {
+        let faux = FauxProvider::default();
+        faux.push(FauxResponse::tool_call(
+            "bash",
+            serde_json::json!({"command": "printf 'one\\ntwo\\nthree\\nfour\\n'"}),
+        ));
+        faux.push(FauxResponse::text("Done"));
+        let _data = setup_models(cx, &[&faux], false);
+        let (_dir, project) = project_dir();
+        let window = open(cx, &project);
+        let conversation = active(window, cx);
+        send(window, "Run it", cx);
+        idle(&conversation, 3, cx);
+        let call = conversation.read_with(cx, |view, _| {
+            let call = view.transcript().assistant(1).unwrap().tool_calls().next();
+            call.unwrap().clone()
+        });
+        let selector = format!("disclosure-tool-{}", call.id);
+        let selector: &'static str = Box::leak(selector.into_boxed_str());
+        let height = |cx: &mut TestAppContext| {
+            cx.run_until_parked();
+            VisualTestContext::from_window(window.into(), cx)
+                .debug_bounds(selector)
+                .map(|bounds| f32::from(bounds.size.height))
+        };
+        // The frame a moving block asked for, drawn at the clock's current time.
+        let next_frame = |cx: &mut TestAppContext| {
+            let requested = window
+                .update(cx, |_, window, cx| window.simulate_next_frame(cx))
+                .unwrap();
+            assert!(requested > 0, "a moving block asks for another frame");
+            height(cx)
+        };
+        let toggle = |cx: &mut TestAppContext| {
+            conversation.update(cx, |view, cx| {
+                let expanded = view.tool_is_expanded(1, &call, false, cx);
+                view.toggle_tool(&call.id, 1, expanded, cx);
+                expanded
+            })
+        };
+
+        // Close the card at once, then open it with motion.
+        if !toggle(cx) {
+            toggle(cx);
+        }
+        assert_eq!(height(cx), None);
+        cx.update(|cx| cx.set_reduce_motion(false));
+        assert!(!toggle(cx));
+        assert_eq!(height(cx), Some(0.), "opening starts closed");
+        cx.executor().advance_clock(DURATION / 2);
+        let half = next_frame(cx).unwrap();
+        cx.executor().advance_clock(DURATION);
+        let full = next_frame(cx).unwrap();
+        assert!(0. < half && half < full, "{half} of {full}");
+
+        toggle(cx);
+        assert_eq!(height(cx), Some(full), "closing starts open");
+        cx.executor().advance_clock(DURATION / 2);
+        let closing = next_frame(cx).unwrap();
+        assert!(0. < closing && closing < full, "{closing} of {full}");
+        cx.executor().advance_clock(DURATION);
+        assert_eq!(
+            next_frame(cx),
+            None,
+            "closed: the output is no longer drawn"
+        );
+    }
 
     #[gpui::test]
     fn thinking_trims_display_edges_without_losing_streamed_separators(cx: &mut TestAppContext) {

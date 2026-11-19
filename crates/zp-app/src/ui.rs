@@ -2,7 +2,8 @@
 
 use gpui::{
     AnyView, App, ClickEvent, Context, Div, ElementId, Font, IntoElement, MouseButton, Pixels,
-    Render, Rgba, SharedString, Stateful, Svg, Window, div, font, prelude::*, px, svg,
+    Render, Rgba, SharedString, Stateful, Svg, Transformation, Window, div, font, prelude::*, px,
+    radians, svg,
 };
 
 use crate::theme::ActiveTheme;
@@ -279,8 +280,7 @@ pub fn tooltip(
     move |_, cx| cx.new(|_| TextTooltip(text.clone())).into()
 }
 
-const ICON_DISCLOSURE_OPEN: &[u8] = include_bytes!("../../../assets/icons/chevron-down.svg");
-const ICON_DISCLOSURE_CLOSED: &[u8] = include_bytes!("../../../assets/icons/chevron-right.svg");
+const ICON_DISCLOSURE: &[u8] = include_bytes!("../../../assets/icons/chevron-right.svg");
 
 /// The font of ordinary UI text (the platform's system font).
 pub fn ui_font() -> Font {
@@ -316,13 +316,15 @@ pub fn icon_shift(cx: &App, text: (&Font, Pixels)) -> Pixels {
 /// A disclosure chevron (right when collapsed, down when expanded), lined up with `text`
 /// in an `items_center` row. An icon instead of ▸/▾: those glyphs come from a fallback
 /// font whose metrics differ per platform, which made them sit visibly off-center.
-pub fn disclosure_icon(expanded: bool, color: Rgba, text: (&Font, Pixels), cx: &App) -> Svg {
+///
+/// `openness` runs from 0 (closed, pointing right) to 1 (open, pointing down): in between,
+/// while the block opens or closes, the chevron is turned that far.
+pub fn disclosure_icon(openness: f32, color: Rgba, text: (&Font, Pixels), cx: &App) -> Svg {
     svg()
-        .data(if expanded {
-            ICON_DISCLOSURE_OPEN
-        } else {
-            ICON_DISCLOSURE_CLOSED
-        })
+        .data(ICON_DISCLOSURE)
+        .with_transformation(Transformation::rotate(radians(
+            openness.clamp(0., 1.) * std::f32::consts::FRAC_PI_2,
+        )))
         .size(px(12.))
         .flex_shrink_0()
         .relative()

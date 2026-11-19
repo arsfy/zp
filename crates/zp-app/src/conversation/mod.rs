@@ -5,6 +5,7 @@
 //! for every token.
 
 pub mod composer;
+mod disclosure;
 mod files;
 mod permissions;
 mod progress;
@@ -200,6 +201,8 @@ pub struct ConversationView {
     /// Blocks shown open because they were in progress. Those that collapse when done stay
     /// open for [`MIN_EXPANDED`] at least.
     pub(crate) held_open: RefCell<HashMap<HeldBlock, Held>>,
+    /// Open and close transitions of collapsible blocks.
+    disclosures: disclosure::Disclosures,
     /// Held blocks that were redrawn to collapse (tests).
     #[cfg(test)]
     block_collapses: usize,
@@ -320,6 +323,7 @@ impl ConversationView {
             thinking_expanded: HashMap::new(),
             tool_expanded: HashMap::new(),
             held_open: RefCell::new(HashMap::new()),
+            disclosures: disclosure::Disclosures::default(),
             #[cfg(test)]
             block_collapses: 0,
             display: crate::store::AppSettings::transcript(cx),
@@ -474,6 +478,7 @@ impl ConversationView {
         self.text_selection.clear();
         self.turn_changes.borrow_mut().clear();
         self.change_log_cache.borrow_mut().take();
+        self.disclosures.clear();
         self.transcript = Transcript::from_messages(&coding.agent().messages());
         // One more item at the end: room for the floating composer.
         self.list_state = ListState::new(self.transcript.len() + 1, ListAlignment::Top, px(1000.));
@@ -683,6 +688,7 @@ impl ConversationView {
             self.transcript = Transcript::from_messages(&coding.agent().messages());
             self.editing = None;
             self.held_open.borrow_mut().clear();
+            self.disclosures.clear();
             self.list_state.reset(self.transcript.len() + 1);
             self.list_state.set_follow_mode(gpui::FollowMode::Tail);
         }

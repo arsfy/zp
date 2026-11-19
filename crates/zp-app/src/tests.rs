@@ -19,7 +19,11 @@ pub(crate) fn setup(cx: &mut TestAppContext, state: Option<AppState>) -> TempDir
             .unwrap();
     }
     let dir = data.path().to_path_buf();
-    cx.update(|cx| crate::init(Some(dir), cx));
+    cx.update(|cx| {
+        crate::init(Some(dir), cx);
+        // Blocks open and close at once; animation tests turn motion back on.
+        cx.set_reduce_motion(true);
+    });
     data
 }
 

@@ -105,6 +105,8 @@ pub fn run(out: PathBuf) {
     let data_dir = data.path().to_path_buf();
     cx.update(|cx| {
         crate::init(Some(data_dir), cx);
+        // Screenshots show blocks fully open or closed, not mid-way.
+        cx.set_reduce_motion(true);
         gpui_tokio::init(cx);
         let mut models = Models::new();
         models.set_provider(Arc::new(faux.clone()));

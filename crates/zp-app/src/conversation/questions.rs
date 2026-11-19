@@ -10,6 +10,7 @@ use gpui_elements::editable_text::{EditableTextState, StringStorage, text_input}
 use serde_json::Value;
 use zp_tools::{Answer, AskOutcome, Question, TodoList, TodoStatus};
 
+use super::disclosure::collapsible;
 use super::render::icon_button;
 use super::{COMPOSER_CARD_RADIUS, ConversationEvent, ConversationView};
 use crate::approvals::PendingQuestions;
@@ -411,6 +412,7 @@ impl ConversationView {
         let (call_id, list) = self.current_todos()?;
         let colors = cx.theme().colors.clone();
         let open = self.todos_open;
+        let openness = self.disclosures.openness("todos", open, cx);
         let completed = list.completed();
         let current = list
             .current()
@@ -426,7 +428,7 @@ impl ConversationView {
             .gap_2()
             .cursor_pointer()
             .child(disclosure_icon(
-                open,
+                openness.value,
                 colors.text_muted,
                 (&ui_font(), px(12.)),
                 cx,
@@ -453,7 +455,6 @@ impl ConversationView {
             div()
                 .flex()
                 .flex_col()
-                .gap_0p5()
                 .px_3()
                 .py_1p5()
                 .rounded(px(COMPOSER_CARD_RADIUS))
@@ -485,9 +486,17 @@ impl ConversationView {
                         )
                     },
                 ))
-                .when(open, |this| {
-                    this.children(list.todos.iter().map(|item| todo_row(item, cx)))
-                })
+                .children(collapsible(&openness, || {
+                    Some(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_0p5()
+                            .pt_0p5()
+                            .children(list.todos.iter().map(|item| todo_row(item, cx)))
+                            .into_any_element(),
+                    )
+                }))
                 .into_any_element(),
         )
     }
