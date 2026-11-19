@@ -2,14 +2,15 @@
 //! commit message and commit, the branch picker, push / pull / fetch, undoing the last
 //! commit, and the history with each commit's diff.
 
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use gpui::{
     AnyElement, App, AppContext as _, ClickEvent, ColorExt as _, Context, DismissEvent, Entity,
     EventEmitter, Focusable as _, FontWeight, IntoElement, Pixels, Point, PromptLevel, Render,
-    Rgba, SharedString, Subscription, Task, Window, anchored, deferred, div, prelude::*, px,
-    rgb_to_hsla, svg,
+    Rgba, SharedString, Subscription, Task, UniformListScrollHandle, Window, anchored, deferred,
+    div, prelude::*, px, rgb_to_hsla, svg, uniform_list,
 };
 use gpui_elements::editable_text::{
     EditableTextState, StringStorage, TextChanged, text_area, text_input,
@@ -132,6 +133,8 @@ pub struct GitPanel {
     branch_picker: Option<BranchPicker>,
     status_task: Option<Task<()>>,
     history_task: Option<Task<()>>,
+    /// Scroll position of the history list.
+    history_scroll: UniformListScrollHandle,
     op_task: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
 }
@@ -160,6 +163,7 @@ impl GitPanel {
             branch_picker: None,
             status_task: None,
             history_task: None,
+            history_scroll: UniformListScrollHandle::new(),
             op_task: None,
             _subscriptions: subscriptions,
         }
@@ -1640,88 +1644,114 @@ impl GitPanel {
         )
     }
 
+    /// The history: a virtual list, so only the commits in view are built and laid out
+    /// (a long history drawn whole slowed every frame of the window).
     fn render_history(&self, cx: &mut Context<Self>) -> AnyElement {
-        let colors = cx.theme().colors.clone();
         let Some(history) = &self.history else {
             return message("Loading…", cx);
         };
         if history.is_empty() {
             return message("No commits yet.", cx);
         }
-        let ahead = self.status().map_or(0, |s| s.ahead);
-        let has_upstream = self.status().is_some_and(|s| s.upstream.is_some());
-        let now = zp_ai::now_ms();
-        let rows = history.iter().enumerate().map(|(index, commit)| {
-            let open = commit.clone();
-            let unpushed = has_upstream && index < ahead;
-            div()
-                .id(("git-commit-row", index))
-                .debug_selector(move || format!("git-commit-{index}"))
-                .flex()
-                .flex_col()
-                .px_3()
-                .py_1()
-                .cursor_pointer()
-                .hover_style(|s| s.bg(colors.surface_hover))
-                .child(
-                    div()
-                        .flex()
-                        .gap_1p5()
-                        .items_baseline()
-                        .child(
+        uniform_list(
+            "git-history",
+            history.len(),
+            cx.processor(|this, range: Range<usize>, _, cx| {
+                let ahead = this.status().map_or(0, |s| s.ahead);
+                let has_upstream = this.status().is_some_and(|s| s.upstream.is_some());
+                let now = zp_ai::now_ms();
+                let commits = this.history.as_deref().unwrap_or_default();
+                range
+                    .filter_map(|index| {
+                        let commit = commits.get(index)?;
+                        let unpushed = has_upstream && index < ahead;
+                        Some(this.render_commit_row(index, commit, unpushed, now, cx))
+                    })
+                    .collect::<Vec<_>>()
+            }),
+        )
+        .track_scroll(&self.history_scroll)
+        // A set width: otherwise the list can take the width of a row measured untruncated.
+        .w_full()
+        .flex_1()
+        .min_h_0()
+        .py_1()
+        .into_any_element()
+    }
+
+    fn render_commit_row(
+        &self,
+        index: usize,
+        commit: &Commit,
+        unpushed: bool,
+        now: i64,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let colors = cx.theme().colors.clone();
+        let open = commit.clone();
+        div()
+            .id(("git-commit-row", index))
+            .debug_selector(move || format!("git-commit-{index}"))
+            // Rows are laid out on their own: without a set width a row grows to its
+            // untruncated text, and a long commit summary runs past the panel.
+            .w_full()
+            .flex()
+            .flex_col()
+            .px_3()
+            .py_1()
+            .cursor_pointer()
+            .hover_style(|s| s.bg(colors.surface_hover))
+            .child(
+                div()
+                    .flex()
+                    .gap_1p5()
+                    .items_baseline()
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .child(commit.summary.clone()),
+                    )
+                    .when(unpushed, |this| {
+                        this.child(
                             div()
-                                .flex_1()
+                                .id(("git-unpushed", index))
+                                .flex_shrink_0()
+                                .text_size(px(11.))
+                                .text_color(colors.accent)
+                                .child("↑")
+                                .tooltip(tooltip("Not pushed yet")),
+                        )
+                    }),
+            )
+            .child(
+                div()
+                    .flex()
+                    .gap_1p5()
+                    .text_size(px(11.))
+                    .text_color(colors.text_muted)
+                    .child(
+                        div()
+                            .font_family(cx.theme().metrics.mono_font.clone())
+                            .child(commit.short_sha.clone()),
+                    )
+                    .child(div().min_w_0().truncate().child(format!(
+                        "{} · {}",
+                        commit.author,
+                        crate::ui::relative_time(commit.time * 1000, now)
+                    )))
+                    .when(!commit.refs.is_empty(), |this| {
+                        this.child(
+                            div()
                                 .min_w_0()
                                 .truncate()
-                                .child(commit.summary.clone()),
+                                .text_color(colors.accent)
+                                .child(commit.refs.clone()),
                         )
-                        .when(unpushed, |this| {
-                            this.child(
-                                div()
-                                    .id(("git-unpushed", index))
-                                    .flex_shrink_0()
-                                    .text_size(px(11.))
-                                    .text_color(colors.accent)
-                                    .child("↑")
-                                    .tooltip(tooltip("Not pushed yet")),
-                            )
-                        }),
-                )
-                .child(
-                    div()
-                        .flex()
-                        .gap_1p5()
-                        .text_size(px(11.))
-                        .text_color(colors.text_muted)
-                        .child(
-                            div()
-                                .font_family(cx.theme().metrics.mono_font.clone())
-                                .child(commit.short_sha.clone()),
-                        )
-                        .child(div().min_w_0().truncate().child(format!(
-                            "{} · {}",
-                            commit.author,
-                            crate::ui::relative_time(commit.time * 1000, now)
-                        )))
-                        .when(!commit.refs.is_empty(), |this| {
-                            this.child(
-                                div()
-                                    .min_w_0()
-                                    .truncate()
-                                    .text_color(colors.accent)
-                                    .child(commit.refs.clone()),
-                            )
-                        }),
-                )
-                .on_click(cx.listener(move |this, _, _, cx| this.open_commit(&open, cx)))
-        });
-        div()
-            .id("git-history")
-            .flex_1()
-            .min_h_0()
-            .overflow_y_scroll()
-            .py_1()
-            .children(rows)
+                    }),
+            )
+            .on_click(cx.listener(move |this, _, _, cx| this.open_commit(&open, cx)))
             .into_any_element()
     }
 

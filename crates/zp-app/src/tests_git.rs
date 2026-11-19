@@ -402,3 +402,47 @@ fn stage_commit_push_uncommit_history_branches_and_discard(cx: &mut TestAppConte
     );
     assert!(!project.join("junk.txt").exists());
 }
+
+#[gpui::test]
+fn long_history_draws_only_the_commits_in_view_within_the_panel(cx: &mut TestAppContext) {
+    let _data = setup_models(cx, &[&FauxProvider::default()], false);
+    let (_dir, project) = project_dir();
+    git(&project, &["init", "-q"]);
+    git(&project, &["config", "user.name", "Tester"]);
+    git(&project, &["config", "user.email", "t@example.com"]);
+    git(&project, &["config", "commit.gpgsign", "false"]);
+    for index in 0..150 {
+        // The newest summary is far wider than the panel.
+        let message = if index == 149 {
+            format!("Commit {index} {}", "with a very long summary ".repeat(20))
+        } else {
+            format!("Commit {index}")
+        };
+        git(&project, &["commit", "-q", "--allow-empty", "-m", &message]);
+    }
+    let window = open(cx, &project);
+    let panel = window
+        .update(cx, |view, _, cx| {
+            view.changes_panel().read(cx).git().clone()
+        })
+        .unwrap();
+    click(window, "status-changes", cx);
+    click(window, "git-tab-history", cx);
+    wait_until(cx, |cx| {
+        panel.read_with(cx, |panel, _| {
+            panel.history().is_some_and(|history| history.len() == 150)
+        })
+    });
+    cx.run_until_parked();
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    let row = visual.debug_bounds("git-commit-0").unwrap();
+    let viewport = visual.update(|window, _| window.viewport_size());
+    assert!(
+        row.right() <= viewport.width,
+        "a long summary is cut off, not drawn past the panel: {row:?} in {viewport:?}"
+    );
+    assert!(
+        visual.debug_bounds("git-commit-149").is_none(),
+        "commits out of view are not built"
+    );
+}

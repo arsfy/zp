@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 use gpui::{
     AnyElement, App, AppContext as _, Context, Entity, EventEmitter, FontWeight, IntoElement,
-    Render, Rgba, SharedString, Subscription, Window, div, prelude::*, px,
+    Render, Rgba, SharedString, StyleRefinement, Subscription, Window, div, prelude::*, px,
 };
 use zp_core::changes::{ChangeLog, FileSummary, GroupKind, RevertStatus, Scope};
 use zp_core::checkpoint::BlobStore;
@@ -574,8 +574,16 @@ impl Render for ChangesPanel {
         let body = match self.mode {
             ChangesMode::Session => self.render_session(cx),
             ChangesMode::Turns => self.render_turns(cx),
-            // The Git view scrolls its file list and keeps its commit box in view.
-            ChangesMode::Git => self.git.clone().into_any_element(),
+            // The Git view scrolls its file list and keeps its commit box in view. It is
+            // drawn again only when it changes, not on every frame of the window (e.g.
+            // while the conversation animates). Not in tests: gpui forgets the debug
+            // selectors of a reused view, which tests look elements up by.
+            ChangesMode::Git if cfg!(test) => self.git.clone().into_any_element(),
+            ChangesMode::Git => self
+                .git
+                .clone()
+                .cached(StyleRefinement::default().size_full())
+                .into_any_element(),
         };
         let git = self.mode == ChangesMode::Git;
         div()
