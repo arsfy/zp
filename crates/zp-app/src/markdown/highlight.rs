@@ -63,7 +63,13 @@ fn lock() -> std::sync::MutexGuard<'static, Cache> {
 }
 
 /// Redraws the windows whenever background highlighting finishes.
+///
+/// Not in tests: the sender is process-wide, and a background thread waking a task of one
+/// test's scheduler aborts the test run. Tests highlight right away instead.
 pub fn init(cx: &mut App) {
+    if cfg!(test) {
+        return;
+    }
     let (sender, mut receiver) = futures::channel::mpsc::unbounded();
     if REDRAW.set(sender).is_err() {
         return;
