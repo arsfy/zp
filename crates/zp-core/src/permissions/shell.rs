@@ -5,6 +5,9 @@
 //! This is not a shell parser. It errs on the side of more, smaller segments, so that a
 //! harmless-looking prefix cannot hide a second command.
 
+use std::io::ErrorKind;
+use std::path::{Component, Path, PathBuf};
+
 /// One simple command, e.g. `cargo test --workspace` out of `cd x && cargo test …`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Segment {
@@ -18,11 +21,17 @@ pub struct Segment {
     pub output_redirected: bool,
     /// Arguments may change through variable, glob or command expansion.
     pub expanded: bool,
+    /// The next segment runs only if this one succeeds.
+    followed_by_and: bool,
 }
 
 /// Splits `command` at `;`, `&`, `&&`, `|`, `||`, newlines, subshells and command
 /// substitutions (`$(…)`, backticks — also inside double quotes).
 pub fn segments(command: &str) -> Vec<Segment> {
+    split(command).segments
+}
+
+fn split(command: &str) -> Splitter {
     let mut splitter = Splitter::default();
     let mut chars = command.chars().peekable();
     while let Some(c) = chars.next() {
@@ -37,7 +46,12 @@ pub fn segments(command: &str) -> Vec<Segment> {
             Some(_) => match c {
                 '"' => splitter.quote = None,
                 '\\' => {
-                    if let Some(next) = chars.next() {
+                    if let Some(next) = chars.next()
+                        && next != '\n'
+                    {
+                        if !matches!(next, '$' | '`' | '"' | '\\') {
+                            splitter.word.push('\\');
+                        }
                         splitter.word.push(next);
                     }
                 }
@@ -82,9 +96,13 @@ pub fn segments(command: &str) -> Vec<Segment> {
                             break;
                         }
                     }
-                    splitter.end_segment(false);
+                    splitter.end_segment(false, false);
                 }
-                ';' | '\n' | '(' | ')' => splitter.end_segment(false),
+                ';' | '\n' => splitter.end_segment(false, false),
+                '(' | ')' => {
+                    splitter.compound = true;
+                    splitter.end_segment(false, false);
+                }
                 '<' | '>' => {
                     splitter.end_word();
                     splitter.word.push(c);
@@ -98,10 +116,12 @@ pub fn segments(command: &str) -> Vec<Segment> {
                     }
                     let target: String = chars
                         .clone()
-                        .skip_while(|c| c.is_whitespace())
+                        .skip_while(|c| matches!(c, ' ' | '\t'))
                         .take_while(|c| {
-                            !c.is_whitespace()
-                                && !matches!(c, ';' | '&' | '|' | '(' | ')' | '<' | '>')
+                            !matches!(
+                                c,
+                                ' ' | '\t' | '\n' | ';' | '&' | '|' | '(' | ')' | '<' | '>'
+                            )
                         })
                         .collect();
                     let descriptor = target == "-"
@@ -123,19 +143,23 @@ pub fn segments(command: &str) -> Vec<Segment> {
                     if doubled {
                         chars.next();
                     }
-                    splitter.end_segment(c == '|' && !doubled);
+                    let and = c == '&' && doubled;
+                    splitter.compound |= !and;
+                    splitter.end_segment(c == '|' && !doubled, and);
                 }
-                c if c.is_whitespace() => splitter.end_word(),
+                ' ' | '\t' => splitter.end_word(),
                 c => {
                     splitter.expanded |= matches!(c, '$' | '*' | '?' | '[' | '{');
+                    splitter.compound |= matches!(c, '{' | '}');
                     splitter.word.push(c);
                     splitter.in_word = true;
                 }
             },
         }
     }
-    splitter.end_segment(false);
-    splitter.segments
+    splitter.compound |= splitter.quote.is_some() || !splitter.stack.is_empty();
+    splitter.end_segment(false, false);
+    splitter
 }
 
 #[derive(Default)]
@@ -150,6 +174,8 @@ struct Splitter {
     redirected: bool,
     output_redirected: bool,
     expanded: bool,
+    /// Shell syntax for which the current directory cannot be tracked linearly.
+    compound: bool,
     /// Open substitutions: their kind and the quote to restore when they close.
     stack: Vec<(char, Option<char>)>,
 }
@@ -163,7 +189,7 @@ impl Splitter {
     }
 
     /// Ends the current segment; the next one receives a pipe if `pipe`.
-    fn end_segment(&mut self, pipe: bool) {
+    fn end_segment(&mut self, pipe: bool, followed_by_and: bool) {
         self.end_word();
         let words = std::mem::take(&mut self.words);
         if words.iter().any(|word| !word.is_empty()) {
@@ -173,6 +199,7 @@ impl Splitter {
                 redirected: self.redirected,
                 output_redirected: self.output_redirected,
                 expanded: self.expanded,
+                followed_by_and,
             });
         }
         self.piped = pipe;
@@ -182,18 +209,19 @@ impl Splitter {
     }
 
     fn open_substitution(&mut self, kind: char) {
+        self.compound = true;
         self.expanded = true;
         let quote = self.quote.take();
         if self.word.is_empty() {
             // `"$(…` — the quote only wraps the substitution.
             self.in_word = false;
         }
-        self.end_segment(false);
+        self.end_segment(false, false);
         self.stack.push((kind, quote));
     }
 
     fn close_substitution(&mut self) {
-        self.end_segment(false);
+        self.end_segment(false, false);
         self.expanded = true;
         if let Some((_, quote)) = self.stack.pop() {
             self.quote = quote;
@@ -476,72 +504,246 @@ pub fn unapproved_prefixes(command: &str, allowed: &[String]) -> Vec<String> {
     prefixes
 }
 
+pub(super) enum CommandAssessment {
+    Allowed,
+    NeedsApproval(Vec<String>),
+    Dangerous(String),
+}
+
+/// Applies the shell rules, treating verified project-local removals as edits.
+pub(super) fn assess(
+    command: &str,
+    allowed: &[String],
+    edit_root: Option<&Path>,
+) -> CommandAssessment {
+    let parsed = split(command);
+    let root = edit_root
+        .filter(|_| {
+            !parsed.compound
+                && parsed
+                    .segments
+                    .iter()
+                    .any(|segment| direct_rm_args(segment).is_some())
+                && (!cfg!(windows) || zp_tools::Shell::detect().name() == "bash")
+        })
+        .and_then(|root| root.canonicalize().ok());
+    let mut cwd = root.clone();
+    let mut preceding_program = false;
+    let mut needs_approval = parsed.segments.is_empty();
+    let mut prefixes = Vec::new();
+    for segment in &parsed.segments {
+        if let (Some(root), Some(cwd)) = (&root, &cwd)
+            && workspace_rm(segment, cwd, root, preceding_program)
+        {
+            continue;
+        }
+        if let Some(reason) = segment_danger(segment) {
+            return CommandAssessment::Dangerous(reason);
+        }
+        if !segment_allowed(segment, allowed) {
+            needs_approval = true;
+            if let Some(prefix) = prefix(segment)
+                && !prefixes.contains(&prefix)
+            {
+                prefixes.push(prefix);
+            }
+        }
+        if let Some(directory) = cwd.take()
+            && !segment.expanded
+            && !segment.redirected
+        {
+            match segment.words.first().map(String::as_str) {
+                Some("cd") if segment.followed_by_and && !preceding_program => {
+                    cwd = changed_directory(&directory, &segment.words[1..]);
+                }
+                Some("pwd" | "ls" | "echo") => cwd = Some(directory),
+                _ if read_only(segment) => cwd = Some(directory),
+                // A build or similar subprocess cannot change the shell's directory,
+                // but may create symlinks used by a later command's directory operands.
+                Some(program) if WITH_SUBCOMMANDS.contains(&program) => {
+                    cwd = Some(directory);
+                    preceding_program = true;
+                }
+                _ => {}
+            }
+        }
+    }
+    if needs_approval {
+        CommandAssessment::NeedsApproval(prefixes)
+    } else {
+        CommandAssessment::Allowed
+    }
+}
+
+fn changed_directory(cwd: &Path, args: &[String]) -> Option<PathBuf> {
+    let path = match args {
+        [flag, path] if flag == "--" => path,
+        [path] => path,
+        _ => return None,
+    };
+    let target = Path::new(path);
+    // Logical cd and CDPATH can resolve a literal differently from filesystem paths.
+    if path.starts_with('-')
+        || target.components().any(|part| part == Component::ParentDir)
+        || (target.is_relative()
+            && !path.starts_with("./")
+            && std::env::var_os("CDPATH").is_some_and(|paths| !paths.is_empty()))
+    {
+        return None;
+    }
+    let directory = literal_path(cwd, path)?.canonicalize().ok()?;
+    directory.is_dir().then_some(directory)
+}
+
+fn direct_rm_args(segment: &Segment) -> Option<&[String]> {
+    let (executable, args) = segment.words.split_first()?;
+    matches!(executable.as_str(), "rm" | "/bin/rm" | "/usr/bin/rm").then_some(args)
+}
+
+fn workspace_rm(segment: &Segment, cwd: &Path, root: &Path, preceding_program: bool) -> bool {
+    let Some(args) = direct_rm_args(segment).filter(|_| !segment.expanded && !segment.redirected)
+    else {
+        return false;
+    };
+    let mut options = true;
+    let mut saw_target = false;
+    for arg in args {
+        if options && arg == "--" {
+            options = false;
+        } else if options && arg.starts_with('-') && arg != "-" {
+            if !removal_option(arg) {
+                return false;
+            }
+        } else {
+            // A previous subprocess may have created a new intermediate symlink.
+            if preceding_program && arg.trim_start_matches("./").contains('/') {
+                return false;
+            }
+            if !literal_path(cwd, arg).is_some_and(|path| removal_target_in_workspace(&path, root))
+            {
+                return false;
+            }
+            saw_target = true;
+        }
+    }
+    saw_target
+}
+
+fn removal_option(arg: &str) -> bool {
+    if arg.starts_with("--") {
+        matches!(
+            arg,
+            "--dir"
+                | "--force"
+                | "--interactive"
+                | "--interactive=never"
+                | "--interactive=once"
+                | "--interactive=always"
+                | "--one-file-system"
+                | "--preserve-root"
+                | "--preserve-root=all"
+                | "--recursive"
+                | "--verbose"
+        )
+    } else {
+        arg[1..].chars().all(|flag| "dfiIrRvx".contains(flag))
+    }
+}
+
+fn literal_path(cwd: &Path, path: &str) -> Option<PathBuf> {
+    // MSYS absolute paths are resolved by the shell, not by Windows' filesystem APIs.
+    if path.is_empty()
+        || path.starts_with('~')
+        || (cfg!(windows) && (path.starts_with('/') || path.contains(['\\', ':'])))
+    {
+        return None;
+    }
+    Some(cwd.join(path))
+}
+
+fn removal_target_in_workspace(mut path: &Path, root: &Path) -> bool {
+    let mut missing = false;
+    loop {
+        match path.canonicalize() {
+            Ok(resolved) => return resolved.starts_with(root) && (missing || resolved != root),
+            Err(error)
+                if error.kind() == ErrorKind::NotFound
+                    && path.file_name().is_some()
+                    && path
+                        .symlink_metadata()
+                        .is_err_and(|error| error.kind() == ErrorKind::NotFound) =>
+            {
+                missing = true;
+                path = path.parent().expect("a file name has a parent");
+            }
+            Err(_) => return false,
+        }
+    }
+}
+
 /// Why `command` is destructive or otherwise high-risk, if it is. Such commands always
 /// need the user's approval (except in full auto mode).
 pub fn danger(command: &str) -> Option<String> {
-    for segment in segments(command) {
-        let words = command_words(&segment);
-        let Some(program) = program(words) else {
-            continue;
-        };
-        let args = if program == "git" {
-            git_arguments(words)
-        } else {
-            &words[1..]
-        };
-        let args: Vec<&str> = args.iter().map(String::as_str).collect();
-        let has = |flag: &str| args.contains(&flag);
-        let has_short = |letter: char| {
-            args.iter()
-                .any(|a| a.starts_with('-') && !a.starts_with("--") && a[1..].contains(letter))
-        };
-        let reason = match program {
-            "rm" | "rmdir" | "unlink" | "shred" => Some("deletes files"),
-            "sudo" | "su" | "doas" => Some("runs with elevated privileges"),
-            "dd" | "fdisk" | "diskutil" | "parted" => Some("writes to disks"),
-            p if p.starts_with("mkfs") => Some("formats a disk"),
-            "shutdown" | "reboot" | "halt" | "poweroff" => Some("shuts the machine down"),
-            "kill" | "killall" | "pkill" => Some("stops processes"),
-            "truncate" => Some("truncates files"),
-            "chmod" | "chown" | "chgrp" if has_short('R') || has("--recursive") => {
-                Some("changes permissions recursively")
-            }
-            "find"
-                if has("-delete")
-                    || args.iter().any(|a| *a == "-exec" || *a == "-execdir")
-                        && args.iter().any(|a| matches!(*a, "rm" | "shred" | "unlink")) =>
-            {
-                Some("deletes files")
-            }
-            "sh" | "bash" | "zsh" | "fish" | "dash" if segment.piped => {
-                Some("runs a script piped into a shell")
-            }
-            "git" => match args.first().copied() {
-                Some("push") => Some("pushes to a remote repository"),
-                Some("reset") if has("--hard") => Some("discards local changes"),
-                Some("clean") => Some("deletes untracked files"),
-                Some("checkout") if has("--") || has(".") || has_short('f') || has("--force") => {
-                    Some("discards local changes")
-                }
-                Some("switch") if has_short('f') || has("--force") || has("--discard-changes") => {
-                    Some("discards local changes")
-                }
-                Some("restore") => Some("discards local changes"),
-                Some("branch") if has_short('D') || has_short('d') || has("--delete") => {
-                    Some("deletes a branch")
-                }
-                Some("stash") if matches!(args.get(1).copied(), Some("drop" | "clear")) => {
-                    Some("deletes stashed changes")
-                }
-                _ => None,
-            },
-            _ => None,
-        };
-        if let Some(reason) = reason {
-            return Some(format!("{reason} (`{program}`)"));
+    segments(command).iter().find_map(segment_danger)
+}
+
+fn segment_danger(segment: &Segment) -> Option<String> {
+    let words = command_words(segment);
+    let program = program(words)?;
+    let args = if program == "git" {
+        git_arguments(words)
+    } else {
+        &words[1..]
+    };
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    let has = |flag: &str| args.contains(&flag);
+    let has_short = |letter: char| {
+        args.iter()
+            .any(|a| a.starts_with('-') && !a.starts_with("--") && a[1..].contains(letter))
+    };
+    let reason = match program {
+        "rm" | "rmdir" | "unlink" | "shred" => Some("deletes files"),
+        "sudo" | "su" | "doas" => Some("runs with elevated privileges"),
+        "dd" | "fdisk" | "diskutil" | "parted" => Some("writes to disks"),
+        p if p.starts_with("mkfs") => Some("formats a disk"),
+        "shutdown" | "reboot" | "halt" | "poweroff" => Some("shuts the machine down"),
+        "kill" | "killall" | "pkill" => Some("stops processes"),
+        "truncate" => Some("truncates files"),
+        "chmod" | "chown" | "chgrp" if has_short('R') || has("--recursive") => {
+            Some("changes permissions recursively")
         }
-    }
-    None
+        "find"
+            if has("-delete")
+                || args.iter().any(|a| *a == "-exec" || *a == "-execdir")
+                    && args.iter().any(|a| matches!(*a, "rm" | "shred" | "unlink")) =>
+        {
+            Some("deletes files")
+        }
+        "sh" | "bash" | "zsh" | "fish" | "dash" if segment.piped => {
+            Some("runs a script piped into a shell")
+        }
+        "git" => match args.first().copied() {
+            Some("push") => Some("pushes to a remote repository"),
+            Some("reset") if has("--hard") => Some("discards local changes"),
+            Some("clean") => Some("deletes untracked files"),
+            Some("checkout") if has("--") || has(".") || has_short('f') || has("--force") => {
+                Some("discards local changes")
+            }
+            Some("switch") if has_short('f') || has("--force") || has("--discard-changes") => {
+                Some("discards local changes")
+            }
+            Some("restore") => Some("discards local changes"),
+            Some("branch") if has_short('D') || has_short('d') || has("--delete") => {
+                Some("deletes a branch")
+            }
+            Some("stash") if matches!(args.get(1).copied(), Some("drop" | "clear")) => {
+                Some("deletes stashed changes")
+            }
+            _ => None,
+        },
+        _ => None,
+    };
+    reason.map(|reason| format!("{reason} (`{program}`)"))
 }
 
 #[cfg(test)]
@@ -572,6 +774,11 @@ mod tests {
             [vec!["echo", "a "], vec!["date"], vec![" b", "done"]]
         );
         assert_eq!(words("a\\\nb c"), [vec!["ab", "c"]]);
+        assert_eq!(
+            words("rm \"a\\/b\" c\u{2003}d"),
+            [vec!["rm", "a\\/b", "c\u{2003}d"]]
+        );
+        assert_eq!(words("rm \"a\\\nb\""), [vec!["rm", "ab"]]);
         assert!(segments("curl x | sh")[1].piped);
         assert!(!segments("a || b")[1].piped);
     }

@@ -494,7 +494,7 @@ fn stopping_while_waiting_for_approval(cx: &mut TestAppContext) {
     let faux = FauxProvider::default();
     faux.push(FauxResponse::tool_call(
         "bash",
-        json!({"command": "rm -rf build"}),
+        json!({"command": "rm -rf ../build"}),
     ));
     let data = setup_models(cx, &[&faux], false);
     set_permission_mode(&data, PermissionMode::AutoReview);
@@ -504,8 +504,10 @@ fn stopping_while_waiting_for_approval(cx: &mut TestAppContext) {
     settings
         .save(&zp_core::paths::settings_file(data.path()))
         .unwrap();
-    let (_dir, project) = project_dir();
-    std::fs::create_dir(project.join("build")).unwrap();
+    let (_dir, parent) = project_dir();
+    let project = parent.join("workspace");
+    std::fs::create_dir(&project).unwrap();
+    std::fs::create_dir(parent.join("build")).unwrap();
     let window = open(cx, &project);
     let conversation = active(window, cx);
     send(window, "clean", cx);
@@ -527,7 +529,7 @@ fn stopping_while_waiting_for_approval(cx: &mut TestAppContext) {
         conversation.read_with(cx, |view, _| !view.is_running())
     });
     assert!(pending(&conversation, cx).is_empty());
-    assert!(project.join("build").exists());
+    assert!(parent.join("build").exists());
 }
 
 #[gpui::test]

@@ -27,10 +27,9 @@ pub enum PermissionMode {
     /// Read-only commands run automatically; other commands and file changes need approval.
     #[default]
     Ask,
-    /// File changes, Python, non-destructive Git operations and echo writes run automatically.
+    /// File changes, including workspace-local removals, and routine commands run automatically.
     AutoEdit,
-    /// Like `AutoEdit`, but a review model approves safe commands; destructive ones still
-    /// need the user.
+    /// Like `AutoEdit`, with a model reviewing other commands that do not require the user.
     AutoReview,
     /// Everything runs.
     FullAuto,
@@ -339,37 +338,36 @@ impl PermissionPolicy {
             }
             ToolKind::Execute => {
                 let command = args["command"].as_str().unwrap_or_default();
-                if self.mode == PermissionMode::FullAuto {
-                    // Runs as asked.
-                } else if let Some(why) = shell::danger(command) {
-                    reasons.push(AskReason::Dangerous(why));
-                    // Never approved wholesale.
-                    return Evaluation::Ask {
-                        reasons,
-                        grants: Vec::new(),
-                    };
-                } else {
+                if self.mode != PermissionMode::FullAuto {
+                    let edits = matches!(
+                        self.mode,
+                        PermissionMode::AutoEdit | PermissionMode::AutoReview
+                    );
                     let mut allowed: Vec<String> = self
                         .allow_commands
                         .iter()
                         .chain(&grants.commands)
                         .cloned()
                         .collect();
-                    if matches!(
-                        self.mode,
-                        PermissionMode::AutoEdit | PermissionMode::AutoReview
-                    ) {
+                    if edits {
                         allowed.extend(["git", "echo", "python", "python3"].map(str::to_owned));
                     }
-                    if !shell::all_allowed(command, &allowed) {
-                        offer.extend(
-                            shell::unapproved_prefixes(command, &allowed)
-                                .into_iter()
-                                .map(SessionGrant::Command),
-                        );
-                        match self.mode {
-                            PermissionMode::AutoReview => review = true,
-                            _ => reasons.push(AskReason::Mode(self.mode)),
+                    match shell::assess(command, &allowed, edits.then_some(self.root.as_path())) {
+                        shell::CommandAssessment::Allowed => {}
+                        shell::CommandAssessment::Dangerous(why) => {
+                            reasons.push(AskReason::Dangerous(why));
+                            // Never approved wholesale.
+                            return Evaluation::Ask {
+                                reasons,
+                                grants: Vec::new(),
+                            };
+                        }
+                        shell::CommandAssessment::NeedsApproval(prefixes) => {
+                            offer.extend(prefixes.into_iter().map(SessionGrant::Command));
+                            match self.mode {
+                                PermissionMode::AutoReview => review = true,
+                                _ => reasons.push(AskReason::Mode(self.mode)),
+                            }
                         }
                     }
                 }
@@ -671,15 +669,73 @@ mod tests {
             review.evaluate("bash", &test, &none),
             Evaluation::Review { .. }
         ));
-        assert!(matches!(
+        assert_eq!(
             review.evaluate("bash", &rm, &none),
-            Evaluation::Ask { .. }
-        ));
+            Evaluation::Review {
+                grants: vec![SessionGrant::Command("cargo test".into())]
+            }
+        );
+        assert_eq!(
+            ask(auto_edit.evaluate("bash", &rm, &none)),
+            (
+                vec![AskReason::Mode(PermissionMode::AutoEdit)],
+                vec![SessionGrant::Command("cargo test".into())]
+            )
+        );
         assert_eq!(review.evaluate("edit", &edit, &none), Evaluation::Allow);
 
         let full = policy(PermissionMode::FullAuto, &root);
         for (tool, args) in [("bash", &rm), ("read", &read_outside), ("edit", &edit)] {
             assert_eq!(full.evaluate(tool, args, &none), Evaluation::Allow);
+        }
+    }
+
+    #[test]
+    fn edit_modes_only_auto_approve_rm_with_known_workspace_targets() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = canonical(dir.path()).join("project");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(dir.path().join("outside.txt"), "keep").unwrap();
+        std::fs::create_dir_all(root.join(".cache")).unwrap();
+        let mut grants = Grants::default();
+        grants.add(&SessionGrant::Command("rm".into()));
+        grants.add(&SessionGrant::Directory(canonical(dir.path())));
+
+        for mode in [PermissionMode::AutoEdit, PermissionMode::AutoReview] {
+            let evaluate = |command: &str| {
+                policy(mode, &root).evaluate("bash", &json!({"command": command}), &grants)
+            };
+            for command in [
+                "rm -rf .cache",
+                "rm -- 'name with spaces' '-leading-dash'",
+                "rm -f missing/child.txt",
+                "pwd; rm -f src/../scratch.txt",
+                "cd ./src && rm -f scratch.txt && pwd",
+                "rm --recursive --force .cache && git status",
+            ] {
+                assert_eq!(evaluate(command), Evaluation::Allow, "{mode:?}: {command}");
+            }
+            for command in [
+                "rm -rf .",
+                "rm -f ../outside.txt",
+                "rm -f src/../../outside.txt",
+                "rm -f local.txt ../outside.txt",
+                "cd .. && rm -f outside.txt",
+                "cd ./src; rm -f scratch.txt",
+                "rm -f *.txt",
+                "rm -f \"$TARGET\"",
+                "rm -f ~/scratch.txt",
+                "rm -f local.txt > ../outside.txt",
+                "echo local.txt | xargs rm -f",
+                "rm -f local.txt && git push",
+            ] {
+                let (reasons, offers) = ask(evaluate(command));
+                assert!(
+                    matches!(&reasons[..], [AskReason::Dangerous(_)]),
+                    "{mode:?}: {command}"
+                );
+                assert!(offers.is_empty(), "{command}");
+            }
         }
     }
 
@@ -900,6 +956,9 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
         std::fs::create_dir_all(base.join("elsewhere")).unwrap();
         std::os::unix::fs::symlink(base.join("elsewhere"), root.join("link")).unwrap();
+        std::os::unix::fs::symlink(base.join("missing"), root.join("dangling")).unwrap();
+        std::os::unix::fs::symlink(base.join("elsewhere"), root.join("backslash\\")).unwrap();
+        std::os::unix::fs::symlink(base.join("elsewhere"), root.join("wide\u{2003}space")).unwrap();
         for mode in [PermissionMode::AutoEdit, PermissionMode::AutoReview] {
             let policy = policy(mode, &root);
             let evaluation = policy.evaluate(
@@ -910,6 +969,30 @@ mod tests {
             assert!(
                 matches!(&evaluation, Evaluation::Ask { reasons, .. } if matches!(&reasons[0], AskReason::OutsideProject(p) if p[0] == base.join("elsewhere/new.txt"))),
                 "{mode:?}: {evaluation:?}"
+            );
+            for command in [
+                "rm -f link/new.txt",
+                "rm -f dangling/new.txt",
+                "cd ./link && rm -f new.txt",
+                r#"rm -f "backslash\/new.txt""#,
+                "rm -f wide\u{2003}space/new.txt",
+            ] {
+                let (reasons, grants) =
+                    ask(policy.evaluate("bash", &json!({"command": command}), &Grants::default()));
+                assert!(
+                    matches!(&reasons[..], [AskReason::Dangerous(_)]),
+                    "{command}"
+                );
+                assert!(grants.is_empty(), "{command}");
+            }
+            let local = format!("{:?}", root.join("local.txt"));
+            assert_eq!(
+                policy.evaluate(
+                    "bash",
+                    &json!({"command": format!("rm -f -- {local}")}),
+                    &Grants::default()
+                ),
+                Evaluation::Allow
             );
         }
     }

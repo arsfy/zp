@@ -1341,10 +1341,10 @@ fn approvals(cx: &mut VisualTestAppContext, faux: &FauxProvider, out: &std::path
         });
     });
     faux.push(FauxResponse::blocks(vec![
-        FauxBlock::Text("The build directory is stale; I'll remove it and rebuild.".into()),
+        FauxBlock::Text("The shared build directory is stale. I'll remove it and rebuild.".into()),
         FauxBlock::ToolCall {
             name: "bash".into(),
-            arguments: json!({"command": "rm -rf build && cargo build --release"}),
+            arguments: json!({"command": "rm -rf ../build && cargo build --release"}),
         },
     ]));
     faux.push(FauxResponse::tool_call(
@@ -1373,7 +1373,10 @@ fn approvals(cx: &mut VisualTestAppContext, faux: &FauxProvider, out: &std::path
         let view = window.root::<ProjectWindow>().flatten().unwrap();
         let conversation = view.read(cx).active_conversation().unwrap().clone();
         conversation.update(cx, |c, cx| {
-            c.deny_first_approval("keep build/, run cargo clean instead", cx)
+            c.deny_first_approval(
+                "keep the shared build directory, run cargo clean instead",
+                cx,
+            )
         });
     })
     .unwrap();
