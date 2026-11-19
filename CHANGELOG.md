@@ -1,4 +1,25 @@
-## v0.1.0-rc.3 19 Nov 2026
+## v0.1.0-rc.4 19 Nov 2026
+
+#### Conversation
+
+- Thinking blocks, tool cards, the context summary and the tasks card slide open and shut instead of jumping to their new height, and their chevrons turn as they do. This includes blocks that open while running and close when done. The model, thinking and permission menus and the session tree fade in when opened.
+- Messages show when they were sent, and responses when they finished and how long the run took (time spent waiting for approval is not counted). Times from another day include the date. For sessions saved by earlier versions the duration is estimated from the time of the user's message.
+- The changes summary under an answer lists the changed files with their added and removed lines: the first three, with **Show N more files** for the rest. Clicking a file opens the turn's diff at that file.
+- Tabs in command output, code blocks and messages are drawn as spaces up to the next tab stop instead of as boxes, so tab-separated output lines up in columns. Copying a code block keeps the tabs.
+
+#### Projects
+
+- **Open Folder** in a project window switches that window to the new folder instead of opening another one; a folder that is already open is brought forward instead. If agents are running or terminals are open, ZP asks first, since switching stops them.
+
+#### Permissions
+
+- In **Auto-approve edits** and **Auto-review**, `rm` of files inside the project runs without asking, like other file changes. This applies only when every path is a literal inside the project (no globs or variables, symlinks resolved), and never for the project folder itself. Removals outside the project still need approval. On Windows this requires the bash shell.
+
+#### Performance
+
+- The Git history draws only the commits in view, and the Git view is no longer redrawn while other parts of the window animate. Long histories had made animations elsewhere stutter.
+
+## v0.1.0-rc.3 19 Nov 2026 `7882ba0`
 
 #### Conversation
 
