@@ -17,6 +17,7 @@ use zp_core::changes::{RevertStatus, Scope};
 use zp_core::checkpoint::RecordedChange;
 
 use super::disclosure::collapsible;
+use super::files::TurnChangeFile;
 use super::permissions::permission_mode_color;
 use super::progress::format_elapsed;
 use super::transcript::{Row, ToolStatus};
@@ -38,6 +39,8 @@ const CONTENT_WIDTH: f32 = 820.0;
 const OUTPUT_PREVIEW_LINES: usize = 30;
 /// Diff rows shown under a tool card.
 const INLINE_DIFF_ROWS: usize = 40;
+/// Changed files initially shown in a completed answer.
+const TURN_FILE_PREVIEW: usize = 3;
 /// Models listed at once in the picker.
 const PICKER_LIMIT: usize = 200;
 
@@ -108,6 +111,26 @@ fn format_message_time(timestamp: i64, now: DateTime<Local>) -> Option<String> {
         "%-d %b %Y %H:%M"
     };
     Some(time.format(format).to_string())
+}
+
+fn turn_line_counts(added: usize, removed: usize, cx: &App) -> Div {
+    let theme = cx.theme();
+    div()
+        .flex()
+        .flex_shrink_0()
+        .gap_1p5()
+        .font_family(theme.metrics.mono_font.clone())
+        .text_size(px(11.))
+        .child(
+            div()
+                .text_color(theme.colors.success)
+                .child(format!("+{added}")),
+        )
+        .child(
+            div()
+                .text_color(theme.colors.error)
+                .child(format!("−{removed}")),
+        )
 }
 
 pub(super) fn picker_checkmark(selected: bool, color: Rgba) -> Div {
@@ -314,99 +337,210 @@ impl ConversationView {
         let changes = self.turn_changes_for_row(row)?;
         let colors = cx.theme().colors.clone();
         let scope = Scope::Group(changes.group);
-        let count = if changes.files == 1 {
+        let count = if changes.files.len() == 1 {
             "1 file changed".to_owned()
         } else {
-            format!("{} files changed", changes.files)
+            format!("{} files changed", changes.files.len())
         };
-        let busy = self.is_busy();
+        let header = div()
+            .flex()
+            .items_center()
+            .child(
+                div()
+                    .id(id("turn-changes-open", row))
+                    .debug_selector(|| "turn-changes-open".into())
+                    .flex_1()
+                    .min_w_0()
+                    .min_h(px(38.))
+                    .flex()
+                    .flex_wrap()
+                    .items_center()
+                    .gap_2()
+                    .px_3()
+                    .py_2()
+                    .cursor_pointer()
+                    .hover_style(|style| style.bg(colors.surface_hover))
+                    .tooltip(crate::ui::tooltip("View changes in this turn"))
+                    .text_size(px(12.))
+                    .child(
+                        div()
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(colors.text)
+                            .child(count),
+                    )
+                    .when_some(changes.status.label(), |summary, label| {
+                        summary.child(
+                            div()
+                                .debug_selector(|| "turn-changes-revert-status".into())
+                                .text_color(colors.text_muted)
+                                .child(label),
+                        )
+                    })
+                    .child(turn_line_counts(changes.added, changes.removed, cx))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.open_turn_diff(scope, None, cx);
+                    })),
+            )
+            .when(changes.status != RevertStatus::Reverted, |summary| {
+                summary.child(
+                    div().px_2().flex_shrink_0().child(
+                        icon_button(
+                            id("turn-changes-revert", row),
+                            ICON_REVERT,
+                            "Revert all changes in this turn",
+                            cx,
+                        )
+                        .debug_selector(|| "turn-changes-revert".into())
+                        .when(self.is_busy(), |button| {
+                            button.opacity(0.4).cursor(gpui::CursorStyle::Arrow)
+                        })
+                        .on_click(cx.listener(
+                            move |this, _, window, cx| {
+                                if !this.is_busy() {
+                                    this.revert(scope, None, window, cx);
+                                }
+                            },
+                        )),
+                    ),
+                )
+            });
+        let expanded = self.turn_files_expanded.contains(&row);
+        let hidden = changes.files.len().saturating_sub(TURN_FILE_PREVIEW);
+        let mut files = div()
+            .flex()
+            .flex_col()
+            .border_t_1()
+            .border_color(colors.border)
+            .py_1()
+            .children(
+                changes
+                    .files
+                    .iter()
+                    .take(TURN_FILE_PREVIEW)
+                    .enumerate()
+                    .map(|(index, file)| self.render_turn_file(scope, index, file, cx)),
+            );
+        if hidden > 0 {
+            let label = if expanded {
+                "Show fewer files".to_owned()
+            } else if hidden == 1 {
+                "Show 1 more file".to_owned()
+            } else {
+                format!("Show {hidden} more files")
+            };
+            files = files.child(
+                div()
+                    .id("turn-changes-toggle")
+                    .debug_selector(|| "turn-changes-toggle".into())
+                    .flex()
+                    .items_center()
+                    .gap_1p5()
+                    .px_3()
+                    .py_1()
+                    .text_size(px(11.))
+                    .text_color(colors.text_muted)
+                    .cursor_pointer()
+                    .hover_style(|style| style.bg(colors.surface_hover).text_color(colors.text))
+                    .child(disclosure_icon(
+                        if expanded { 1. } else { 0. },
+                        colors.text_muted,
+                        (&ui_font(), px(11.)),
+                        cx,
+                    ))
+                    .child(label)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if expanded {
+                            this.turn_files_expanded.remove(&row);
+                        } else {
+                            this.turn_files_expanded.insert(row);
+                            this.list_state.pause_following_tail();
+                        }
+                        this.list_state.remeasure_items(row..row + 1);
+                        cx.notify();
+                    })),
+            );
+        }
+        if expanded {
+            files = files.children(
+                changes
+                    .files
+                    .iter()
+                    .enumerate()
+                    .skip(TURN_FILE_PREVIEW)
+                    .map(|(index, file)| self.render_turn_file(scope, index, file, cx)),
+            );
+        }
         Some(
             div()
                 .id(id("turn-changes", row))
                 .debug_selector(|| "turn-changes-summary".into())
                 .mt_2()
                 .flex()
-                .items_center()
+                .flex_col()
                 .rounded(px(6.))
                 .border_1()
                 .border_color(colors.border)
                 .bg(colors.surface)
                 .overflow_hidden()
-                .child(
-                    div()
-                        .id(id("turn-changes-open", row))
-                        .debug_selector(|| "turn-changes-open".into())
-                        .flex_1()
-                        .min_w_0()
-                        .min_h(px(38.))
-                        .flex()
-                        .flex_wrap()
-                        .items_center()
-                        .gap_2()
-                        .px_3()
-                        .py_2()
-                        .cursor_pointer()
-                        .hover_style(|style| style.bg(colors.surface_hover))
-                        .tooltip(crate::ui::tooltip("View changes in this turn"))
-                        .text_size(px(12.))
-                        .child(div().text_color(colors.text).child(count))
-                        .child(
-                            div()
-                                .flex()
-                                .gap_2()
-                                .font_family(cx.theme().metrics.mono_font.clone())
-                                .child(
-                                    div()
-                                        .text_color(colors.success)
-                                        .child(format!("+{}", changes.added)),
-                                )
-                                .child(
-                                    div()
-                                        .text_color(colors.error)
-                                        .child(format!("-{}", changes.removed)),
-                                ),
-                        )
-                        .when_some(changes.status.label(), |summary, label| {
-                            summary.child(
-                                div()
-                                    .debug_selector(|| "turn-changes-revert-status".into())
-                                    .text_color(colors.text_muted)
-                                    .child(label),
-                            )
-                        })
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            let items = this.diff_items(scope, cx);
-                            if !items.is_empty() {
-                                cx.emit(ConversationEvent::OpenDiff(items));
-                            }
-                        })),
-                )
-                .when(changes.status != RevertStatus::Reverted, |summary| {
-                    summary.child(
-                        div().px_2().flex_shrink_0().child(
-                            icon_button(
-                                id("turn-changes-revert", row),
-                                ICON_REVERT,
-                                "Revert all changes in this turn",
-                                cx,
-                            )
-                            .debug_selector(|| "turn-changes-revert".into())
-                            .when(busy, |button| {
-                                button.opacity(0.4).cursor(gpui::CursorStyle::Arrow)
-                            })
-                            .on_click(cx.listener(
-                                move |this, _, window, cx| {
-                                    cx.stop_propagation();
-                                    if !this.is_busy() {
-                                        this.revert(scope, None, window, cx);
-                                    }
-                                },
-                            )),
-                        ),
-                    )
-                })
+                .child(header)
+                .child(files)
                 .into_any_element(),
         )
+    }
+
+    fn render_turn_file(
+        &self,
+        scope: Scope,
+        index: usize,
+        file: &TurnChangeFile,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<Div> {
+        let colors = &cx.theme().colors;
+        let path = file.path.clone();
+        let display = self.display_path(&path);
+        let (directory, name) = display.rsplit_once('/').unwrap_or(("", &display));
+        div()
+            .id(id("turn-changes-file", index))
+            .debug_selector(move || format!("turn-changes-file-{index}"))
+            .flex()
+            .items_center()
+            .gap_2()
+            .px_3()
+            .py_1()
+            .text_size(px(12.))
+            .text_color(colors.text)
+            .cursor_pointer()
+            .hover_style(|style| style.bg(colors.surface_hover))
+            .tooltip(crate::ui::tooltip(display.clone()))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .items_baseline()
+                    .gap_2()
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .max_w_full()
+                            .truncate()
+                            .child(name.to_owned()),
+                    )
+                    .when(!directory.is_empty(), |row| {
+                        row.child(
+                            div()
+                                .min_w_0()
+                                .truncate()
+                                .text_size(px(11.))
+                                .text_color(colors.text_muted)
+                                .child(directory.to_owned()),
+                        )
+                    }),
+            )
+            .child(turn_line_counts(file.added, file.removed, cx))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.open_turn_diff(scope, Some(&path), cx);
+            }))
     }
 
     /// The line under a message with its timestamp, actions and live progress.
@@ -1132,7 +1266,10 @@ impl ConversationView {
                         .child("Open diff")
                         .on_click(cx.listener(move |this, _, _, cx| {
                             if let Some(item) = this.tool_diff_item(&call_id, &change, cx) {
-                                cx.emit(ConversationEvent::OpenDiff(vec![item]));
+                                cx.emit(ConversationEvent::OpenDiff {
+                                    items: vec![item],
+                                    index: 0,
+                                });
                             }
                         })),
                 )

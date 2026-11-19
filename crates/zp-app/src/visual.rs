@@ -600,7 +600,10 @@ fn turn_change_footers(cx: &mut VisualTestAppContext, out: &std::path::Path) {
                 .turn_changes_for_row(4)
                 .expect("completed turn footer")
         });
-        assert_eq!((summary.files, summary.added, summary.removed), (3, 6, 1));
+        assert_eq!(
+            (summary.files.len(), summary.added, summary.removed),
+            (3, 6, 1)
+        );
         cx.capture_screenshot(window.into())
             .unwrap()
             .save(out.join(format!("42-turn-changes{suffix}.png")))

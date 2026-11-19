@@ -107,8 +107,8 @@ pub enum ConversationEvent {
     FilesChanged,
     /// A user-confirmed restore finished; a diff can return to the conversation.
     FilesRestored,
-    /// The user asked for the full diff of a change.
-    OpenDiff(Vec<DiffItem>),
+    /// The diffs to show, and the initially selected file.
+    OpenDiff { items: Vec<DiffItem>, index: usize },
     /// The user picked a permission mode (for the whole project).
     PermissionModeChanged(zp_core::permissions::PermissionMode),
     /// A `/` command the window handles.
@@ -228,8 +228,10 @@ pub struct ConversationView {
     markdown_cache: RefCell<HashMap<u64, Rc<Vec<Block>>>>,
     /// Diffs of tool calls, by call id.
     tool_diffs: RefCell<HashMap<String, Rc<Result<files::ToolDiff, String>>>>,
-    /// Net file statistics for completed answers, by transcript row.
-    turn_changes: RefCell<HashMap<usize, Option<files::TurnChanges>>>,
+    /// Net file changes for completed answers, by transcript row.
+    turn_changes: RefCell<HashMap<usize, Option<Rc<files::TurnChanges>>>>,
+    /// Rows whose full list of changed files is open.
+    turn_files_expanded: HashSet<usize>,
     change_log_cache: RefCell<Option<zp_core::changes::ChangeLog>>,
     /// Tool calls waiting for the user.
     approvals: Vec<permissions::Approval>,
@@ -347,6 +349,7 @@ impl ConversationView {
             markdown_cache: RefCell::default(),
             tool_diffs: RefCell::default(),
             turn_changes: RefCell::default(),
+            turn_files_expanded: HashSet::new(),
             change_log_cache: RefCell::default(),
             approvals: Vec::new(),
             questions: Vec::new(),
@@ -515,6 +518,7 @@ impl ConversationView {
 
         self.text_selection.clear();
         self.turn_changes.borrow_mut().clear();
+        self.turn_files_expanded.clear();
         self.change_log_cache.borrow_mut().take();
         self.disclosures.clear();
         self.transcript = Transcript::from_session(&coding.session());
@@ -721,6 +725,7 @@ impl ConversationView {
     fn reload_transcript(&mut self) {
         self.text_selection.clear();
         self.turn_changes.borrow_mut().clear();
+        self.turn_files_expanded.clear();
         self.change_log_cache.borrow_mut().take();
         if let Some(coding) = &self.coding {
             self.transcript = Transcript::from_session(&coding.session());

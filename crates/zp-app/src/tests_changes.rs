@@ -116,7 +116,11 @@ fn turn_footer_counts_net_changes_opens_diffs_and_reverts_the_turn(cx: &mut Test
         assert!(view.turn_changes_for_row(1).is_none());
         view.turn_changes_for_row(4).unwrap()
     });
-    assert_eq!((summary.files, summary.added, summary.removed), (2, 2, 1));
+    assert_eq!(
+        (summary.files.len(), summary.added, summary.removed),
+        (2, 2, 1)
+    );
+    assert_eq!((summary.files[0].added, summary.files[0].removed), (1, 1));
     window
         .update(cx, |_, window, _| window.remove_window())
         .unwrap();
@@ -125,7 +129,7 @@ fn turn_footer_counts_net_changes_opens_diffs_and_reverts_the_turn(cx: &mut Test
     let conversation = active(window, cx);
     assert_eq!(
         conversation.read_with(cx, |view, _| view.turn_changes_for_row(4)),
-        Some(summary)
+        Some(summary.clone())
     );
     click(window, "turn-changes-open", cx);
     let diff = with_window(window, cx, |view, _, _| view.diff_view()).unwrap();
@@ -193,7 +197,7 @@ fn turn_footer_counts_net_changes_opens_diffs_and_reverts_the_turn(cx: &mut Test
     assert_eq!(reverted_summary.status, RevertStatus::Reverted);
     assert_eq!(
         (
-            reverted_summary.files,
+            reverted_summary.files.len(),
             reverted_summary.added,
             reverted_summary.removed
         ),
@@ -245,24 +249,48 @@ fn turn_footer_counts_net_changes_opens_diffs_and_reverts_the_turn(cx: &mut Test
 }
 
 #[gpui::test]
-fn turn_diff_lists_all_three_files_and_switches_on_click(cx: &mut TestAppContext) {
+fn turn_file_list_expands_and_opens_the_selected_diff(cx: &mut TestAppContext) {
     let faux = FauxProvider::default();
-    let paths = ["a.txt", "nested/b.txt", "nested/c.txt"];
+    let paths = [
+        "a.txt",
+        "nested/b.txt",
+        "nested/with/a/long/directory/path/for/the/file/list/c.txt",
+        "nested/d.txt",
+    ];
     for path in paths {
         faux.push(write(path, &format!("{path}\n")));
     }
-    faux.push(FauxResponse::text("Created three files."));
+    faux.push(FauxResponse::text("Created four files."));
     let _data = setup_models(cx, &[&faux], false);
     let (_dir, project) = project_dir();
     let window = open(cx, &project);
+    cx.simulate_window_resize(window.into(), gpui::size(gpui::px(700.), gpui::px(760.)));
     let conversation = active(window, cx);
     send(window, "create the files", cx);
-    idle(&conversation, 5, cx);
-    let summary = conversation.read_with(cx, |view, _| view.turn_changes_for_row(4).unwrap());
-    assert_eq!((summary.files, summary.added, summary.removed), (3, 3, 0));
-    click(window, "turn-changes-open", cx);
+    idle(&conversation, 6, cx);
+    let summary = conversation.read_with(cx, |view, _| view.turn_changes_for_row(5).unwrap());
+    assert_eq!(
+        (summary.files.len(), summary.added, summary.removed),
+        (4, 4, 0)
+    );
+    click(window, "turn-changes-file-1", cx);
     let diff = with_window(window, cx, |view, _, _| view.diff_view()).unwrap();
-    for (selector, path) in ["diff-file-0", "diff-file-1", "diff-file-2"]
+    diff.read_with(cx, |view, _| {
+        assert_eq!(view.item().unwrap().display, paths[1])
+    });
+    cx.dispatch_action(window.into(), CloseDiff);
+    let bounds = |selector, cx: &mut TestAppContext| {
+        VisualTestContext::from_window(window.into(), cx).debug_bounds(selector)
+    };
+    assert!(bounds("turn-changes-file-2", cx).is_some());
+    assert!(bounds("turn-changes-file-3", cx).is_none());
+    click(window, "turn-changes-toggle", cx);
+    click(window, "turn-changes-file-3", cx);
+    let diff = with_window(window, cx, |view, _, _| view.diff_view()).unwrap();
+    diff.read_with(cx, |view, _| {
+        assert_eq!(view.item().unwrap().display, paths[3])
+    });
+    for (selector, path) in ["diff-file-0", "diff-file-1", "diff-file-2", "diff-file-3"]
         .into_iter()
         .zip(paths)
     {
@@ -276,6 +304,10 @@ fn turn_diff_lists_all_three_files_and_switches_on_click(cx: &mut TestAppContext
             assert_eq!(view.diff().added, 1);
         });
     }
+    cx.dispatch_action(window.into(), CloseDiff);
+    click(window, "turn-changes-toggle", cx);
+    cx.run_until_parked();
+    assert!(bounds("turn-changes-file-3", cx).is_none());
 }
 
 #[gpui::test]

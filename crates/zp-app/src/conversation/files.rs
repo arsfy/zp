@@ -21,13 +21,20 @@ pub struct ToolDiff {
     pub rows: Vec<UnifiedRow>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub(crate) struct TurnChanges {
     pub group: usize,
-    pub files: usize,
+    pub files: Vec<TurnChangeFile>,
     pub added: usize,
     pub removed: usize,
     pub status: RevertStatus,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct TurnChangeFile {
+    pub path: PathBuf,
+    pub added: usize,
+    pub removed: usize,
 }
 
 pub(super) struct RestoreRecord {
@@ -60,7 +67,7 @@ impl ConversationView {
     }
 
     /// Net changes for the answer ending at `row`, cached to avoid reading blobs on repaint.
-    pub(crate) fn turn_changes_for_row(&self, row: usize) -> Option<TurnChanges> {
+    pub(crate) fn turn_changes_for_row(&self, row: usize) -> Option<Rc<TurnChanges>> {
         if !matches!(self.transcript.rows().get(row), Some(Row::Assistant { .. }))
             || matches!(
                 self.transcript.rows().get(row + 1),
@@ -71,10 +78,10 @@ impl ConversationView {
             return None;
         }
         if let Some(changes) = self.turn_changes.borrow().get(&row) {
-            return *changes;
+            return changes.clone();
         }
-        let changes = self.compute_turn_changes(row);
-        self.turn_changes.borrow_mut().insert(row, changes);
+        let changes = self.compute_turn_changes(row).map(Rc::new);
+        self.turn_changes.borrow_mut().insert(row, changes.clone());
         changes
     }
 
@@ -92,7 +99,7 @@ impl ConversationView {
         let blobs = self.blobs()?;
         let mut changes = TurnChanges {
             group,
-            files: 0,
+            files: Vec::new(),
             added: 0,
             removed: 0,
             status: log.revert_status(Scope::Group(group), None),
@@ -106,11 +113,27 @@ impl ConversationView {
                     zp_core::diff::line_stats(before.as_deref(), after.as_deref())
                 }
             };
-            changes.files += 1;
+            changes.files.push(TurnChangeFile {
+                path: file.path,
+                added,
+                removed,
+            });
             changes.added += added;
             changes.removed += removed;
         }
-        (changes.files > 0).then_some(changes)
+        (!changes.files.is_empty()).then_some(changes)
+    }
+
+    /// Opens the whole turn's diff with the selected file shown first.
+    pub(super) fn open_turn_diff(&self, scope: Scope, path: Option<&Path>, cx: &mut Context<Self>) {
+        let items = self.diff_items(scope, cx);
+        let index = match path {
+            Some(path) => items.iter().position(|item| item.path == path),
+            None => (!items.is_empty()).then_some(0),
+        };
+        if let Some(index) = index {
+            cx.emit(ConversationEvent::OpenDiff { items, index });
+        }
     }
 
     /// `path` relative to the project, for display.

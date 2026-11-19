@@ -173,8 +173,8 @@ impl ProjectWindow {
                             WindowCommand::Reload => this.reload_resources(cx),
                         }
                     }
-                    ConversationEvent::OpenDiff(items) => {
-                        this.open_diff(items.clone(), 0, window, cx)
+                    ConversationEvent::OpenDiff { items, index } => {
+                        this.open_diff(items.clone(), *index, window, cx)
                     }
                 }
                 cx.notify();
