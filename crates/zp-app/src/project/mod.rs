@@ -18,7 +18,7 @@ use zp_core::app_state::PanelLayout;
 use zp_session::{Session, SessionManager};
 
 use crate::actions::{
-    ActivateTab, CancelRename, ClearSessionSearch, ConfirmRename, NewChat, NextTab,
+    ActivateTab, CancelRename, ClearSessionSearch, ConfirmRename, NewChat, NextTab, OpenFolder,
     OpenSelectedSession, PROJECT_CONTEXT, PreviousTab, SelectNextSession, SelectPreviousSession,
     ToggleRightPanel, ToggleSessionTree, ToggleSidebar,
 };
@@ -117,7 +117,7 @@ pub struct ProjectWindow {
     /// The terminal panel's terminals.
     terminals: terminal_panel::Terminals,
     focus_handle: FocusHandle,
-    _subscriptions: Vec<Subscription>,
+    subscriptions: Vec<Subscription>,
 }
 
 impl ProjectWindow {
@@ -304,7 +304,6 @@ impl ProjectWindow {
         let layout = AppStore::state(cx).project(&root).layout;
 
         let geometry_root = root.clone();
-        let release_root = root.clone();
         let search = cx.new(|cx| EditableTextState::new(StringStorage::default(), cx));
         let changes = cx.new(|cx| ChangesPanel::new(root.clone(), cx));
         let subscriptions = vec![
@@ -334,9 +333,9 @@ impl ProjectWindow {
                 this.sidebar.on_search_changed();
                 cx.notify();
             }),
-            cx.on_release(move |_, cx| {
-                crate::mcp::stop(&release_root, cx);
-                Workspaces::project_closed(&release_root, cx)
+            cx.on_release(|this, cx| {
+                crate::mcp::stop(&this.root, cx);
+                Workspaces::project_closed(&this.root, cx);
             }),
         ];
 
@@ -361,7 +360,7 @@ impl ProjectWindow {
             palette: None,
             terminals: Default::default(),
             focus_handle,
-            _subscriptions: subscriptions,
+            subscriptions,
         };
         if this.layout.terminal_visible {
             this.ensure_terminal(window, cx);
@@ -376,11 +375,36 @@ impl ProjectWindow {
         &self.root
     }
 
+    pub(crate) fn has_running_work(&self, cx: &App) -> bool {
+        self.terminals.has_tabs()
+            || self
+                .tabs
+                .iter()
+                .any(|tab| tab.conversation.read(cx).is_busy())
+    }
+
     pub fn has_update_interruptions(&self, cx: &App) -> bool {
-        self.tabs.iter().any(|tab| {
-            let conversation = tab.conversation.read(cx);
-            conversation.is_busy() || !conversation.draft(cx).is_empty()
-        }) || self.terminals.has_tabs()
+        self.has_running_work(cx)
+            || self
+                .tabs
+                .iter()
+                .any(|tab| !tab.conversation.read(cx).draft(cx).is_empty())
+    }
+
+    /// Saves the current workspace before replacing the window's root view.
+    pub(crate) fn prepare_folder_switch(&mut self, cx: &mut App) -> PathBuf {
+        self.save_tabs(cx);
+        for tab in &self.tabs {
+            if tab.conversation.read(cx).is_busy() {
+                tab.conversation
+                    .update(cx, |view, cx| view.stop_for_folder_switch(cx));
+            }
+        }
+        self.subscriptions.clear();
+        self.tabs.clear();
+        self.terminals = Default::default();
+        crate::mcp::stop(&self.root, cx);
+        self.root.clone()
     }
 
     /// The current panel layout.
@@ -992,6 +1016,9 @@ impl Render for ProjectWindow {
             .id("project-window")
             .key_context(PROJECT_CONTEXT)
             .track_focus(&self.focus_handle)
+            .on_action(cx.listener(|_, _: &OpenFolder, window, cx| {
+                workspace::prompt_open_folder(Some(window.window_handle()), cx);
+            }))
             .on_action(cx.listener(Self::toggle_sidebar))
             .on_action(cx.listener(Self::toggle_right_panel))
             .on_action(cx.listener(Self::toggle_session_tree))

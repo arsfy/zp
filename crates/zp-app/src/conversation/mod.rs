@@ -947,6 +947,15 @@ impl ConversationView {
         cx.notify();
     }
 
+    /// Cancels the active run or compaction as the project is unloaded.
+    pub(crate) fn stop_for_folder_switch(&mut self, cx: &mut Context<Self>) {
+        self.abort(cx);
+        self.running = false;
+        self.compacting = false;
+        self.run_task = None;
+        self.stop_status_updates(cx);
+    }
+
     /// The error of the last run, if it failed.
     pub fn failure(&self) -> Option<String> {
         self.run_error.clone().or_else(|| {

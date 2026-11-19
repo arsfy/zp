@@ -164,11 +164,150 @@ fn open_folder_from_welcome_replaces_it(cx: &mut TestAppContext) {
 
     assert_eq!(cx.update(|cx| Workspaces::welcome_count(cx)), 0);
     assert_eq!(cx.windows().len(), 1);
-    assert!(
-        cx.update(|cx| Workspaces::project_window(&project, cx))
-            .is_some()
-    );
+    let opened = cx.update(|cx| Workspaces::project_window(&project, cx).unwrap());
+    assert_eq!(opened.window_id(), welcome.window_id());
     assert_eq!(saved_state(cx, &data).recent_projects[0].path, project);
+}
+
+#[gpui::test]
+fn open_folder_switches_the_current_project_and_recovers_its_draft(cx: &mut TestAppContext) {
+    let data = setup(cx, None);
+    let (_a_dir, a) = project_dir();
+    let (_b_dir, b) = project_dir();
+    let window = cx
+        .update(|cx| workspace::open_project(&a, None, cx))
+        .unwrap();
+    let original = window.root(cx).unwrap();
+    cx.run_until_parked();
+    let bounds = window
+        .update(cx, |_, window, _| window.window_bounds())
+        .unwrap();
+    let project_a = crate::tests_conversation::active(window, cx);
+    project_a.update(cx, |view, cx| view.set_draft("saved for project A", cx));
+
+    let pick = |path: &Path, cx: &mut TestAppContext| {
+        cx.dispatch_action(window.into(), OpenFolder);
+        cx.run_until_parked();
+        assert!(cx.did_prompt_for_paths());
+        cx.simulate_path_prompt_response(|_| Some(vec![path.to_owned()]));
+        cx.run_until_parked();
+        assert_eq!(cx.windows().len(), 1);
+        assert_eq!(
+            cx.update(|cx| Workspaces::project_window(path, cx)),
+            Some(window)
+        );
+        window
+            .update(cx, |view, window, _| {
+                assert_eq!(view.root(), path);
+                assert_eq!(window.window_bounds(), bounds);
+            })
+            .unwrap();
+    };
+
+    pick(&b, cx);
+    assert!(!cx.has_pending_prompt());
+    assert_eq!(saved_state(cx, &data).open_projects, [b.clone()]);
+    assert!(cx.update(|cx| crate::mcp::hub(&a, cx)).is_none());
+    assert!(
+        crate::tests_conversation::active(window, cx)
+            .read_with(cx, |view, cx| view.draft(cx).is_empty())
+    );
+
+    pick(&a, cx);
+    drop(original);
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|cx| Workspaces::project_window(&a, cx)),
+        Some(window)
+    );
+    assert!(cx.update(|cx| crate::mcp::hub(&a, cx)).is_some());
+    assert_eq!(saved_state(cx, &data).open_projects, [a]);
+    assert_eq!(
+        crate::tests_conversation::active(window, cx).read_with(cx, |view, cx| view.draft(cx)),
+        "saved for project A"
+    );
+}
+
+#[gpui::test]
+fn open_folder_asks_before_interrupting_a_run(cx: &mut TestAppContext) {
+    use std::time::Duration;
+
+    use zp_ai::{FauxProvider, FauxResponse};
+
+    use crate::tests_conversation::{active, open, send, setup_models};
+
+    let faux = FauxProvider::default().with_chunk_delay(Duration::from_secs(30));
+    faux.push(FauxResponse::text("Still working"));
+    let _data = setup_models(cx, &[&faux], false);
+    let (_a_dir, a) = project_dir();
+    let (_b_dir, b) = project_dir();
+    let window = open(cx, &a);
+    send(window, "start a run", cx);
+    let conversation = active(window, cx);
+    assert!(conversation.read_with(cx, |view, _| view.is_running()));
+
+    let pick_b = |cx: &mut TestAppContext| {
+        cx.dispatch_action(window.into(), OpenFolder);
+        cx.run_until_parked();
+        cx.simulate_path_prompt_response(|_| Some(vec![b.clone()]));
+        cx.run_until_parked();
+        assert_eq!(cx.pending_prompt().unwrap().0, "Switch folders?");
+    };
+    pick_b(cx);
+    cx.simulate_prompt_answer("Cancel");
+    cx.run_until_parked();
+    assert!(conversation.read_with(cx, |view, _| view.is_running()));
+    assert_eq!(
+        window
+            .update(cx, |view, _, _| view.root().to_owned())
+            .unwrap(),
+        a
+    );
+
+    pick_b(cx);
+    cx.simulate_prompt_answer("Switch Folder");
+    cx.run_until_parked();
+    assert!(!conversation.read_with(cx, |view, _| view.is_running()));
+    assert_eq!(cx.windows().len(), 1);
+    assert_eq!(
+        window
+            .update(cx, |view, _, _| view.root().to_owned())
+            .unwrap(),
+        b
+    );
+}
+
+#[gpui::test]
+fn open_folder_focuses_a_project_that_is_already_open(cx: &mut TestAppContext) {
+    let _data = setup(cx, None);
+    let (_a_dir, a) = project_dir();
+    let (_b_dir, b) = project_dir();
+    let first = cx
+        .update(|cx| workspace::open_project(&a, None, cx))
+        .unwrap();
+    let second = cx
+        .update(|cx| workspace::open_project(&b, None, cx))
+        .unwrap();
+    cx.run_until_parked();
+
+    cx.dispatch_action(first.into(), OpenFolder);
+    cx.run_until_parked();
+    cx.simulate_path_prompt_response(|_| Some(vec![b.clone()]));
+    cx.run_until_parked();
+
+    assert_eq!(cx.windows().len(), 2);
+    assert_eq!(
+        cx.update(|cx| Workspaces::project_window(&a, cx)),
+        Some(first)
+    );
+    assert_eq!(
+        cx.update(|cx| Workspaces::project_window(&b, cx)),
+        Some(second)
+    );
+    assert_eq!(
+        cx.update(|cx| cx.active_window().unwrap().window_id()),
+        second.window_id()
+    );
 }
 
 #[gpui::test]

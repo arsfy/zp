@@ -234,6 +234,7 @@ impl ProjectWindow {
             .position(|tab| tab.conversation.entity_id() == conversation)
         {
             self.activate_tab(index, window, cx);
+            window.activate();
         }
     }
 

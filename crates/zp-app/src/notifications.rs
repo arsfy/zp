@@ -24,12 +24,13 @@ pub fn init(cx: &mut App) {
         let Some((window, conversation)) = target else {
             return;
         };
-        if let Some(project) = window.downcast::<ProjectWindow>() {
-            let _ = project.update(cx, |view, window, cx| {
-                view.activate_conversation(conversation, window, cx);
-                window.activate();
-            });
-        }
+        let _ = window.update(cx, |view, window, cx| {
+            if let Ok(project) = view.downcast::<ProjectWindow>() {
+                project.update(cx, |view, cx| {
+                    view.activate_conversation(conversation, window, cx);
+                });
+            }
+        });
     });
 }
 

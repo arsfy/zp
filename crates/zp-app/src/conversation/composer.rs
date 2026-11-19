@@ -792,7 +792,7 @@ impl ConversationView {
         cx.notify();
         let task =
             gpui_tokio::Tokio::spawn(cx, async move { coding.compact(focus.as_deref()).await });
-        cx.spawn(async move |this, cx| {
+        self.run_task = Some(cx.spawn(async move |this, cx| {
             let result = task.await;
             let _ = this.update(cx, |this, cx| {
                 this.compacting = false;
@@ -823,8 +823,7 @@ impl ConversationView {
                 }
                 cx.notify();
             });
-        })
-        .detach();
+        }));
     }
 }
 

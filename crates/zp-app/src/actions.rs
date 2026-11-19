@@ -186,7 +186,7 @@ pub fn init(cx: &mut App) {
     cx.on_action(|_: &Quit, cx| workspace::quit(cx));
     cx.on_action(show_about);
     cx.on_action(|_: &OpenSettings, cx| crate::settings::SettingsWindow::open(cx));
-    // Welcome windows handle this themselves so the project can replace them.
+    // Workspace windows handle this themselves so they can be reused.
     cx.on_action(|_: &OpenFolder, cx| workspace::prompt_open_folder(None, cx));
     cx.on_action(|_: &NewWindow, cx| {
         workspace::open_welcome_or_report(cx);

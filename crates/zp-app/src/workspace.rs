@@ -66,6 +66,15 @@ impl Workspaces {
             .any(|welcome| welcome.window_id() == window.window_id())
     }
 
+    fn contains_window(window: AnyWindowHandle, cx: &App) -> bool {
+        Self::is_welcome(window, cx)
+            || cx
+                .global::<Self>()
+                .projects
+                .values()
+                .any(|project| project.window_id() == window.window_id())
+    }
+
     fn window_count(&self) -> usize {
         self.projects.len() + self.welcomes.len()
     }
@@ -286,9 +295,12 @@ pub fn restore(cx: &mut App) -> Result<()> {
     Ok(())
 }
 
-/// Shows the folder picker and opens the choice; the project replaces `replace` if it is
-/// a welcome window.
-pub fn prompt_open_folder(replace: Option<AnyWindowHandle>, cx: &mut App) {
+/// Shows the folder picker, using the requesting workspace window when available.
+pub fn prompt_open_folder(source: Option<AnyWindowHandle>, cx: &mut App) {
+    let source = source.or_else(|| {
+        cx.active_window()
+            .filter(|window| Workspaces::contains_window(*window, cx))
+    });
     let answer = cx.prompt_for_paths(PathPromptOptions {
         files: false,
         directories: true,
@@ -303,12 +315,106 @@ pub fn prompt_open_folder(replace: Option<AnyWindowHandle>, cx: &mut App) {
             return;
         };
         cx.update(|cx| {
-            if let Err(error) = open_project(&path, replace, cx) {
+            let result = match source {
+                Some(source) => open_picked_folder(&path, source, cx),
+                None => open_project(&path, None, cx).map(|_| ()),
+            };
+            if let Err(error) = result {
                 report_error("Could not open folder", &error, cx);
             }
         });
     })
     .detach();
+}
+
+/// Brings an already open project forward, keeping one window per project.
+fn focus_open_project(root: &Path, source: AnyWindowHandle, cx: &mut App) -> bool {
+    let Some(existing) = Workspaces::project_window(root, cx) else {
+        return false;
+    };
+    AppStore::update(cx, |state| state.touch_recent(root));
+    if existing.window_id() != source.window_id() {
+        let close_welcome = Workspaces::is_welcome(source, cx);
+        cx.defer(move |cx| {
+            let _ = existing.update(cx, |_, window, _| window.activate());
+            if close_welcome {
+                let _ = source.update(cx, |_, window, _| window.remove_window());
+            }
+        });
+    }
+    true
+}
+
+fn open_picked_folder(path: &Path, source: AnyWindowHandle, cx: &mut App) -> Result<()> {
+    let root = zp_core::project::normalize_project_path(path)
+        .with_context(|| format!("Cannot open {}", path.display()))?;
+    if focus_open_project(&root, source, cx) {
+        return Ok(());
+    }
+    let _ = source.update(cx, |view, window, cx| {
+        let project = window.root::<ProjectWindow>().flatten();
+        if project.is_some_and(|project| project.read(cx).has_running_work(cx)) {
+            let answer = window.prompt(
+                PromptLevel::Warning,
+                "Switch folders?",
+                Some(
+                    "Switching folders stops running agents and closes terminals in this project.",
+                ),
+                &["Switch Folder", "Cancel"],
+                cx,
+            );
+            let original = view.entity_id();
+            cx.spawn(async move |cx| {
+                if answer.await == Ok(0) {
+                    cx.update(|cx| {
+                        let _ = source.update(cx, |view, window, cx| {
+                            if view.entity_id() == original
+                                && !focus_open_project(&root, source, cx)
+                            {
+                                replace_project(root, window, cx);
+                            }
+                        });
+                    });
+                }
+            })
+            .detach();
+        } else {
+            replace_project(root, window, cx);
+        }
+    });
+    Ok(())
+}
+
+fn replace_project(root: PathBuf, window: &mut Window, cx: &mut App) {
+    let geometry = capture_geometry(window, cx);
+    let previous = window
+        .root::<ProjectWindow>()
+        .flatten()
+        .map(|project| project.update(cx, |project, cx| project.prepare_folder_switch(cx)));
+    let handle = WindowHandle::new(window.window_handle().window_id());
+    let project_root = root.clone();
+    window.replace_root(cx, |window, cx| {
+        ProjectWindow::new(project_root, window, cx)
+    });
+
+    let workspaces = cx.global_mut::<Workspaces>();
+    if let Some(previous) = &previous {
+        workspaces.projects.remove(previous);
+    } else {
+        workspaces
+            .welcomes
+            .retain(|welcome| welcome.window_id() != handle.window_id());
+    }
+    workspaces.projects.insert(root.clone(), handle);
+    AppStore::update(cx, |state| {
+        if let Some(previous) = previous {
+            state.mark_closed(&previous);
+            state.project_mut(&previous).window = Some(geometry.clone());
+        }
+        state.project_mut(&root).window = Some(geometry);
+        state.touch_recent(&root);
+        state.mark_open(&root);
+    });
 }
 
 /// Closes the active window.
@@ -386,8 +492,10 @@ pub fn report_error(title: &str, error: &anyhow::Error, cx: &mut App) {
 /// Re-applies the permission settings to every open project.
 pub fn apply_permissions(cx: &mut App) {
     for window in cx.windows() {
-        if let Some(project) = window.downcast::<ProjectWindow>() {
-            let _ = project.update(cx, |view, _, cx| view.apply_permissions(cx));
-        }
+        let _ = window.update(cx, |view, _, cx| {
+            if let Ok(project) = view.downcast::<ProjectWindow>() {
+                project.update(cx, |view, cx| view.apply_permissions(cx));
+            }
+        });
     }
 }
