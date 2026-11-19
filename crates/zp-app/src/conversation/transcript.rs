@@ -67,7 +67,8 @@ pub enum Row {
     /// A model response with its tool calls. While streaming, the current content is
     /// read through [`Transcript::assistant`].
     Assistant {
-        message: AssistantMessage,
+        /// Boxed: a response is several times larger than the other rows.
+        message: Box<AssistantMessage>,
         completion: Option<MessageTiming>,
         ordinal: usize,
     },
@@ -288,7 +289,7 @@ impl Transcript {
                 }
                 self.active_thinking.clear();
                 let finished = Row::Assistant {
-                    message: assistant.clone(),
+                    message: Box::new(assistant.clone()),
                     completion: Some(completion),
                     ordinal,
                 };
@@ -355,7 +356,7 @@ impl Transcript {
                 self.active_thinking.clear();
                 let row = self.push(
                     Row::Assistant {
-                        message: message.clone(),
+                        message: Box::new(message.clone()),
                         completion: None,
                         ordinal: self.next_ordinal,
                     },
@@ -426,7 +427,7 @@ impl Transcript {
                 if let Some((row, accumulator)) = self.streaming.take() {
                     let ordinal = self.rows[row].ordinal();
                     self.rows[row] = Row::Assistant {
-                        message: accumulator.into_message(),
+                        message: Box::new(accumulator.into_message()),
                         completion: None,
                         ordinal,
                     };

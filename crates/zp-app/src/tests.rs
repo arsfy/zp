@@ -206,7 +206,10 @@ fn open_folder_switches_the_current_project_and_recovers_its_draft(cx: &mut Test
 
     pick(&b, cx);
     assert!(!cx.has_pending_prompt());
-    assert_eq!(saved_state(cx, &data).open_projects, [b.clone()]);
+    assert_eq!(
+        saved_state(cx, &data).open_projects,
+        std::slice::from_ref(&b)
+    );
     assert!(cx.update(|cx| crate::mcp::hub(&a, cx)).is_none());
     assert!(
         crate::tests_conversation::active(window, cx)
