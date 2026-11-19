@@ -9,6 +9,7 @@ use zp_ai::{FauxProvider, FauxResponse};
 use zp_core::permissions::{Decision, PermissionMode};
 
 use crate::actions::StopRun;
+use crate::conversation::transcript::Row;
 use crate::conversation::{ConversationView, Picker};
 use crate::tests::{project_dir, saved_state};
 use crate::tests_conversation::{
@@ -89,6 +90,29 @@ fn task_clock_pauses_for_approval_and_resets_for_the_next_task(cx: &mut TestAppC
         conversation.read_with(cx, |view, _| !view.is_running())
     });
     let finished = conversation.read_with(cx, |view, cx| view.task_elapsed(cx));
+    let (completion, session_file) = conversation.read_with(cx, |view, _| {
+        let Some(Row::Assistant {
+            completion: Some(completion),
+            ..
+        }) = view.transcript().rows().last()
+        else {
+            panic!("expected timing on the completed response");
+        };
+        (*completion, view.session_file().unwrap())
+    });
+    let elapsed = completion.elapsed_seconds.unwrap();
+    assert!((paused.as_secs()..=finished.as_secs()).contains(&elapsed));
+    let session = zp_session::Session::open(&session_file).unwrap();
+    let reply = session.entries().last().unwrap();
+    assert_eq!(reply.timestamp, completion.timestamp);
+    assert!(matches!(
+        reply.data,
+        zp_session::EntryData::Message {
+            elapsed_seconds: Some(saved),
+            ..
+        } if saved == elapsed
+    ));
+
     cx.executor().advance_clock(Duration::from_secs(10));
     cx.run_until_parked();
     assert_eq!(

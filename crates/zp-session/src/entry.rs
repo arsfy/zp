@@ -74,6 +74,9 @@ pub enum EntryData {
     Message {
         /// The message.
         message: AgentMessage,
+        /// Active run time in whole seconds when an assistant response finished.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        elapsed_seconds: Option<u64>,
     },
     /// The model was switched.
     ModelChange {
@@ -119,7 +122,7 @@ impl SessionEntry {
     /// The message, if this is a message entry.
     pub fn message(&self) -> Option<&AgentMessage> {
         match &self.data {
-            EntryData::Message { message } => Some(message),
+            EntryData::Message { message, .. } => Some(message),
             _ => None,
         }
     }
@@ -169,6 +172,7 @@ mod tests {
             timestamp: 6,
             data: EntryData::Message {
                 message: AgentMessage::user("hi"),
+                elapsed_seconds: None,
             },
         };
         let value = serde_json::to_value(&message).unwrap();

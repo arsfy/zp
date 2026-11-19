@@ -7,8 +7,10 @@ use serde_json::Value;
 use zp_agent::{AgentEvent, AgentMessage};
 use zp_ai::{
     AssistantMessage, AssistantMessageEvent, Message, StopReason, StreamAccumulator, UserContent,
+    now_ms,
 };
 use zp_core::UsageTotals;
+use zp_session::{EntryData, Session, SessionEntry};
 
 /// Execution state of a tool call.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -28,6 +30,28 @@ pub struct ToolState {
     pub details: Option<Value>,
 }
 
+/// When a message was recorded, with the active run time for an assistant response.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MessageTiming {
+    pub timestamp: i64,
+    pub elapsed_seconds: Option<u64>,
+}
+
+impl MessageTiming {
+    pub(super) fn from_entry(entry: &SessionEntry) -> Option<Self> {
+        let EntryData::Message {
+            elapsed_seconds, ..
+        } = &entry.data
+        else {
+            return None;
+        };
+        Some(Self {
+            timestamp: entry.timestamp,
+            elapsed_seconds: *elapsed_seconds,
+        })
+    }
+}
+
 /// One rendered row of the transcript.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Row {
@@ -37,12 +61,14 @@ pub enum Row {
         images: usize,
         /// Files attached with `@path`.
         files: Vec<String>,
+        sent_at: i64,
         ordinal: usize,
     },
     /// A model response with its tool calls. While streaming, the current content is
     /// read through [`Transcript::assistant`].
     Assistant {
         message: AssistantMessage,
+        completion: Option<MessageTiming>,
         ordinal: usize,
     },
     /// A custom message meant to be shown.
@@ -87,6 +113,8 @@ pub struct Transcript {
     usage: UsageTotals,
     /// Ordinal of the next finished message.
     next_ordinal: usize,
+    /// Used to estimate elapsed time for responses saved before the run clock was recorded.
+    last_user_at: Option<i64>,
 }
 
 fn text_of(content: &[UserContent]) -> String {
@@ -98,12 +126,14 @@ fn text_of(content: &[UserContent]) -> String {
 }
 
 impl Transcript {
-    /// A transcript showing `messages` (a restored conversation).
-    pub fn from_messages(messages: &[AgentMessage]) -> Self {
+    /// Restores the transcript and message timing from the active session branch.
+    pub(super) fn from_session(session: &Session) -> Self {
         let mut transcript = Self::default();
         let mut changes = Changes::default();
-        for message in messages {
-            transcript.finish_message(message, &mut changes);
+        let context = session.context();
+        for (message, id) in context.messages.iter().zip(&context.entry_ids) {
+            let timing = session.entry(id).and_then(MessageTiming::from_entry);
+            transcript.finish_message(message, timing, &mut changes);
         }
         transcript
     }
@@ -214,11 +244,17 @@ impl Transcript {
     }
 
     /// Records a completed message.
-    fn finish_message(&mut self, message: &AgentMessage, changes: &mut Changes) {
+    fn finish_message(
+        &mut self,
+        message: &AgentMessage,
+        timing: Option<MessageTiming>,
+        changes: &mut Changes,
+    ) {
         let ordinal = self.next_ordinal;
         self.next_ordinal += 1;
         match message {
             AgentMessage::Llm(Message::User(user)) => {
+                self.last_user_at = Some(timing.map_or(user.timestamp, |timing| timing.timestamp));
                 let images = user
                     .content
                     .iter()
@@ -231,29 +267,38 @@ impl Transcript {
                         text: text.to_owned(),
                         images,
                         files,
+                        sent_at: user.timestamp,
                         ordinal,
                     },
                     changes,
                 );
             }
             AgentMessage::Llm(Message::Assistant(assistant)) => {
+                let mut completion = timing.unwrap_or_else(|| MessageTiming {
+                    timestamp: now_ms(),
+                    elapsed_seconds: None,
+                });
+                if completion.elapsed_seconds.is_none() {
+                    let started = self
+                        .last_user_at
+                        .filter(|&sent_at| sent_at <= completion.timestamp)
+                        .unwrap_or(assistant.timestamp);
+                    completion.elapsed_seconds =
+                        u64::try_from(completion.timestamp.saturating_sub(started) / 1000).ok();
+                }
                 self.active_thinking.clear();
+                let finished = Row::Assistant {
+                    message: assistant.clone(),
+                    completion: Some(completion),
+                    ordinal,
+                };
                 let row = match self.streaming.take() {
                     Some((row, _)) => {
-                        self.rows[row] = Row::Assistant {
-                            message: assistant.clone(),
-                            ordinal,
-                        };
+                        self.rows[row] = finished;
                         changes.dirty.insert(row);
                         row
                     }
-                    None => self.push(
-                        Row::Assistant {
-                            message: assistant.clone(),
-                            ordinal,
-                        },
-                        changes,
-                    ),
+                    None => self.push(finished, changes),
                 };
                 for call in assistant.tool_calls() {
                     self.tool_rows.insert(call.id.clone(), row);
@@ -297,7 +342,12 @@ impl Transcript {
     }
 
     /// Applies one agent event.
-    pub fn apply(&mut self, event: &AgentEvent, changes: &mut Changes) {
+    pub(super) fn apply(
+        &mut self,
+        event: &AgentEvent,
+        timing: Option<MessageTiming>,
+        changes: &mut Changes,
+    ) {
         match event {
             AgentEvent::MessageStart {
                 message: AgentMessage::Llm(Message::Assistant(message)),
@@ -306,6 +356,7 @@ impl Transcript {
                 let row = self.push(
                     Row::Assistant {
                         message: message.clone(),
+                        completion: None,
                         ordinal: self.next_ordinal,
                     },
                     changes,
@@ -327,7 +378,7 @@ impl Transcript {
                     changes.dirty.insert(*row);
                 }
             }
-            AgentEvent::MessageEnd { message } => self.finish_message(message, changes),
+            AgentEvent::MessageEnd { message } => self.finish_message(message, timing, changes),
             AgentEvent::ToolExecutionStart { tool_call_id, .. } => {
                 self.tools.insert(
                     tool_call_id.clone(),
@@ -376,6 +427,7 @@ impl Transcript {
                     let ordinal = self.rows[row].ordinal();
                     self.rows[row] = Row::Assistant {
                         message: accumulator.into_message(),
+                        completion: None,
                         ordinal,
                     };
                     changes.dirty.insert(row);
@@ -395,6 +447,53 @@ mod tests {
     use zp_ai::{
         AssistantContent, AssistantMessageEvent, TextContent, ToolCall, ToolResultMessage, Usage,
     };
+
+    fn restored(messages: &[AgentMessage]) -> Transcript {
+        let mut session = Session::in_memory(std::path::Path::new("."));
+        for message in messages {
+            session.append_message(message.clone()).unwrap();
+        }
+        Transcript::from_session(&session)
+    }
+
+    #[test]
+    fn restores_legacy_completion_time_and_estimates_elapsed_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("session.jsonl");
+        let session = Session::in_memory(dir.path());
+        let mut user = zp_ai::UserMessage::text("hello");
+        user.timestamp = 10_000;
+        let mut reply = AssistantMessage::empty("faux", "faux", "m");
+        reply.timestamp = 20_000;
+        let lines = [
+            serde_json::to_value(session.header()).unwrap(),
+            json!({"type": "message", "id": "a", "parentId": null,
+                "timestamp": 12_000, "message": Message::User(user)}),
+            json!({"type": "message", "id": "b", "parentId": "a",
+                "timestamp": 95_000, "message": Message::Assistant(reply)}),
+        ];
+        let text = lines.map(|line| line.to_string()).join("\n");
+        std::fs::write(&file, text).unwrap();
+
+        let transcript = Transcript::from_session(&Session::open(&file).unwrap());
+        assert!(matches!(
+            transcript.rows()[0],
+            Row::User {
+                sent_at: 10_000,
+                ..
+            }
+        ));
+        assert!(matches!(
+            transcript.rows()[1],
+            Row::Assistant {
+                completion: Some(MessageTiming {
+                    timestamp: 95_000,
+                    elapsed_seconds: Some(83),
+                }),
+                ..
+            }
+        ));
+    }
 
     fn assistant(blocks: Vec<AssistantContent>, stop: StopReason) -> AssistantMessage {
         let mut message = AssistantMessage::empty("faux", "faux", "m");
@@ -436,7 +535,7 @@ mod tests {
             )
             .into(),
         ];
-        let transcript = Transcript::from_messages(&messages);
+        let transcript = restored(&messages);
         assert_eq!(transcript.len(), 3, "tool results live in their call's row");
         let ordinals: Vec<usize> = transcript.rows().iter().map(Row::ordinal).collect();
         assert_eq!(ordinals, [0, 1, 3], "the tool result is message 2");
@@ -455,6 +554,7 @@ mod tests {
             &AgentEvent::MessageStart {
                 message: skeleton.clone().into(),
             },
+            None,
             &mut changes,
         );
         transcript.apply(
@@ -464,6 +564,7 @@ mod tests {
                     redacted: false,
                 },
             },
+            None,
             &mut changes,
         );
         assert!(transcript.thinking_is_running(0, 0));
@@ -477,6 +578,7 @@ mod tests {
                     signature: None,
                 },
             },
+            None,
             &mut changes,
         );
         assert!(!transcript.thinking_is_running(0, 0));
@@ -497,6 +599,7 @@ mod tests {
                 &AgentEvent::MessageStart {
                     message: skeleton.clone().into(),
                 },
+                None,
                 &mut changes,
             );
             transcript.apply(
@@ -506,15 +609,17 @@ mod tests {
                         redacted: false,
                     },
                 },
+                None,
                 &mut changes,
             );
             assert!(transcript.thinking_is_running(0, 0));
-            transcript.apply(&end, &mut changes);
+            transcript.apply(&end, None, &mut changes);
             assert!(!transcript.thinking_is_running(0, 0));
             transcript.apply(
                 &AgentEvent::MessageStart {
                     message: skeleton.clone().into(),
                 },
+                None,
                 &mut changes,
             );
             assert!(!transcript.thinking_is_running(1, 0));
@@ -524,12 +629,13 @@ mod tests {
     #[test]
     fn streaming_usage_is_replaced_by_final_usage_without_double_counting() {
         let first = assistant(Vec::new(), StopReason::Stop);
-        let mut transcript = Transcript::from_messages(&[first.clone().into()]);
+        let mut transcript = restored(&[first.clone().into()]);
         let mut changes = Changes::default();
         transcript.apply(
             &AgentEvent::MessageStart {
                 message: AssistantMessage::empty("faux", "faux", "m").into(),
             },
+            None,
             &mut changes,
         );
         let usage = Usage {
@@ -545,6 +651,7 @@ mod tests {
                     usage: usage.clone(),
                 },
             },
+            None,
             &mut changes,
         );
         assert_eq!(transcript.streaming_usage(), Some(&usage));
@@ -559,6 +666,7 @@ mod tests {
             &AgentEvent::MessageEnd {
                 message: final_message.into(),
             },
+            None,
             &mut changes,
         );
         assert!(transcript.streaming_usage().is_none());
@@ -568,13 +676,14 @@ mod tests {
 
     #[test]
     fn streams_and_tracks_tools() {
-        let mut transcript = Transcript::from_messages(&[AgentMessage::user("go")]);
+        let mut transcript = restored(&[AgentMessage::user("go")]);
         let mut changes = Changes::default();
         let skeleton = AssistantMessage::empty("faux", "faux", "m");
         transcript.apply(
             &AgentEvent::MessageStart {
                 message: skeleton.clone().into(),
             },
+            None,
             &mut changes,
         );
         for event in [
@@ -588,7 +697,7 @@ mod tests {
                 delta: "lo".into(),
             },
         ] {
-            transcript.apply(&AgentEvent::MessageUpdate { event }, &mut changes);
+            transcript.apply(&AgentEvent::MessageUpdate { event }, None, &mut changes);
         }
         assert!(transcript.is_streaming(1));
         assert_eq!(transcript.assistant(1).unwrap().text(), "Hello");
@@ -608,6 +717,7 @@ mod tests {
             &AgentEvent::MessageEnd {
                 message: final_message.into(),
             },
+            None,
             &mut changes,
         );
         assert!(!transcript.is_streaming(1) && changes.usage);
@@ -619,6 +729,7 @@ mod tests {
                 tool_name: "bash".into(),
                 args: json!({}),
             },
+            None,
             &mut changes,
         );
         transcript.apply(
@@ -627,6 +738,7 @@ mod tests {
                 tool_name: "bash".into(),
                 partial_result: AgentToolResult::text("partial"),
             },
+            None,
             &mut changes,
         );
         assert_eq!(transcript.tool("c1").unwrap().status, ToolStatus::Running);
@@ -639,6 +751,7 @@ mod tests {
                 is_error: true,
                 duration_ms: Some(3),
             },
+            None,
             &mut changes,
         );
         assert_eq!(transcript.tool("c1").unwrap().status, ToolStatus::Error);
@@ -649,12 +762,14 @@ mod tests {
             &AgentEvent::MessageEnd {
                 message: assistant(Vec::new(), StopReason::Aborted).into(),
             },
+            None,
             &mut changes,
         );
         transcript.apply(
             &AgentEvent::AgentEnd {
                 messages: Vec::new(),
             },
+            None,
             &mut changes,
         );
         assert!(changes.finished);

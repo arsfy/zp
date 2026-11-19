@@ -252,7 +252,10 @@ impl Session {
 
     /// Appends a transcript message.
     pub fn append_message(&mut self, message: AgentMessage) -> anyhow::Result<String> {
-        self.append(EntryData::Message { message })
+        self.append(EntryData::Message {
+            message,
+            elapsed_seconds: None,
+        })
     }
 
     /// Records a model switch.
@@ -452,6 +455,7 @@ impl Session {
                 }
                 EntryData::Message {
                     message: AgentMessage::Llm(Message::Assistant(message)),
+                    ..
                 } => {
                     context.model = Some(ModelRef {
                         provider: message.provider.clone(),

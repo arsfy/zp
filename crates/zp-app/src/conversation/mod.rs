@@ -32,7 +32,7 @@ use zp_ai::{Model, ThinkingLevel};
 use zp_core::{CodingSession, CodingSessionOptions, UsageTotals, session_model};
 use zp_session::Session;
 
-use self::transcript::{Changes, Transcript};
+use self::transcript::{Changes, MessageTiming, Transcript};
 use crate::actions::{ClosePicker, PickFirstModel, SendMessage, StopRun};
 use crate::diff_view::DiffItem;
 use crate::markdown::{Block, parse};
@@ -50,6 +50,23 @@ const COMPOSER_CARD_RADIUS: f32 = 8.0;
 /// was in progress (the "collapse when done" display): quick commands and short thoughts
 /// would otherwise flash open and shut.
 pub(crate) const MIN_EXPANDED: Duration = Duration::from_millis(1500);
+
+/// An agent event with its arrival time and any saved message timing.
+struct ReceivedEvent {
+    at: Instant,
+    event: AgentEvent,
+    timing: Option<MessageTiming>,
+}
+
+impl ReceivedEvent {
+    fn new(at: Instant, event: AgentEvent) -> Self {
+        Self {
+            at,
+            event,
+            timing: None,
+        }
+    }
+}
 
 /// A transcript block that opens while it is in progress.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -414,6 +431,8 @@ impl ConversationView {
         options.asker = Some(Arc::new(crate::approvals::ChannelAsker::new(
             question_sender,
         )));
+        options.response_elapsed_seconds =
+            Some(Arc::new(self.progress.read(cx).elapsed_sampler(cx)));
         let coding = Arc::new(CodingSession::new(options)?);
         let approvals = cx.spawn(async move |this, cx| {
             while let Some(pending) = approval_receiver.next().await {
@@ -439,9 +458,28 @@ impl ConversationView {
         self._questions = Some(questions);
 
         // Events carry their arrival time: batches are applied up to a frame later.
-        let (sender, mut receiver) = futures::channel::mpsc::unbounded::<(Instant, AgentEvent)>();
+        let (sender, mut receiver) = futures::channel::mpsc::unbounded::<ReceivedEvent>();
+        let session_owner = Arc::downgrade(&coding);
         let subscription = coding.agent().subscribe(move |event| {
-            let _ = sender.unbounded_send((Instant::now(), event.clone()));
+            let mut received = ReceivedEvent::new(Instant::now(), event.clone());
+            if let AgentEvent::MessageEnd { message } = event
+                && matches!(
+                    message.as_llm(),
+                    Some(zp_ai::Message::User(_) | zp_ai::Message::Assistant(_))
+                )
+                && let Some(coding) = session_owner.upgrade()
+            {
+                // The persistence listener has already appended this message.
+                let session = coding.session();
+                received.timing = session
+                    .entries()
+                    .iter()
+                    .rev()
+                    .find(|entry| entry.message().is_some())
+                    .filter(|entry| entry.message() == Some(message))
+                    .and_then(MessageTiming::from_entry);
+            }
+            let _ = sender.unbounded_send(received);
         });
         let mut awaiting_first_save = {
             let session = coding.session();
@@ -457,9 +495,9 @@ impl ConversationView {
                     .update(cx, |this, cx| {
                         // The coding session saves each completed message before forwarding it.
                         if awaiting_first_save
-                            && batch
-                                .iter()
-                                .any(|(_, event)| matches!(event, AgentEvent::MessageEnd { .. }))
+                            && batch.iter().any(|received| {
+                                matches!(received.event, AgentEvent::MessageEnd { .. })
+                            })
                             && this.session_file().is_some()
                         {
                             awaiting_first_save = false;
@@ -479,7 +517,7 @@ impl ConversationView {
         self.turn_changes.borrow_mut().clear();
         self.change_log_cache.borrow_mut().take();
         self.disclosures.clear();
-        self.transcript = Transcript::from_messages(&coding.agent().messages());
+        self.transcript = Transcript::from_session(&coding.session());
         // One more item at the end: room for the floating composer.
         self.list_state = ListState::new(self.transcript.len() + 1, ListAlignment::Top, px(1000.));
         self.list_state.set_follow_mode(gpui::FollowMode::Tail);
@@ -489,14 +527,14 @@ impl ConversationView {
         Ok(())
     }
 
-    fn apply_events(&mut self, events: Vec<(Instant, AgentEvent)>, cx: &mut Context<Self>) {
+    fn apply_events(&mut self, events: Vec<ReceivedEvent>, cx: &mut Context<Self>) {
         let old_len = self.transcript.len();
         let mut changes = Changes::default();
-        for (at, event) in &events {
+        for ReceivedEvent { at, event, timing } in &events {
             if self.time_response(*at, event) {
                 changes.usage = true;
             }
-            self.transcript.apply(event, &mut changes);
+            self.transcript.apply(event, *timing, &mut changes);
         }
         for &row in changes.dirty.iter().filter(|&&row| row < old_len) {
             self.list_state.remeasure_items(row..row + 1);
@@ -512,8 +550,8 @@ impl ConversationView {
         if changes.usage {
             cx.emit(ConversationEvent::StatusChanged);
         }
-        let files_changed = events.iter().any(|(_, event)| {
-            matches!(event, AgentEvent::ToolExecutionEnd { result, .. } if result.details.is_some())
+        let files_changed = events.iter().any(|received| {
+            matches!(&received.event, AgentEvent::ToolExecutionEnd { result, .. } if result.details.is_some())
         });
         if files_changed {
             self.turn_changes.borrow_mut().clear();
@@ -685,7 +723,7 @@ impl ConversationView {
         self.turn_changes.borrow_mut().clear();
         self.change_log_cache.borrow_mut().take();
         if let Some(coding) = &self.coding {
-            self.transcript = Transcript::from_messages(&coding.agent().messages());
+            self.transcript = Transcript::from_session(&coding.session());
             self.editing = None;
             self.held_open.borrow_mut().clear();
             self.disclosures.clear();
@@ -828,7 +866,13 @@ impl ConversationView {
         }
         self.refresh_last_row();
         let now = Instant::now();
-        self.apply_events(events.into_iter().map(|e| (now, e)).collect(), cx);
+        self.apply_events(
+            events
+                .into_iter()
+                .map(|event| ReceivedEvent::new(now, event))
+                .collect(),
+            cx,
+        );
     }
 
     /// Scrolls the transcript so that `row` is at the top (screenshots).
@@ -1767,7 +1811,7 @@ mod tests {
         let window = crate::tests_conversation::open(cx, &project);
         let conversation = crate::tests_conversation::active(window, cx);
         let apply = |view: &mut ConversationView, event, cx: &mut Context<ConversationView>| {
-            view.apply_events(vec![(Instant::now(), event)], cx);
+            view.apply_events(vec![ReceivedEvent::new(Instant::now(), event)], cx);
         };
         let calls = ["write", "edit", "bash", "read", "custom-tool"].map(|name| ToolCall {
             id: name.into(),
@@ -1989,13 +2033,13 @@ mod tests {
         conversation.update(cx, |view, cx| {
             view.apply_events(
                 vec![
-                    (
+                    ReceivedEvent::new(
                         at,
                         AgentEvent::MessageStart {
                             message: message.clone().into(),
                         },
                     ),
-                    (
+                    ReceivedEvent::new(
                         at,
                         AgentEvent::MessageUpdate {
                             event: AssistantMessageEvent::Usage {
@@ -2003,13 +2047,13 @@ mod tests {
                             },
                         },
                     ),
-                    (
+                    ReceivedEvent::new(
                         at,
                         AgentEvent::MessageUpdate {
                             event: AssistantMessageEvent::TextStart { index: 0 },
                         },
                     ),
-                    (
+                    ReceivedEvent::new(
                         at,
                         AgentEvent::MessageUpdate {
                             event: AssistantMessageEvent::TextDelta {
@@ -2037,7 +2081,7 @@ mod tests {
         };
         conversation.update(cx, |view, cx| {
             view.apply_events(
-                vec![(
+                vec![ReceivedEvent::new(
                     at,
                     AgentEvent::MessageUpdate {
                         event: AssistantMessageEvent::Usage {
@@ -2053,7 +2097,7 @@ mod tests {
         assert!(!calibrated.output_estimated);
         conversation.update(cx, |view, cx| {
             view.apply_events(
-                vec![(
+                vec![ReceivedEvent::new(
                     at,
                     AgentEvent::MessageEnd {
                         message: message.into(),

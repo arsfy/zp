@@ -12,7 +12,7 @@ use zp_agent::{
     AgentTool, BeforeToolCall, PromptInput, Subscription, ToolCallDecision, ToolResultOverride,
 };
 use zp_ai::{Message, Model, Models, StopReason, StreamOptions, ThinkingLevel, Usage, UserContent};
-use zp_session::{COMPACTION_SUMMARY_TYPE, Session};
+use zp_session::{COMPACTION_SUMMARY_TYPE, EntryData, Session};
 
 use crate::changes::{ChangeLog, RestoreSource, restore_message_with_sources};
 use crate::checkpoint::{BlobStore, RecordedChange, store_tool_change};
@@ -149,6 +149,8 @@ pub struct CodingSessionOptions {
     pub compaction: CompactionSettings,
     /// Prompt templates and skills.
     pub resources: Arc<Resources>,
+    /// Samples the active run clock when an assistant response finishes.
+    pub response_elapsed_seconds: Option<Arc<dyn Fn() -> u64 + Send + Sync>>,
 }
 
 impl CodingSessionOptions {
@@ -171,6 +173,7 @@ impl CodingSessionOptions {
             trusted: true,
             compaction: CompactionSettings::default(),
             resources: Arc::default(),
+            response_elapsed_seconds: None,
         }
     }
 }
@@ -290,6 +293,7 @@ impl CodingSession {
             trusted,
             compaction,
             resources,
+            response_elapsed_seconds,
         } = options;
         let blobs = blobs.unwrap_or_else(BlobStore::in_memory);
         let context = session.context();
@@ -343,8 +347,14 @@ impl CodingSession {
             let session = session.clone();
             agent.subscribe(move |event| {
                 if let AgentEvent::MessageEnd { message } = event {
+                    let elapsed_seconds = message
+                        .as_assistant()
+                        .and_then(|_| response_elapsed_seconds.as_ref().map(|elapsed| elapsed()));
                     let mut session = session.lock().unwrap_or_else(PoisonError::into_inner);
-                    if let Err(error) = session.append_message(message.clone()) {
+                    if let Err(error) = session.append(EntryData::Message {
+                        message: message.clone(),
+                        elapsed_seconds,
+                    }) {
                         tracing::error!(%error, "could not save message to the session");
                     }
                 }

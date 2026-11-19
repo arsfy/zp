@@ -3,6 +3,7 @@
 use std::sync::LazyLock;
 use std::time::Duration;
 
+use chrono::{DateTime, Datelike as _, Local, TimeZone as _};
 use gpui::{
     Anchor, Animation, AnimationExt as _, AnyElement, App, ClipboardItem, ColorExt as _, Context,
     DispatchPhase, Div, ElementId, FontWeight, IntoElement, MouseButton, Render, Rgba,
@@ -17,6 +18,7 @@ use zp_core::checkpoint::RecordedChange;
 
 use super::disclosure::collapsible;
 use super::permissions::permission_mode_color;
+use super::progress::format_elapsed;
 use super::transcript::{Row, ToolStatus};
 use super::{COMPOSER_CARD_RADIUS, ConversationEvent, ConversationView, Picker};
 use crate::actions::KEY_SEND;
@@ -95,6 +97,18 @@ const ICON_BRANCH: &[u8] = include_bytes!("../../../../assets/icons/git-branch.s
 const ICON_FORK: &[u8] = include_bytes!("../../../../assets/icons/square-arrow-out-up-right.svg");
 const ICON_REVERT: &[u8] = include_bytes!("../../../../assets/icons/undo-2.svg");
 const ICON_DROPDOWN: &[u8] = include_bytes!("../../../../assets/icons/triangle-down.svg");
+
+fn format_message_time(timestamp: i64, now: DateTime<Local>) -> Option<String> {
+    let time = Local.timestamp_millis_opt(timestamp).single()?;
+    let format = if time.date_naive() == now.date_naive() {
+        "%H:%M"
+    } else if time.year() == now.year() {
+        "%-d %b %H:%M"
+    } else {
+        "%-d %b %Y %H:%M"
+    };
+    Some(time.format(format).to_string())
+}
 
 pub(super) fn picker_checkmark(selected: bool, color: Rgba) -> Div {
     div().size(px(12.)).flex_shrink_0().when(selected, |slot| {
@@ -395,9 +409,7 @@ impl ConversationView {
         )
     }
 
-    /// The line under a message: the working indicator on the last row while busy,
-    /// otherwise its actions. The working indicator reserves room for elapsed time;
-    /// assistant messages in the middle of an answer have none.
+    /// The line under a message with its timestamp, actions and live progress.
     fn render_row_footer(
         &self,
         ix: usize,
@@ -413,24 +425,54 @@ impl ConversationView {
         if !is_user && !self.ends_turn(ix) {
             return None;
         }
-        let slot = div().h(px(ACTION_SIZE)).flex().items_center();
+        let slot = div().h(px(ACTION_SIZE)).flex().items_center().gap_2();
         if self.editing().is_some_and(|edit| edit.row == ix) {
             return Some(slot.into_any_element());
         }
-        if self.is_busy() {
+        let busy = self.is_busy();
+        let show_progress = busy && last;
+        let time_label = |timestamp| format_message_time(timestamp, Local::now());
+        let label = match row {
+            Row::User { sent_at, .. } => time_label(*sent_at),
+            Row::Assistant {
+                completion: Some(completion),
+                ..
+            } if !show_progress => time_label(completion.timestamp).map(|time| {
+                if let Some(seconds) = completion.elapsed_seconds {
+                    format!("{time} ({})", format_elapsed(seconds))
+                } else {
+                    time
+                }
+            }),
+            _ => None,
+        }
+        .map(|label| {
+            div()
+                .text_size(px(11.))
+                .text_color(cx.theme().colors.text_muted)
+                .whitespace_nowrap()
+                .child(label)
+        });
+        if show_progress {
             return Some(
-                slot.when(last, |this| this.h(px(38.)).child(self.progress.clone()))
+                slot.h(px(38.))
+                    .justify_between()
+                    .child(self.progress.clone())
+                    .children(label)
                     .into_any_element(),
             );
         }
-        let Some(actions) = self.render_row_actions(ix, row, cx) else {
-            return Some(slot.into_any_element());
+        let actions = if busy {
+            None
+        } else {
+            self.render_row_actions(ix, row, cx)
         };
-        Some(
-            slot.when(is_user, |this| this.justify_end())
-                .child(actions)
-                .into_any_element(),
-        )
+        let footer = if is_user {
+            slot.justify_end().children(label).children(actions)
+        } else {
+            slot.children(actions).children(label)
+        };
+        Some(footer.into_any_element())
     }
 
     /// Icon buttons for a message: edit or branch, fork, copy.
@@ -2136,6 +2178,7 @@ impl ConversationView {
 mod tests {
     use std::time::Instant;
 
+    use chrono::{Local, TimeZone as _};
     use gpui::{Modifiers, MouseButton, TestAppContext, VisualTestContext};
     use zp_agent::AgentEvent;
     use zp_ai::{
@@ -2145,8 +2188,29 @@ mod tests {
     use crate::tests::project_dir;
     use crate::tests_conversation::{active, idle, open, send, setup_models};
 
-    use super::wrappable_error;
+    use super::{format_message_time, wrappable_error};
+    use crate::conversation::ReceivedEvent;
     use crate::conversation::disclosure::DURATION;
+
+    #[test]
+    fn message_times_use_local_dates_and_include_the_year_when_it_differs() {
+        let local = |year, day, hour, minute| {
+            Local
+                .with_ymd_and_hms(year, 11, day, hour, minute, 0)
+                .unwrap()
+        };
+        let now = local(2026, 19, 20, 0);
+        for (time, expected) in [
+            (local(2026, 19, 13, 43), "13:43"),
+            (local(2026, 18, 15, 25), "18 Nov 15:25"),
+            (local(2025, 18, 15, 25), "18 Nov 2025 15:25"),
+        ] {
+            assert_eq!(
+                format_message_time(time.timestamp_millis(), now).as_deref(),
+                Some(expected),
+            );
+        }
+    }
 
     #[gpui::test]
     fn tool_cards_slide_open_and_shut(cx: &mut TestAppContext) {
@@ -2232,13 +2296,13 @@ mod tests {
             let now = Instant::now();
             view.apply_events(
                 vec![
-                    (
+                    ReceivedEvent::new(
                         now,
                         AgentEvent::MessageStart {
                             message: message.into(),
                         },
                     ),
-                    (
+                    ReceivedEvent::new(
                         now,
                         AgentEvent::MessageUpdate {
                             event: AssistantMessageEvent::ThinkingStart {
@@ -2263,7 +2327,7 @@ mod tests {
         ] {
             conversation.update(cx, |view, cx| {
                 view.apply_events(
-                    vec![(
+                    vec![ReceivedEvent::new(
                         Instant::now(),
                         AgentEvent::MessageUpdate {
                             event: AssistantMessageEvent::ThinkingDelta {

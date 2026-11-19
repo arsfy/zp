@@ -1,5 +1,6 @@
 //! A small independently rendered working indicator and active task clock.
 
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use gpui::{
@@ -34,45 +35,59 @@ impl ActiveClock {
 
 #[derive(Default)]
 pub(super) struct RunProgress {
-    clock: ActiveClock,
+    clock: Arc<Mutex<ActiveClock>>,
     seconds: u64,
     paused: bool,
 }
 
 impl RunProgress {
     pub fn start(&mut self, cx: &mut Context<Self>) {
-        self.clock = ActiveClock::default();
-        self.seconds = 0;
+        *self.clock.lock().unwrap_or_else(PoisonError::into_inner) = ActiveClock::default();
         self.set_paused(false, cx);
     }
 
     pub fn set_paused(&mut self, paused: bool, cx: &mut Context<Self>) {
         let now = cx.background_executor().now();
+        let mut clock = self.clock.lock().unwrap_or_else(PoisonError::into_inner);
         if paused {
-            self.clock.pause(now);
+            clock.pause(now);
         } else {
-            self.clock.resume(now);
+            clock.resume(now);
         }
         self.paused = paused;
-        self.seconds = self.clock.elapsed(now).as_secs();
+        self.seconds = clock.elapsed(now).as_secs();
         cx.notify();
     }
 
     pub fn refresh(&mut self, cx: &mut Context<Self>) {
-        let seconds = self.clock.elapsed(cx.background_executor().now()).as_secs();
+        let seconds = self.elapsed(cx).as_secs();
         if seconds != self.seconds {
             self.seconds = seconds;
             cx.notify();
         }
     }
 
-    #[cfg(test)]
     pub fn elapsed(&self, cx: &gpui::App) -> Duration {
-        self.clock.elapsed(cx.background_executor().now())
+        self.clock
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .elapsed(cx.background_executor().now())
+    }
+
+    pub fn elapsed_sampler(&self, cx: &gpui::App) -> impl Fn() -> u64 + use<> {
+        let clock = self.clock.clone();
+        let executor = cx.background_executor().clone();
+        move || {
+            clock
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .elapsed(executor.now())
+                .as_secs()
+        }
     }
 }
 
-fn format_elapsed(seconds: u64) -> String {
+pub(super) fn format_elapsed(seconds: u64) -> String {
     if seconds >= 3600 {
         format!(
             "{}h {}m {}s",
