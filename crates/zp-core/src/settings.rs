@@ -80,7 +80,7 @@ impl BlockDisplay {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct TranscriptSettings {
-    /// The model's reasoning (default collapsed).
+    /// The model's reasoning (default expanded).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thinking: Option<BlockDisplay>,
     /// File writes and edits, shown as diffs (default expanded).
@@ -96,7 +96,7 @@ pub struct TranscriptSettings {
 
 impl TranscriptSettings {
     pub fn thinking(&self) -> BlockDisplay {
-        self.thinking.unwrap_or(BlockDisplay::Collapsed)
+        self.thinking.unwrap_or(BlockDisplay::Expanded)
     }
 
     pub fn file_edits(&self) -> BlockDisplay {
@@ -332,7 +332,7 @@ mod tests {
             "defaultThinking": "high",
             "generateTitles": false,
             "theme": "light",
-            "transcript": {"thinking": "expanded", "commands": "collapsed"},
+            "transcript": {"thinking": "collapsed", "commands": "collapsed"},
             "providers": [{"id": "local", "name": "Local", "baseUrl": "http://localhost:1234/v1", "models": ["m1"]}],
             "keybindings": {"zp::NewChat": "cmd-k"}
         }"#;
@@ -342,7 +342,7 @@ mod tests {
         assert_eq!(settings.providers[0].models, ["m1"]);
         assert_eq!(settings.keybindings["zp::NewChat"], "cmd-k");
         let transcript = settings.transcript;
-        assert_eq!(transcript.thinking(), BlockDisplay::Expanded);
+        assert_eq!(transcript.thinking(), BlockDisplay::Collapsed);
         assert_eq!(transcript.commands(), BlockDisplay::Collapsed);
         assert_eq!(transcript.file_edits(), BlockDisplay::Expanded);
         assert_eq!(transcript.other_tools(), BlockDisplay::Collapsed);
@@ -352,6 +352,10 @@ mod tests {
             serde_json::from_str(&serde_json::to_string(&settings).unwrap()).unwrap();
         assert_eq!(back, settings);
         // Defaults stay out of the file.
+        assert_eq!(
+            TranscriptSettings::default().thinking(),
+            BlockDisplay::Expanded
+        );
         assert_eq!(
             serde_json::to_string(&Settings::default()).unwrap(),
             r#"{"permissions":{}}"#
