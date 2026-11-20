@@ -316,12 +316,25 @@ impl ProjectWindow {
 
     /// Closes tab `index`, asking first if its agent is running.
     pub(crate) fn close_tab(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        self.close_tab_then(index, window, cx, |_, _, _| {});
+    }
+
+    /// Closes tab `index`, then runs `then`. A running agent is stopped after asking;
+    /// if the user keeps it running, the tab stays and `then` does not run.
+    pub(crate) fn close_tab_then(
+        &mut self,
+        index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        then: impl FnOnce(&mut Self, &mut Window, &mut Context<Self>) + 'static,
+    ) {
         let Some(tab) = self.tabs.get(index) else {
             return;
         };
         let conversation = tab.conversation.clone();
         if !conversation.read(cx).is_running() {
             self.remove_tab(index, window, cx);
+            then(self, window, cx);
             return;
         }
         let answer = window.prompt(
@@ -340,6 +353,7 @@ impl ProjectWindow {
                 if let Some(index) = this.index_of(&conversation) {
                     this.remove_tab(index, window, cx);
                 }
+                then(this, window, cx);
             });
         })
         .detach();

@@ -765,9 +765,15 @@ fn sidebar_delete_hides_by_default_and_trashes_only_when_checked(cx: &mut TestAp
     assert_eq!(sessions(window, cx).len(), 2);
     assert!(hidden.exists());
 
+    let tabs = tab_count(window, cx);
     request_delete(&hidden, cx);
     click("confirm-session-delete", cx);
     assert_eq!(
+        tab_count(window, cx),
+        tabs - 1,
+        "the hidden session's tab closed"
+    );
+    assert_ne!(
         active(window, cx).read_with(cx, |view, _| view.session_file()),
         Some(hidden.clone())
     );
@@ -784,11 +790,16 @@ fn sidebar_delete_hides_by_default_and_trashes_only_when_checked(cx: &mut TestAp
     assert!(state.project(&project).hidden_sessions.contains(&id));
 
     open_tab(&trashed, cx);
+    let tabs = tab_count(window, cx);
     request_delete(&trashed, cx);
     click("delete-session-file", cx);
     click("confirm-session-delete", cx);
     assert!(!trashed.exists());
-    assert_eq!(tab_count(window, cx), 2, "the trashed session's tab closed");
+    assert_eq!(
+        tab_count(window, cx),
+        tabs - 1,
+        "the trashed session's tab closed"
+    );
     assert!(sessions(window, cx).is_empty());
 
     window
@@ -1173,5 +1184,65 @@ fn scrolling_up_while_a_reply_streams_stays_put(cx: &mut TestAppContext) {
         (now.item_ix, now.offset_in_item),
         (scrolled.item_ix, scrolled.offset_in_item),
         "streamed output moved the scroll position"
+    );
+}
+
+#[gpui::test]
+fn hiding_a_running_session_asks_before_stopping_and_closing_its_tab(cx: &mut TestAppContext) {
+    let faux = FauxProvider::default();
+    faux.push(FauxResponse::tool_call(
+        "ask",
+        json!({"questions": [{"question": "Continue?"}]}),
+    ));
+    let _data = setup_models(cx, &[&faux], false);
+    let (_dir, project) = project_dir();
+    let window = open(cx, &project);
+    let conversation = active(window, cx);
+    send(window, "Keep running", cx);
+    wait_until(cx, |cx| {
+        conversation.read_with(cx, |view, _| !view.pending_questions().is_empty())
+    });
+    let sessions = |cx: &mut TestAppContext| {
+        window
+            .update(cx, |view, _, cx| view.visible_sessions(cx))
+            .unwrap()
+    };
+    wait_until(cx, |cx| sessions(cx).len() == 1);
+    let hide = |cx: &mut TestAppContext| {
+        let info = sessions(cx).remove(0);
+        let menu = window
+            .update(cx, |view, window, cx| {
+                view.session_menu(&info, point(px(10.), px(10.)), window, cx);
+                view.context_menu().unwrap()
+            })
+            .unwrap();
+        let delete = menu.read_with(cx, |menu, _| menu.handler("Delete"));
+        gpui::AnyWindowHandle::from(window)
+            .update(cx, |_, window, cx| delete(window, cx))
+            .unwrap();
+        cx.run_until_parked();
+        let mut visual = VisualTestContext::from_window(window.into(), cx);
+        let confirm = visual.debug_bounds("confirm-session-delete").unwrap();
+        visual.simulate_click(confirm.center(), Modifiers::none());
+        cx.run_until_parked();
+    };
+
+    // Keeping the agent running keeps the tab and the listing.
+    hide(cx);
+    assert!(cx.has_pending_prompt());
+    cx.simulate_prompt_answer("Cancel");
+    cx.run_until_parked();
+    assert!(conversation.read_with(cx, |view, _| view.is_running()));
+    assert_eq!(sessions(cx).len(), 1);
+
+    hide(cx);
+    cx.simulate_prompt_answer("Stop and Close");
+    cx.run_until_parked();
+    assert!(sessions(cx).is_empty());
+    assert_eq!(tab_count(window, cx), 1);
+    assert_ne!(
+        active(window, cx).entity_id(),
+        conversation.entity_id(),
+        "the tab closed (a new one replaced the last tab)"
     );
 }

@@ -284,11 +284,30 @@ impl ProjectWindow {
                 return;
             };
             let _ = this.update_in(cx, |this, window, cx| match decision {
-                session_delete_dialog::Decision::Hide => this.hide_session(&id, &path, cx),
+                session_delete_dialog::Decision::Hide => {
+                    this.close_session_tab_and_hide(id, path, window, cx)
+                }
                 session_delete_dialog::Decision::Trash => this.trash_session(&path, window, cx),
             });
         })
         .detach();
+    }
+
+    /// Closes the session's tab, if open, then hides it from the sidebar. A running agent
+    /// is stopped after asking; if the user keeps it, the session stays listed.
+    fn close_session_tab_and_hide(
+        &mut self,
+        id: String,
+        path: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match self.tab_for_file(&path, cx) {
+            Some(index) => self.close_tab_then(index, window, cx, move |this, _, cx| {
+                this.hide_session(&id, &path, cx)
+            }),
+            None => self.hide_session(&id, &path, cx),
+        }
     }
 
     fn hide_session(&mut self, id: &str, path: &Path, cx: &mut Context<Self>) {
