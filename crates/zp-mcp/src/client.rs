@@ -21,6 +21,9 @@ use crate::config::{Server, Transport};
 pub const PROTOCOL_VERSION: &str = "2025-06-18";
 /// Lines of a stdio server's stderr kept for error messages.
 const STDERR_LINES: usize = 20;
+/// How long a failed handshake waits for an exiting server's stderr to be read (a process
+/// it started may keep the pipe open).
+const STDERR_DRAIN: Duration = Duration::from_secs(1);
 
 /// A tool offered by a server.
 #[derive(Clone, Debug, PartialEq, Deserialize)]
@@ -44,6 +47,8 @@ enum Connection {
         stdin: Arc<tokio::sync::Mutex<tokio::process::ChildStdin>>,
         child: Box<Mutex<Option<tokio::process::Child>>>,
         stderr: Arc<Mutex<VecDeque<String>>>,
+        /// Becomes `true` once stderr reached its end.
+        stderr_done: tokio::sync::watch::Receiver<bool>,
     },
     Http {
         http: reqwest::Client,
@@ -143,6 +148,7 @@ impl Client {
                 let stdout = child.stdout.take().context("no stdout")?;
                 let stderr_pipe = child.stderr.take().context("no stderr")?;
                 let stderr: Arc<Mutex<VecDeque<String>>> = Arc::default();
+                let (stderr_finished, stderr_done) = tokio::sync::watch::channel(false);
                 {
                     let stderr = stderr.clone();
                     tokio::spawn(async move {
@@ -154,6 +160,7 @@ impl Client {
                             }
                             tail.push_back(line);
                         }
+                        let _ = stderr_finished.send(true);
                     });
                 }
                 let stdin = Arc::new(tokio::sync::Mutex::new(stdin));
@@ -192,6 +199,7 @@ impl Client {
                     stdin,
                     child: Box::new(Mutex::new(Some(child))),
                     stderr,
+                    stderr_done,
                 }
             }
             Transport::Http { url, headers } => Connection::Http {
@@ -218,7 +226,7 @@ impl Client {
     }
 
     async fn initialize(&mut self) -> anyhow::Result<()> {
-        let result = self
+        let result = match self
             .request(
                 "initialize",
                 json!({
@@ -229,10 +237,28 @@ impl Client {
                 None,
             )
             .await
-            .map_err(|error| self.with_stderr(error))?;
+        {
+            Ok(result) => result,
+            Err(error) => {
+                self.drain_stderr().await;
+                return Err(self.with_stderr(error));
+            }
+        };
         self.instructions = result["instructions"].as_str().map(str::to_owned);
         self.notify("notifications/initialized", json!({})).await?;
         Ok(())
+    }
+
+    /// When a stdio server is gone, waits (briefly) until its stderr is read to the end:
+    /// a server that exits at once can make the request fail before its explanation on
+    /// stderr was read.
+    async fn drain_stderr(&self) {
+        if let Connection::Stdio { stderr_done, .. } = &self.connection
+            && self.is_closed()
+        {
+            let mut done = stderr_done.clone();
+            let _ = tokio::time::timeout(STDERR_DRAIN, done.wait_for(|done| *done)).await;
+        }
     }
 
     /// The error with the tail of a stdio server's stderr.
@@ -262,10 +288,11 @@ impl Client {
                 let mut line = serde_json::to_string(message)?;
                 line.push('\n');
                 let mut stdin = stdin.lock().await;
-                stdin
-                    .write_all(line.as_bytes())
-                    .await
-                    .context("the server closed its input")?;
+                if let Err(error) = stdin.write_all(line.as_bytes()).await {
+                    // The server no longer reads requests (usually: it exited).
+                    self.closed.store(true, Ordering::SeqCst);
+                    return Err(anyhow::Error::new(error).context("the server closed its input"));
+                }
                 stdin.flush().await?;
                 Ok(None)
             }

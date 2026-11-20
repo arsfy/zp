@@ -93,19 +93,21 @@ async fn task_profiles_run_a_distinct_model_with_scoped_tools_and_accounted_usag
         json!({"task": "find evidence", "paths": ["src"], "context": "explicit hint"}),
     ));
     parent.push(FauxResponse::text("Parent conclusion"));
-    let reads = ["src/allowed.txt", "excluded.txt", "../private.txt"];
-    let mut blocks: Vec<_> = reads
+    let reads = [
+        "src/allowed.txt",
+        "excluded.txt",
+        "../private.txt",
+        // A symlink out of the allowed paths (only created on Unix).
+        #[cfg(unix)]
+        "src/link",
+    ];
+    let blocks: Vec<_> = reads
         .into_iter()
         .map(|path| FauxBlock::ToolCall {
             name: "read".into(),
             arguments: json!({"path": path}),
         })
         .collect();
-    #[cfg(unix)]
-    blocks.push(FauxBlock::ToolCall {
-        name: "read".into(),
-        arguments: json!({"path": "src/link"}),
-    });
     child.push(FauxResponse::blocks(blocks));
     child.push(FauxResponse::text("Found evidence at src/allowed.txt:1"));
 

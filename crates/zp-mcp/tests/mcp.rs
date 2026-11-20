@@ -82,10 +82,26 @@ async fn stdio_server_tools() {
         env: BTreeMap::new(),
         cwd: None,
     };
+    // Stops reading before it explains itself, so the request fails (broken pipe) before
+    // its stderr arrives.
+    let closes_input = Transport::Stdio {
+        command: "sh".into(),
+        args: vec![
+            "-c".into(),
+            "exec <&-; sleep 0.2; echo 'bad config file' >&2; exit 1".into(),
+        ],
+        env: BTreeMap::new(),
+        cwd: None,
+    };
     let mut disabled = server("off", stdio.clone());
     disabled.enabled = false;
     let hub = McpHub::new(
-        vec![server("mock", stdio), server("broken", broken), disabled],
+        vec![
+            server("mock", stdio),
+            server("broken", broken),
+            disabled,
+            server("closes-input", closes_input),
+        ],
         Vec::new(),
     );
     hub.start();
@@ -99,6 +115,10 @@ async fn stdio_server_tools() {
     };
     assert!(error.contains("cannot start: missing token"), "{error}");
     assert_eq!(statuses[2].state, ServerState::Disabled);
+    let ServerState::Failed(error) = &statuses[3].state else {
+        panic!("{:?}", statuses[3])
+    };
+    assert!(error.contains("bad config file"), "{error}");
 
     let tools = hub.tools();
     let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
