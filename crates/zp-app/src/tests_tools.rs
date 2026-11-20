@@ -226,6 +226,13 @@ fn a_subagent_card_stays_open_while_it_runs_and_a_cancelled_one_does_not_count_a
         conversation.update(cx, |view, cx| view.tool_is_expanded(1, &call, false, cx)),
         "open while running, though other tools are collapsed"
     );
+    // What the child is writing shows in the card as it streams.
+    wait_until(cx, |cx| {
+        report(cx).is_some_and(|(_, report)| report.activity.is_some())
+            && VisualTestContext::from_window(window.into(), cx)
+                .debug_bounds("subagent-activity")
+                .is_some()
+    });
 
     click(window, "subagent-cancel", cx);
     idle(&conversation, 3, cx);

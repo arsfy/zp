@@ -468,3 +468,62 @@ async fn a_conclusion_cut_off_at_the_output_limit_is_returned_marked_truncated()
     assert!(text.starts_with("Partial finding"), "{text}");
     assert!(text.contains("output token limit"), "{text}");
 }
+
+#[tokio::test]
+async fn progress_shows_the_childs_thinking_and_tool_calls() {
+    use zp_core::subagents::{ActivityKind, StepStatus};
+
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("lib.rs"), "fn add() {}").unwrap();
+    let parent = FauxProvider::new("parent");
+    let child = FauxProvider::new("child");
+    let mut config = settings();
+    config.assignment = Some(Assignment::TaskProfiles);
+    config.default_profile = Some("explore".into());
+    config.profiles.insert("explore".into(), profile(&child));
+    parent.push(delegate(json!({"task": "find add"})));
+    parent.push(FauxResponse::text("Main run finished"));
+    child.push(FauxResponse::blocks(vec![
+        FauxBlock::Thinking("Looking for the add function first".into()),
+        FauxBlock::ToolCall {
+            name: "read".into(),
+            arguments: json!({"path": "lib.rs"}),
+        },
+    ]));
+    child.push(FauxResponse::text("add() is in lib.rs:1"));
+    let coding = coding(dir.path(), &[&parent, &child], config, None);
+    let progress = Arc::new(Mutex::new(Vec::new()));
+    let _subscription = coding.agent().subscribe({
+        let progress = progress.clone();
+        move |event| {
+            if let AgentEvent::ToolExecutionUpdate { partial_result, .. } = event
+                && let Some(report) = partial_result
+                    .details
+                    .as_ref()
+                    .and_then(Report::from_details)
+            {
+                progress.lock().unwrap().push(report);
+            }
+        }
+    });
+    let messages = coding.prompt("delegate").await.unwrap();
+    let progress = progress.lock().unwrap();
+    assert!(
+        progress
+            .iter()
+            .any(|report| report.activity.as_ref().is_some_and(|activity| {
+                activity.kind == ActivityKind::Thinking && activity.text.contains("add function")
+            })),
+        "the thinking shows while it streams"
+    );
+    assert!(progress.iter().any(|report| {
+        report.steps.last().is_some_and(|step| {
+            (step.tool.as_str(), step.target.as_str(), step.status)
+                == ("read", "lib.rs", StepStatus::Running)
+        })
+    }));
+    let report = &reports(&messages)[0];
+    assert_eq!(report.step_count, 1);
+    assert_eq!(report.steps[0].status, StepStatus::Done);
+    assert!(report.activity.is_none(), "nothing streams once it is done");
+}

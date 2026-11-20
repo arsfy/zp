@@ -56,6 +56,11 @@ fn subagent_stats(report: &zp_core::subagents::Report) -> Option<String> {
         1 => parts.push("1 model request".to_owned()),
         count => parts.push(format!("{count} model requests")),
     }
+    match report.step_count {
+        0 => {}
+        1 => parts.push("1 tool call".to_owned()),
+        count => parts.push(format!("{count} tool calls")),
+    }
     if tokens > 0 {
         parts.push(format!("{} tokens", crate::ui::format_tokens(tokens)));
     }
@@ -64,6 +69,10 @@ fn subagent_stats(report: &zp_core::subagents::Report) -> Option<String> {
     }
     (!parts.is_empty()).then(|| parts.join(" · "))
 }
+
+/// Tool calls of a running subagent shown in its card (the latest).
+const SUBAGENT_LIVE_STEPS: usize = 3;
+
 /// Diff rows shown under a tool card.
 const INLINE_DIFF_ROWS: usize = 40;
 /// Changed files initially shown in a completed answer.
@@ -1354,12 +1363,36 @@ impl ConversationView {
             .child(div().text_color(colors.text_muted).child(model));
         if report.status.is_active() {
             return body
-                .child(div().text_color(colors.text_muted).child(output.to_owned()))
+                .child(self.render_subagent_progress(call, output, report, cx))
                 .into_any_element();
         }
-        let body = body.children(
-            subagent_stats(report).map(|stats| div().text_color(colors.text_muted).child(stats)),
-        );
+        // What it looked at, on one line: enough to tell where the conclusion comes from.
+        let steps = (!report.steps.is_empty()).then(|| {
+            let earlier = report.step_count.saturating_sub(report.steps.len());
+            let mut line = report
+                .steps
+                .iter()
+                .map(|step| format!("{} {}", step.tool, step.target))
+                .collect::<Vec<_>>()
+                .join(" · ");
+            if earlier > 0 {
+                line = format!("… {line}");
+            }
+            div()
+                .debug_selector(|| "subagent-steps".into())
+                .min_w_0()
+                .truncate()
+                .font_family(cx.theme().metrics.mono_font.clone())
+                .text_size(px(11.))
+                .text_color(colors.text_muted)
+                .child(expand_tabs(&line, TAB_WIDTH).into_owned())
+        });
+        let body = body
+            .children(
+                subagent_stats(report)
+                    .map(|stats| div().text_color(colors.text_muted).child(stats)),
+            )
+            .children(steps);
         let concluded = matches!(
             report.status,
             SubagentStatus::Completed | SubagentStatus::Truncated
@@ -1427,6 +1460,102 @@ impl ConversationView {
         )
         .children(toggle)
         .into_any_element()
+    }
+
+    /// What a running subagent is doing, in a few lines: its latest tool calls and the
+    /// end of what it is thinking or writing.
+    fn render_subagent_progress(
+        &self,
+        call: &ToolCall,
+        output: &str,
+        report: &zp_core::subagents::Report,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        use zp_core::subagents::{ActivityKind, StepStatus};
+
+        let colors = cx.theme().colors.clone();
+        let mono = cx.theme().metrics.mono_font.clone();
+        let shown = report.steps.len().min(SUBAGENT_LIVE_STEPS);
+        let earlier = report.step_count.saturating_sub(shown);
+        let steps = report.steps[report.steps.len() - shown..]
+            .iter()
+            .enumerate()
+            .map(|(index, step)| {
+                let (color, running) = match step.status {
+                    StepStatus::Running => (colors.accent, true),
+                    StepStatus::Done => (colors.text_muted, false),
+                    StepStatus::Failed => (colors.error, false),
+                    StepStatus::Stopped => (colors.border, false),
+                };
+                let dot = div().size(px(6.)).flex_shrink_0().rounded_full().bg(color);
+                let dot = if running {
+                    dot.with_animation(
+                        ElementId::Name(format!("subagent-step-{}-{index}", call.id).into()),
+                        Animation::new(Duration::from_millis(1200))
+                            .repeat()
+                            .with_easing(gpui::pulsating_between(0.35, 1.)),
+                        |dot, opacity| dot.opacity(opacity),
+                    )
+                    .into_any_element()
+                } else {
+                    dot.into_any_element()
+                };
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .min_w_0()
+                    .child(dot)
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(step.tool.clone()),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .font_family(mono.clone())
+                            .text_size(px(11.))
+                            .text_color(colors.text_muted)
+                            .child(expand_tabs(&step.target, TAB_WIDTH).into_owned()),
+                    )
+            });
+        let activity = report.activity.as_ref().map(|activity| {
+            let label = match activity.kind {
+                ActivityKind::Thinking => "Thinking",
+                ActivityKind::Writing => "Writing",
+            };
+            div()
+                .debug_selector(|| "subagent-activity".into())
+                .pl_2()
+                .border_l_2()
+                .border_color(colors.border)
+                .text_color(colors.text_muted)
+                .italic()
+                .line_clamp(2)
+                .child(format!("{label}: {}", activity.text))
+        });
+        let idle = report.steps.is_empty() && activity.is_none();
+        div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .when(earlier > 0, |list| {
+                list.child(div().text_color(colors.text_muted).child(if earlier == 1 {
+                    "1 earlier tool call".to_owned()
+                } else {
+                    format!("{earlier} earlier tool calls")
+                }))
+            })
+            .children(steps)
+            .children(activity)
+            .when(idle, |list| {
+                list.child(div().text_color(colors.text_muted).child(output.to_owned()))
+            })
+            .into_any_element()
     }
 
     /// The diff of a file change under its tool card (the first lines; the rest in the

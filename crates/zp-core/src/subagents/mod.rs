@@ -67,6 +67,179 @@ pub struct Report {
     pub elapsed_ms: u64,
     pub model_requests: usize,
     pub usage: UsageTotals,
+    /// The latest tool calls, oldest first (at most [`MAX_STEPS`]).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub steps: Vec<Step>,
+    /// All tool calls made, also those no longer in `steps`.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub step_count: usize,
+    /// While running: the end of what the subagent is thinking or writing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activity: Option<Activity>,
+}
+
+fn is_zero(count: &usize) -> bool {
+    *count == 0
+}
+
+/// Tool calls kept in a report.
+pub const MAX_STEPS: usize = 40;
+/// Characters of live thinking or writing kept in a report.
+const ACTIVITY_CHARS: usize = 240;
+/// Least time between progress updates for streamed text; tool calls report at once.
+const PROGRESS_INTERVAL: Duration = Duration::from_millis(150);
+
+/// One tool call of a subagent.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Step {
+    pub tool: String,
+    /// What the call looks at (`src/lib.rs`, a search pattern).
+    pub target: String,
+    pub status: StepStatus,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum StepStatus {
+    Running,
+    Done,
+    Failed,
+    /// The task ended while the call ran.
+    Stopped,
+}
+
+/// What a running subagent is streaming.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Activity {
+    pub kind: ActivityKind,
+    /// The latest text on one line, starting with "…" when cut.
+    pub text: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ActivityKind {
+    Thinking,
+    Writing,
+}
+
+/// A running task's progress, shared with the child's event subscription.
+struct Live {
+    report: Report,
+    /// Call IDs of `report.steps`.
+    step_ids: Vec<String>,
+    /// The current response's text so far, and whether it is reasoning.
+    stream: String,
+    thinking: bool,
+    sent: Option<Instant>,
+}
+
+impl Live {
+    /// Folds a child event in; returns whether to report progress now.
+    fn apply(&mut self, event: &AgentEvent) -> Option<bool> {
+        use zp_ai::AssistantMessageEvent as E;
+        match event {
+            // The last thought stays up while its tool calls run, until the next response.
+            AgentEvent::MessageStart { message } if message.as_assistant().is_some() => {
+                self.stream.clear();
+                None
+            }
+            AgentEvent::MessageUpdate { event } => {
+                let (thinking, delta) = match event {
+                    E::ThinkingDelta { delta, .. } => (true, delta),
+                    E::TextDelta { delta, .. } => (false, delta),
+                    // A finished block shows whole, whatever the update interval held back.
+                    E::ThinkingEnd { .. } | E::TextEnd { .. } => return Some(true),
+                    _ => return None,
+                };
+                if thinking != self.thinking {
+                    self.stream.clear();
+                    self.thinking = thinking;
+                }
+                self.stream.push_str(delta);
+                // Only the end is shown; keep a little more than that.
+                if self.stream.len() > ACTIVITY_CHARS * 8 {
+                    let cut = self.stream.len() - ACTIVITY_CHARS * 4;
+                    let cut = (cut..self.stream.len())
+                        .find(|&index| self.stream.is_char_boundary(index))
+                        .unwrap_or(0);
+                    self.stream.drain(..cut);
+                }
+                Some(false)
+            }
+            AgentEvent::ToolExecutionStart {
+                tool_call_id,
+                tool_name,
+                args,
+            } => {
+                self.report.steps.push(Step {
+                    tool: tool_name.clone(),
+                    target: zp_tools::describe_call(tool_name, args, 120),
+                    status: StepStatus::Running,
+                });
+                self.step_ids.push(tool_call_id.clone());
+                self.report.step_count += 1;
+                if self.report.steps.len() > MAX_STEPS {
+                    self.report.steps.remove(0);
+                    self.step_ids.remove(0);
+                }
+                Some(true)
+            }
+            AgentEvent::ToolExecutionEnd {
+                tool_call_id,
+                is_error,
+                ..
+            } => {
+                let index = self.step_ids.iter().position(|id| id == tool_call_id)?;
+                self.report.steps[index].status = if *is_error {
+                    StepStatus::Failed
+                } else {
+                    StepStatus::Done
+                };
+                Some(true)
+            }
+            _ => None,
+        }
+    }
+
+    /// The streamed text's end on one line.
+    fn activity(&self) -> Option<Activity> {
+        let words: Vec<&str> = self.stream.split_whitespace().collect();
+        if words.is_empty() {
+            return None;
+        }
+        let line = words.join(" ");
+        let count = line.chars().count();
+        let text = if count > ACTIVITY_CHARS {
+            let tail: String = line.chars().skip(count - ACTIVITY_CHARS).collect();
+            format!("…{}", tail.trim_start())
+        } else {
+            line
+        };
+        Some(Activity {
+            kind: if self.thinking {
+                ActivityKind::Thinking
+            } else {
+                ActivityKind::Writing
+            },
+            text,
+        })
+    }
+
+    /// The progress line and details for the parent's tool card.
+    fn progress(&mut self) -> AgentToolResult {
+        self.sent = Some(Instant::now());
+        self.report.activity = self.activity();
+        let text = match self.report.steps.last() {
+            Some(step) if step.status == StepStatus::Running => {
+                format!("Investigating workspace · {} {}", step.tool, step.target)
+            }
+            _ => "Investigating workspace".to_owned(),
+        };
+        AgentToolResult::text(text).with_details(self.report.details())
+    }
 }
 
 impl Report {
@@ -332,6 +505,9 @@ impl SubagentTool {
             elapsed_ms: 0,
             model_requests: 0,
             usage: UsageTotals::default(),
+            steps: Vec::new(),
+            step_count: 0,
+            activity: None,
         };
         // Wait for a slot; the timeout only starts once the task runs.
         let _slot = match self.slots.try_acquire() {
@@ -396,12 +572,27 @@ impl SubagentTool {
         }
         options.system_prompt = Some(system_prompt);
         let child = Agent::new(options);
+        let live = Arc::new(Mutex::new(Live {
+            report: report.clone(),
+            step_ids: Vec::new(),
+            stream: String::new(),
+            thinking: false,
+            sent: None,
+        }));
         let updates = ctx.clone();
+        let progress = live.clone();
         let _subscription = child.subscribe(move |event| {
-            if let AgentEvent::ToolExecutionStart { tool_name, .. } = event {
-                updates.update(AgentToolResult::text(format!(
-                    "Investigating workspace · {tool_name}"
-                )));
+            let mut live = progress.lock().unwrap_or_else(PoisonError::into_inner);
+            let Some(now) = live.apply(event) else {
+                return;
+            };
+            // Streamed text is reported a few times a second; tool calls right away.
+            if now
+                || live
+                    .sent
+                    .is_none_or(|sent| sent.elapsed() >= PROGRESS_INTERVAL)
+            {
+                updates.update(live.progress());
             }
         });
         let timeout = self.settings.timeout_seconds();
@@ -466,6 +657,16 @@ impl SubagentTool {
             },
         };
         report.status = status;
+        {
+            let live = live.lock().unwrap_or_else(PoisonError::into_inner);
+            report.steps.clone_from(&live.report.steps);
+            report.step_count = live.report.step_count;
+        }
+        for step in &mut report.steps {
+            if step.status == StepStatus::Running {
+                step.status = StepStatus::Stopped;
+            }
+        }
         let mut text = zp_tools::truncate_head(&text, usize::MAX, MAX_RESULT_BYTES).content;
         let concluded = match status {
             Status::Completed => true,
