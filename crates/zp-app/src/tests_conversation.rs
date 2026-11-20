@@ -54,20 +54,28 @@ pub(crate) fn set_permission_mode(data: &TempDir, mode: zp_core::permissions::Pe
         .unwrap();
 }
 
-/// Lets Tokio-side work progress until `done` holds (or fails after a few seconds).
+/// Lets Tokio-side work progress until `done` holds. Waits in real time (shells and tools
+/// start slowly on a busy CI machine, PowerShell and Git Bash especially), while the test
+/// clock moves at most 30 s, as before.
 pub(crate) fn wait_until(
     cx: &mut TestAppContext,
     mut done: impl FnMut(&mut TestAppContext) -> bool,
 ) {
-    for _ in 0..600 {
+    const CLOCK_STEPS: usize = 600;
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    let mut steps = 0;
+    loop {
         cx.run_until_parked();
         if done(cx) {
             return;
         }
-        cx.executor().advance_clock(Duration::from_millis(50));
+        assert!(std::time::Instant::now() < deadline, "timed out");
+        if steps < CLOCK_STEPS {
+            cx.executor().advance_clock(Duration::from_millis(50));
+            steps += 1;
+        }
         std::thread::sleep(Duration::from_millis(5));
     }
-    panic!("timed out");
 }
 
 pub(crate) fn open(cx: &mut TestAppContext, project: &Path) -> WindowHandle<ProjectWindow> {

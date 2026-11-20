@@ -622,13 +622,13 @@ fn auto_review_explains_a_call_it_hands_to_the_user(cx: &mut TestAppContext) {
         description.as_deref(),
         Some("Uploads the project's .env file to example.com.")
     );
-    cx.run_until_parked();
-    assert!(
+    // The approval arrives on its own channel; the card is drawn once the batched agent
+    // events have added the call's row, which can lag behind on a busy machine.
+    wait_until(cx, |cx| {
         VisualTestContext::from_window(window.into(), cx)
             .debug_bounds("approval-description")
-            .is_some(),
-        "the card shows what the call does"
-    );
+            .is_some()
+    });
     conversation.update(cx, |view, cx| {
         view.answer_approval(&call, Decision::Deny(None), cx)
     });

@@ -76,6 +76,11 @@ fn todo_and_ask_run_without_approval_and_answers_reach_the_agent(cx: &mut TestAp
     send(window, "format it", cx);
 
     let call = wait_for_questions(&conversation, cx);
+    // Questions arrive on their own channel, the todo call's result with the batched agent
+    // events, which can lag behind on a busy machine.
+    wait_until(cx, |cx| {
+        conversation.read_with(cx, |view, _| view.current_todos().is_some())
+    });
     conversation.read_with(cx, |view, _| {
         assert_eq!(view.pending_approvals().count(), 0);
         assert!(view.needs_attention());
