@@ -34,7 +34,9 @@ use zp_core::{CodingSession, CodingSessionOptions, UsageTotals, session_model};
 use zp_session::Session;
 
 use self::transcript::{Changes, MessageTiming, Transcript};
-use crate::actions::{ClosePicker, PickFirstModel, SendMessage, StopRun};
+use crate::actions::{
+    ClosePicker, PickSelectedModel, SelectNextModel, SelectPreviousModel, SendMessage, StopRun,
+};
 use crate::diff_view::DiffItem;
 use crate::markdown::{Block, parse};
 use crate::review_model_picker::ReviewModelPicker;
@@ -200,6 +202,10 @@ pub struct ConversationView {
     history_index: Option<usize>,
     history_draft: String,
     model_filter: Entity<EditableTextState>,
+    /// The model picker's highlighted row (moved with the arrow keys, picked with enter).
+    model_selected: usize,
+    /// Scrolls the highlighted model into view.
+    model_scroll: ScrollHandle,
     picker: Option<Picker>,
     pub(crate) review_model_picker: Option<Entity<ReviewModelPicker>>,
     review_model_subscription: Option<Subscription>,
@@ -307,7 +313,10 @@ impl ConversationView {
         let model_filter = cx.new(|cx| EditableTextState::new(StringStorage::default(), cx));
         // The composer redraws itself while typing; only the model filter changes our list.
         let subscriptions = vec![
-            cx.subscribe(&model_filter, |_, _, _: &TextChanged, cx| cx.notify()),
+            cx.subscribe(&model_filter, |this, _, _: &TextChanged, cx| {
+                this.reset_model_selection(cx);
+                cx.notify();
+            }),
             // The composer redraws itself; only the completion menu depends on its text.
             cx.subscribe(&composer, |this, composer, _: &TextChanged, cx| {
                 let text = composer.read(cx).as_str();
@@ -339,6 +348,8 @@ impl ConversationView {
             history_index: None,
             history_draft: String::new(),
             model_filter,
+            model_selected: 0,
+            model_scroll: ScrollHandle::new(),
             picker: None,
             review_model_picker: None,
             review_model_subscription: None,
@@ -1697,15 +1708,63 @@ impl ConversationView {
         cx.notify();
     }
 
-    fn pick_first_model(
+    fn pick_selected_model(
         &mut self,
-        _: &PickFirstModel,
+        _: &PickSelectedModel,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if let Some(choice) = self.filtered_models(cx).into_iter().next() {
+        let choices = self.filtered_models(cx);
+        let index = self.model_selected.min(choices.len().saturating_sub(1));
+        if let Some(choice) = choices.into_iter().nth(index) {
             self.select_model(choice.model, window, cx);
         }
+    }
+
+    fn select_next_model(&mut self, _: &SelectNextModel, _: &mut Window, cx: &mut Context<Self>) {
+        self.move_model_selection(1, cx);
+    }
+
+    fn select_previous_model(
+        &mut self,
+        _: &SelectPreviousModel,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.move_model_selection(-1, cx);
+    }
+
+    /// Highlights the current model while the filter is empty, else the first match.
+    fn reset_model_selection(&mut self, cx: &App) {
+        self.model_selected = if self.model_filter.read(cx).as_str().trim().is_empty() {
+            let current = self.model().map(|model| model.qualified_id());
+            self.filtered_models(cx)
+                .iter()
+                .take(render::PICKER_LIMIT)
+                .position(|choice| Some(choice.model.qualified_id()) == current)
+                .unwrap_or(0)
+        } else {
+            0
+        };
+        self.model_scroll.scroll_to_item(self.model_selected);
+    }
+
+    /// Moves the model picker's highlight by `delta` rows, wrapping around.
+    fn move_model_selection(&mut self, delta: isize, cx: &mut Context<Self>) {
+        let count = self.filtered_models(cx).len().min(render::PICKER_LIMIT);
+        if count == 0 {
+            return;
+        }
+        let current = self.model_selected.min(count - 1) as isize;
+        self.model_selected = (current + delta).rem_euclid(count as isize) as usize;
+        self.model_scroll.scroll_to_item(self.model_selected);
+        cx.notify();
+    }
+
+    /// The model picker's highlighted row (tests).
+    #[cfg(test)]
+    pub fn model_selected_for_test(&self) -> usize {
+        self.model_selected
     }
 
     pub(crate) fn retry(&mut self, cx: &mut Context<Self>) {
@@ -1748,6 +1807,7 @@ impl ConversationView {
         if self.picker == Some(Picker::Model) {
             self.model_filter
                 .update(cx, |filter, cx| filter.emplace("", cx));
+            self.reset_model_selection(cx);
             self.model_filter
                 .read(cx)
                 .focus_handle(cx)

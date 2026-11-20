@@ -983,6 +983,61 @@ fn conversations_open_without_any_api_key(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+fn arrow_keys_choose_in_the_model_picker(cx: &mut TestAppContext) {
+    use crate::conversation::Picker;
+
+    let faux = FauxProvider::default();
+    let other = FauxProvider::new("other");
+    let _data = setup_models(cx, &[&faux, &other], false);
+    let (_dir, project) = project_dir();
+    let window = open(cx, &project);
+    let conversation = active(window, cx);
+    let ids: Vec<String> = conversation.read_with(cx, |view, cx| {
+        view.model_choices_for_test(cx)
+            .iter()
+            .map(|choice| choice.model.qualified_id())
+            .collect()
+    });
+    assert_eq!(ids.len(), 2);
+    let current = faux.model().qualified_id();
+    let start = ids.iter().position(|id| *id == current).unwrap();
+    let selected = |cx: &mut TestAppContext| {
+        conversation.read_with(cx, |view, _| view.model_selected_for_test())
+    };
+
+    // Opening the picker highlights the current model.
+    conversation.update(cx, |view, cx| view.set_draft("keep me", cx));
+    window
+        .update(cx, |_, window, cx| {
+            conversation.update(cx, |view, cx| view.toggle_picker(Picker::Model, window, cx))
+        })
+        .unwrap();
+    cx.run_until_parked();
+    assert_eq!(selected(cx), start);
+
+    // Down and up move the highlight and wrap around.
+    cx.simulate_keystrokes(window.into(), "down");
+    assert_eq!(selected(cx), (start + 1) % 2);
+    cx.simulate_keystrokes(window.into(), "up up");
+    assert_eq!(selected(cx), (start + 1) % 2);
+
+    // Enter picks the highlighted model (not the first one) and does not send the draft,
+    // although the picker sits inside the composer, whose Enter sends.
+    cx.simulate_keystrokes(window.into(), "enter");
+    cx.run_until_parked();
+    let (model, draft, running) = conversation.read_with(cx, |view, cx| {
+        (
+            view.model().unwrap().qualified_id(),
+            view.draft(cx),
+            view.is_running(),
+        )
+    });
+    assert_eq!(model, ids[(start + 1) % 2]);
+    assert_eq!((draft.as_str(), running), ("keep me", false));
+    assert!(faux.requests().is_empty() && other.requests().is_empty());
+}
+
+#[gpui::test]
 fn new_conversations_remember_the_last_model(cx: &mut TestAppContext) {
     let faux = FauxProvider::default();
     faux.push(FauxResponse::text("back to the original model"));

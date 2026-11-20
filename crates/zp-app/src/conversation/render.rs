@@ -78,7 +78,7 @@ const INLINE_DIFF_ROWS: usize = 40;
 /// Changed files initially shown in a completed answer.
 const TURN_FILE_PREVIEW: usize = 3;
 /// Models listed at once in the picker.
-const PICKER_LIMIT: usize = 200;
+pub(super) const PICKER_LIMIT: usize = 200;
 
 pub(super) fn id(name: impl Into<SharedString>, index: usize) -> ElementId {
     ElementId::NamedInteger(name.into(), index as u64)
@@ -1651,6 +1651,7 @@ impl ConversationView {
         let current = self.model().map(|model| model.qualified_id());
         let choices = self.filtered_models(cx);
         let total = choices.len();
+        let highlighted = self.model_selected.min(total.saturating_sub(1));
         let items = choices
             .into_iter()
             .take(PICKER_LIMIT)
@@ -1673,6 +1674,7 @@ impl ConversationView {
                     .py_1()
                     .rounded(px(4.))
                     .cursor_pointer()
+                    .when(index == highlighted, |this| this.bg(colors.surface_hover))
                     .hover_style(|s| s.bg(colors.surface_hover))
                     .child(picker_checkmark(selected, colors.text))
                     .child(
@@ -1699,6 +1701,7 @@ impl ConversationView {
             .flex_col()
             .max_h(px(320.))
             .overflow_y_scroll()
+            .track_scroll(&self.model_scroll)
             .px_1()
             .pb_1()
             .children(items)
@@ -2435,7 +2438,9 @@ impl Render for ConversationView {
             .on_action(cx.listener(Self::send))
             .on_action(cx.listener(Self::stop))
             .on_action(cx.listener(Self::close_picker))
-            .on_action(cx.listener(Self::pick_first_model))
+            .on_action(cx.listener(Self::pick_selected_model))
+            .on_action(cx.listener(Self::select_next_model))
+            .on_action(cx.listener(Self::select_previous_model))
             .on_action(cx.listener(Self::deny_focused_approval))
             .on_action(cx.listener(Self::submit_focused_answers))
             .on_action(

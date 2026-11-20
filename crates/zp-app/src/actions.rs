@@ -26,7 +26,9 @@ actions!(
         SendMessage,
         StopRun,
         ClosePicker,
-        PickFirstModel,
+        PickSelectedModel,
+        SelectNextModel,
+        SelectPreviousModel,
         NextTab,
         PreviousTab,
         ToggleSessionTree,
@@ -274,8 +276,6 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("shift-enter", Enter, Some(MESSAGE_EDITOR_INPUT)),
         KeyBinding::new("escape", CancelEdit, Some(MESSAGE_EDITOR_INPUT)),
         KeyBinding::new("escape", StopRun, Some(COMPOSER_INPUT)),
-        KeyBinding::new("enter", PickFirstModel, Some(MODEL_FILTER_INPUT)),
-        KeyBinding::new("escape", ClosePicker, Some(MODEL_FILTER_INPUT)),
         KeyBinding::new(
             "enter",
             TerminalFindNext,
@@ -376,6 +376,14 @@ pub fn bind_keys(cx: &mut App) {
         };
         cx.bind_keys([(shortcut.bind)(&keys, shortcut.context)]);
     }
+    // The model picker opens inside the composer, so `Composer > EditableText` (Send
+    // Message) matches its filter at the same depth; on a tie the later binding wins.
+    cx.bind_keys([
+        KeyBinding::new("enter", PickSelectedModel, Some(MODEL_FILTER_INPUT)),
+        KeyBinding::new("down", SelectNextModel, Some(MODEL_FILTER_INPUT)),
+        KeyBinding::new("up", SelectPreviousModel, Some(MODEL_FILTER_INPUT)),
+        KeyBinding::new("escape", ClosePicker, Some(MODEL_FILTER_INPUT)),
+    ]);
     set_menus(cx);
 }
 
