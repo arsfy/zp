@@ -1063,6 +1063,8 @@ impl ConversationView {
         let (status_text, status_color) = match (status, subagent_status) {
             _ if approval.is_some() => ("awaiting approval", colors.warning),
             _ if question.is_some() => ("waiting for you", colors.accent),
+            // Checked by the review model before it runs.
+            _ if self.is_reviewing(&call.id) => ("reviewing…", colors.accent),
             (_, Some(SubagentStatus::Queued)) => ("queued", colors.text_muted),
             (_, Some(SubagentStatus::Truncated)) => ("truncated", colors.warning),
             (_, Some(SubagentStatus::Cancelled)) => ("cancelled", colors.text_muted),

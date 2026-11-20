@@ -636,3 +636,47 @@ fn auto_review_explains_a_call_it_hands_to_the_user(cx: &mut TestAppContext) {
         conversation.read_with(cx, |view, _| !view.is_running())
     });
 }
+
+#[gpui::test]
+fn a_call_under_review_shows_as_reviewing_until_it_runs(cx: &mut TestAppContext) {
+    // The review model answers slowly, like a real one.
+    let faux = FauxProvider::default().with_chunk_delay(Duration::from_millis(100));
+    faux.push(FauxResponse::tool_call(
+        "bash",
+        json!({"command": "printf reviewed"}),
+    ));
+    faux.push(FauxResponse::text(
+        r#"{"decision": "allow", "reason": "prints text"}"#,
+    ));
+    faux.push(FauxResponse::text("Printed"));
+    let data = setup_models(cx, &[&faux], false);
+    let mut settings = zp_core::settings::Settings::default();
+    settings.permissions.mode = Some(PermissionMode::AutoReview);
+    settings.permissions.review_model = Some(faux.model().qualified_id());
+    settings
+        .save(&zp_core::paths::settings_file(data.path()))
+        .unwrap();
+    let (_dir, project) = project_dir();
+    let window = open(cx, &project);
+    let conversation = active(window, cx);
+    send(window, "Print it", cx);
+
+    let reviewed_call = |cx: &mut TestAppContext| {
+        conversation.read_with(cx, |view, _| {
+            let call = view.transcript().assistant(1)?.tool_calls().next()?.clone();
+            view.is_reviewing(&call.id).then_some(call.id)
+        })
+    };
+    wait_until(cx, |cx| reviewed_call(cx).is_some());
+    let call = reviewed_call(cx).unwrap();
+    assert!(
+        tool_results(&conversation, cx).is_empty(),
+        "it has not run yet"
+    );
+    wait_until(cx, |cx| !tool_results(&conversation, cx).is_empty());
+    assert!(!conversation.read_with(cx, |view, _| view.is_reviewing(&call)));
+    assert_eq!(
+        tool_results(&conversation, cx),
+        [(false, "reviewed".to_owned())]
+    );
+}

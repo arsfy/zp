@@ -240,11 +240,30 @@ impl ConversationView {
     }
 
     /// Drops pending approvals (the run ended; the gate stopped waiting).
+    /// The review model started or stopped deciding on call `call_id`.
+    pub(super) fn set_reviewing(&mut self, call_id: String, active: bool, cx: &mut Context<Self>) {
+        let changed = if active {
+            self.reviewing.insert(call_id.clone())
+        } else {
+            self.reviewing.remove(&call_id)
+        };
+        if changed {
+            self.refresh_tool_row(&call_id);
+            cx.notify();
+        }
+    }
+
+    /// Whether the review model is deciding on call `call_id`.
+    pub(crate) fn is_reviewing(&self, call_id: &str) -> bool {
+        self.reviewing.contains(call_id)
+    }
+
     pub(super) fn clear_approvals(&mut self) {
         let ids: Vec<String> = self
             .approvals
             .drain(..)
             .map(|a| a.request.tool_call_id)
+            .chain(self.reviewing.drain())
             .collect();
         for id in ids {
             self.refresh_tool_row(&id);

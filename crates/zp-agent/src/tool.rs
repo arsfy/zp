@@ -14,7 +14,8 @@ use zp_ai::{Tool, UserContent};
 pub enum ToolExecutionMode {
     /// One at a time: each call is checked, executed and finalized before the next.
     Sequential,
-    /// Calls are checked one by one, then the allowed ones execute concurrently.
+    /// Calls are checked and executed concurrently: each runs as soon as its
+    /// `before_tool_call` allows it. Hooks that ask the user should queue their questions.
     /// `ToolExecutionEnd` events arrive in completion order; tool result messages are
     /// still emitted in the order the model requested them.
     #[default]

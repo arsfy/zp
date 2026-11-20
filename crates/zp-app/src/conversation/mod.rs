@@ -237,6 +237,8 @@ pub struct ConversationView {
     change_log_cache: RefCell<Option<zp_core::changes::ChangeLog>>,
     /// Tool calls waiting for the user.
     approvals: Vec<permissions::Approval>,
+    /// Calls the review model is deciding on (they wait, not run).
+    reviewing: HashSet<String>,
     /// Questions of `ask` calls waiting for the user.
     questions: Vec<questions::QuestionCard>,
     /// Whether the task list above the composer shows every item.
@@ -356,6 +358,7 @@ impl ConversationView {
             full_subagent_results: HashSet::new(),
             change_log_cache: RefCell::default(),
             approvals: Vec::new(),
+            reviewing: HashSet::new(),
             questions: Vec::new(),
             todos_open: false,
             dismissed_todo_calls: HashSet::new(),
@@ -443,9 +446,16 @@ impl ConversationView {
             Some(Arc::new(self.progress.read(cx).elapsed_sampler(cx)));
         let coding = Arc::new(CodingSession::new(options)?);
         let approvals = cx.spawn(async move |this, cx| {
-            while let Some(pending) = approval_receiver.next().await {
+            while let Some(event) = approval_receiver.next().await {
                 if this
-                    .update(cx, |this, cx| this.add_approval(pending, cx))
+                    .update(cx, |this, cx| match event {
+                        crate::approvals::GateEvent::Approval(pending) => {
+                            this.add_approval(*pending, cx)
+                        }
+                        crate::approvals::GateEvent::Reviewing { call_id, active } => {
+                            this.set_reviewing(call_id, active, cx)
+                        }
+                    })
                     .is_err()
                 {
                     break;

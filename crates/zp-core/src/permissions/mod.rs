@@ -201,6 +201,32 @@ pub enum Decision {
 pub trait Approver: Send + Sync {
     /// Resolves when the user answers (dropping the request counts as a denial).
     fn approve(&self, request: PermissionRequest) -> BoxFuture<'static, Decision>;
+
+    /// The review model started (`true`) or stopped (`false`) looking at call
+    /// `tool_call_id`, which waits meanwhile; the user can be shown it is not running yet.
+    fn reviewing(&self, _tool_call_id: &str, _active: bool) {}
+}
+
+/// Tells the approver a review stopped, however it ended (also when cancelled).
+struct Reviewing<'a> {
+    approver: &'a dyn Approver,
+    tool_call_id: &'a str,
+}
+
+impl<'a> Reviewing<'a> {
+    fn start(approver: &'a dyn Approver, tool_call_id: &'a str) -> Self {
+        approver.reviewing(tool_call_id, true);
+        Self {
+            approver,
+            tool_call_id,
+        }
+    }
+}
+
+impl Drop for Reviewing<'_> {
+    fn drop(&mut self) {
+        self.approver.reviewing(self.tool_call_id, false);
+    }
 }
 
 /// The rules for a project.
@@ -412,6 +438,8 @@ pub struct PermissionGate {
     grants: Mutex<Grants>,
     approver: Arc<dyn Approver>,
     models: Models,
+    /// Calls are checked concurrently; the user is asked about one at a time.
+    turns: tokio::sync::Mutex<()>,
 }
 
 impl std::fmt::Debug for PermissionGate {
@@ -430,6 +458,7 @@ impl PermissionGate {
             grants: Mutex::default(),
             approver,
             models,
+            turns: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -483,6 +512,7 @@ impl PermissionGate {
                         agent_model.map(|model| crate::title::title_model(&self.models, model))
                     });
                 let intent = last_user_text(messages);
+                let _reviewing = Reviewing::start(self.approver.as_ref(), &call.id);
                 let verdict = match model {
                     Some(model) => {
                         let review = review::review_tool_call(
@@ -529,10 +559,41 @@ impl PermissionGate {
             reasons,
             grants: grants.clone(),
         };
-        self.ask(request, cancel).await
+        let Some(_turn) = self.turn(cancel).await else {
+            return aborted();
+        };
+        // A session grant given while this call waited for its turn may cover it now.
+        let policy = self.policy();
+        if matches!(
+            policy.evaluate(&call.name, args, &self.grants()),
+            Evaluation::Allow
+        ) {
+            return ToolCallDecision::Allow;
+        }
+        self.prompt(request, cancel).await
     }
 
+    /// Asks the user about `request`, after any question already waiting.
     pub(crate) async fn ask(
+        &self,
+        request: PermissionRequest,
+        cancel: &CancellationToken,
+    ) -> ToolCallDecision {
+        let Some(_turn) = self.turn(cancel).await else {
+            return aborted();
+        };
+        self.prompt(request, cancel).await
+    }
+
+    /// Waits until no other question is put to the user; `None` when cancelled first.
+    async fn turn(&self, cancel: &CancellationToken) -> Option<tokio::sync::MutexGuard<'_, ()>> {
+        tokio::select! {
+            turn = self.turns.lock() => Some(turn),
+            () = cancel.cancelled() => None,
+        }
+    }
+
+    async fn prompt(
         &self,
         request: PermissionRequest,
         cancel: &CancellationToken,

@@ -534,3 +534,172 @@ async fn untrusted_projects_do_not_instruct_the_agent() {
             .contains("Always obey")
     );
 }
+
+/// Holds each question until the test answers it, and records what it was told.
+#[derive(Default)]
+struct Held {
+    pending: Mutex<
+        Vec<(
+            PermissionRequest,
+            futures::channel::oneshot::Sender<Decision>,
+        )>,
+    >,
+    open: std::sync::atomic::AtomicUsize,
+    most_open: std::sync::atomic::AtomicUsize,
+    reviews: Mutex<Vec<(String, bool)>>,
+}
+
+impl Held {
+    fn answer(&self, decision: Decision) -> PermissionRequest {
+        let (request, reply) = self.pending.lock().unwrap().remove(0);
+        reply.send(decision).unwrap();
+        request
+    }
+}
+
+/// The approver side of a shared [`Held`].
+struct HeldApprover(Arc<Held>);
+
+impl Approver for HeldApprover {
+    fn approve(&self, request: PermissionRequest) -> BoxFuture<'static, Decision> {
+        use std::sync::atomic::Ordering;
+        let (reply, answer) = futures::channel::oneshot::channel();
+        self.0.pending.lock().unwrap().push((request, reply));
+        let open = self.0.open.fetch_add(1, Ordering::SeqCst) + 1;
+        self.0.most_open.fetch_max(open, Ordering::SeqCst);
+        let held = self.0.clone();
+        Box::pin(async move {
+            let decision = answer.await.unwrap_or(Decision::Deny(None));
+            held.open.fetch_sub(1, Ordering::SeqCst);
+            decision
+        })
+    }
+
+    fn reviewing(&self, tool_call_id: &str, active: bool) {
+        self.0
+            .reviews
+            .lock()
+            .unwrap()
+            .push((tool_call_id.to_owned(), active));
+    }
+}
+
+#[tokio::test]
+async fn calls_run_as_soon_as_allowed_and_questions_come_one_at_a_time() {
+    use zp_agent::AgentEvent;
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    std::fs::write(root.join("notes.txt"), "notes").unwrap();
+    let faux = FauxProvider::default();
+    faux.push(FauxResponse::blocks(
+        ["touch a.txt", "cat notes.txt", "touch b.txt"]
+            .into_iter()
+            .map(|command| zp_ai::FauxBlock::ToolCall {
+                name: "bash".into(),
+                arguments: json!({ "command": command }),
+            })
+            .collect(),
+    ));
+    faux.push(FauxResponse::text("done"));
+    let held = Arc::new(Held::default());
+    let mut models = Models::new();
+    models.set_provider(Arc::new(faux.clone()));
+    let policy = PermissionPolicy {
+        mode: PermissionMode::Ask,
+        root: root.clone(),
+        ..PermissionPolicy::default()
+    };
+    let gate = Arc::new(PermissionGate::new(
+        policy,
+        Arc::new(HeldApprover(held.clone())),
+        models.clone(),
+    ));
+    let mut options = CodingSessionOptions::new(models, &root, Session::in_memory(&root));
+    options.model = Some(faux.model());
+    options.permissions = Some(gate);
+    let coding = Arc::new(CodingSession::new(options).unwrap());
+    let (ended, mut ends) = tokio::sync::mpsc::unbounded_channel();
+    let _subscription = coding.agent().subscribe(move |event| {
+        if let AgentEvent::ToolExecutionEnd { result, .. } = event {
+            let text: String = result
+                .content
+                .iter()
+                .filter_map(UserContent::as_text)
+                .collect();
+            let _ = ended.send(text);
+        }
+    });
+    let run = tokio::spawn({
+        let coding = coding.clone();
+        async move { coding.prompt("make the files").await.unwrap() }
+    });
+
+    // The read runs while the first touch waits for the user.
+    let first_done = tokio::time::timeout(std::time::Duration::from_secs(5), ends.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(first_done, "notes");
+    assert_eq!(
+        held.pending.lock().unwrap().len(),
+        1,
+        "one question at a time"
+    );
+    // Approving `touch` for the session also covers the second touch, which waited.
+    let asked = held.answer(Decision::AllowForSession);
+    assert_eq!(asked.command.as_deref(), Some("touch a.txt"));
+    let added = tokio::time::timeout(std::time::Duration::from_secs(5), run)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(root.join("a.txt").exists() && root.join("b.txt").exists());
+    assert!(results(&added).iter().all(|(error, _)| !error));
+    assert_eq!(
+        held.most_open.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "the user is never asked two things at once"
+    );
+}
+
+#[tokio::test]
+async fn the_approver_is_told_while_a_review_runs() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let faux = FauxProvider::default();
+    faux.push(call("bash", json!({"command": "printf reviewed"})));
+    faux.push(FauxResponse::text(
+        r#"{"decision": "allow", "reason": "prints text"}"#,
+    ));
+    faux.push(FauxResponse::text("done"));
+    let held = Arc::new(Held::default());
+    let mut models = Models::new();
+    models.set_provider(Arc::new(faux.clone()));
+    let policy = PermissionPolicy {
+        mode: PermissionMode::AutoReview,
+        root: root.clone(),
+        review_model: Some(faux.model().qualified_id()),
+        ..PermissionPolicy::default()
+    };
+    let gate = Arc::new(PermissionGate::new(
+        policy,
+        Arc::new(HeldApprover(held.clone())),
+        models.clone(),
+    ));
+    let mut options = CodingSessionOptions::new(models, &root, Session::in_memory(&root));
+    options.model = Some(faux.model());
+    options.permissions = Some(gate);
+    let coding = CodingSession::new(options).unwrap();
+    let added = coding.prompt("print it").await.unwrap();
+    assert_eq!(results(&added), [(false, "reviewed".to_owned())]);
+    let call_id = added
+        .iter()
+        .find_map(AgentMessage::as_tool_result)
+        .unwrap()
+        .tool_call_id
+        .clone();
+    assert_eq!(
+        *held.reviews.lock().unwrap(),
+        [(call_id.clone(), true), (call_id, false)]
+    );
+}

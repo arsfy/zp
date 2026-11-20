@@ -395,36 +395,24 @@ async fn execute_parallel(
     emit: &Emit,
     cancel: &CancellationToken,
 ) -> Batch {
-    // Checks (including permission prompts) run one at a time, in call order.
-    let mut prepared = Vec::with_capacity(calls.len());
+    // Each call is checked and run on its own, so a slow review or a pending approval
+    // holds back only its call. Hooks that ask the user queue their questions themselves.
     for call in calls {
         emit(start_event(call));
-        let preparation = prepare(config, context, message, call, cancel).await;
-        if let Prepared::Immediate(result) = &preparation {
-            emit_end(emit, call, &Finalized::immediate(result.clone()));
-        }
-        prepared.push(preparation);
     }
-
-    let finalized = join_all(
-        calls
-            .iter()
-            .zip(prepared)
-            .map(|(call, preparation)| async move {
-                match preparation {
-                    Prepared::Immediate(result) => Finalized::immediate(result),
-                    Prepared::Ready { tool, args } => {
-                        let finalized = if cancel.is_cancelled() {
-                            Finalized::immediate(AgentToolResult::error(TOOL_ABORTED))
-                        } else {
-                            execute(config, context, message, call, tool, args, emit, cancel).await
-                        };
-                        emit_end(emit, call, &finalized);
-                        finalized
-                    }
-                }
-            }),
-    )
+    let finalized = join_all(calls.iter().map(|call| async move {
+        let finalized = match prepare(config, context, message, call, cancel).await {
+            Prepared::Immediate(result) => Finalized::immediate(result),
+            Prepared::Ready { .. } if cancel.is_cancelled() => {
+                Finalized::immediate(AgentToolResult::error(TOOL_ABORTED))
+            }
+            Prepared::Ready { tool, args } => {
+                execute(config, context, message, call, tool, args, emit, cancel).await
+            }
+        };
+        emit_end(emit, call, &finalized);
+        finalized
+    }))
     .await;
 
     let terminate = terminates(&finalized);

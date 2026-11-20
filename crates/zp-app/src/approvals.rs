@@ -19,23 +19,41 @@ pub struct PendingApproval {
     pub reply: oneshot::Sender<Decision>,
 }
 
+/// What the permission gate tells the conversation view.
+pub enum GateEvent {
+    /// A call waits for the user (boxed: a request is much larger than the other event).
+    Approval(Box<PendingApproval>),
+    /// The review model started or stopped looking at a call.
+    Reviewing { call_id: String, active: bool },
+}
+
 /// Sends requests to the conversation view; a dropped answer counts as a denial.
 pub struct ChannelApprover {
-    sender: mpsc::UnboundedSender<PendingApproval>,
+    sender: mpsc::UnboundedSender<GateEvent>,
 }
 
 impl ChannelApprover {
-    pub fn new(sender: mpsc::UnboundedSender<PendingApproval>) -> Self {
+    pub fn new(sender: mpsc::UnboundedSender<GateEvent>) -> Self {
         Self { sender }
     }
 }
 
 impl Approver for ChannelApprover {
+    fn reviewing(&self, tool_call_id: &str, active: bool) {
+        let _ = self.sender.unbounded_send(GateEvent::Reviewing {
+            call_id: tool_call_id.to_owned(),
+            active,
+        });
+    }
+
     fn approve(&self, request: PermissionRequest) -> BoxFuture<'static, Decision> {
         let (reply, answer) = oneshot::channel();
         let sent = self
             .sender
-            .unbounded_send(PendingApproval { request, reply })
+            .unbounded_send(GateEvent::Approval(Box::new(PendingApproval {
+                request,
+                reply,
+            })))
             .is_ok();
         Box::pin(async move {
             if !sent {

@@ -19,8 +19,9 @@ use crate::truncate::{DEFAULT_MAX_BYTES, TruncatedBy, format_size};
 /// Minimum spacing of progress updates.
 const UPDATE_INTERVAL: Duration = Duration::from_millis(100);
 /// How long to keep reading after the shell exits, for output still in the pipes. Background
-/// processes that keep the pipes open do not hold the call beyond this.
-const DRAIN_GRACE: Duration = Duration::from_millis(250);
+/// processes that keep the pipes open do not hold the call beyond this. Output the shell
+/// wrote is in the pipes when it exits, so this only needs to cover reading it.
+const DRAIN_GRACE: Duration = Duration::from_millis(100);
 
 /// Runs shell commands in a working directory.
 #[derive(Clone, Debug)]
