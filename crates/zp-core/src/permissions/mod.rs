@@ -178,6 +178,9 @@ pub struct PermissionRequest {
     pub command: Option<String>,
     /// Where a delegated call sends its task: the model and its endpoint.
     pub destination: Option<String>,
+    /// What the call would do in plain words, from the review model that handed it to
+    /// the user.
+    pub description: Option<String>,
     pub reasons: Vec<AskReason>,
     /// What "approve for session" would grant; empty when it is not offered (destructive
     /// commands).
@@ -468,9 +471,9 @@ impl PermissionGate {
         let policy = self.policy();
         let current_grants = self.grants();
         let evaluation = policy.evaluate(&call.name, args, &current_grants);
-        let (reasons, grants) = match evaluation {
+        let (reasons, grants, description) = match evaluation {
             Evaluation::Allow => return ToolCallDecision::Allow,
-            Evaluation::Ask { reasons, grants } => (reasons, grants),
+            Evaluation::Ask { reasons, grants } => (reasons, grants, None),
             Evaluation::Review { grants } => {
                 let model = policy
                     .review_model
@@ -500,10 +503,13 @@ impl PermissionGate {
                 };
                 match verdict {
                     Ok(review::Verdict::Allow(_)) => return ToolCallDecision::Allow,
-                    Ok(review::Verdict::Ask(why)) => (vec![AskReason::Review(why)], grants),
+                    Ok(review::Verdict::Ask { reason, summary }) => {
+                        (vec![AskReason::Review(reason)], grants, summary)
+                    }
                     Err(error) => (
                         vec![AskReason::Review(format!("review failed ({error:#})"))],
                         grants,
+                        None,
                     ),
                 }
             }
@@ -519,6 +525,7 @@ impl PermissionGate {
                 .filter(|_| call.name == "bash")
                 .map(str::to_owned),
             destination: None,
+            description,
             reasons,
             grants: grants.clone(),
         };

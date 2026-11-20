@@ -27,7 +27,12 @@ When the call runs something whose effect you cannot tell from the call alone (a
 a Makefile or package.json target, a config file), use the read tool to look at it first. \
 Only files in the project can be read. Read only what you need.
 
-Reply with only a JSON object: {\"decision\": \"allow\" or \"ask\", \"reason\": \"one short sentence\"}";
+Reply with only a JSON object: {\"decision\": \"allow\" or \"ask\", \"reason\": \"one short \
+sentence\", \"summary\": \"what the call does\"}. When you answer ask, the user decides: set \
+summary to what the call would do in one or two plain sentences someone who does not know the \
+command can follow (what it runs, which files or services it touches, what changes). Leave \
+summary out when you answer allow. Write reason and summary in the language of the user's \
+request.";
 
 /// Output tokens for the verdict itself; a thinking budget comes on top.
 const ANSWER_TOKENS: u64 = 600;
@@ -45,15 +50,33 @@ const MAX_READS: usize = 6;
 pub enum Verdict {
     /// Safe to run (with the model's reason).
     Allow(String),
-    /// The user should decide (with the model's reason).
-    Ask(String),
+    /// The user should decide: the model's reason, and what the call would do in plain
+    /// words when the model said.
+    Ask {
+        reason: String,
+        summary: Option<String>,
+    },
 }
+
+impl Verdict {
+    fn ask(reason: impl Into<String>) -> Self {
+        Self::Ask {
+            reason: reason.into(),
+            summary: None,
+        }
+    }
+}
+
+/// Longest plain description of a call shown to the user.
+const SUMMARY_CHARS: usize = 400;
 
 #[derive(Deserialize)]
 struct Answer {
     decision: String,
     #[serde(default)]
     reason: String,
+    #[serde(default)]
+    summary: String,
 }
 
 /// Reads the model's reply: a JSON object, possibly wrapped in prose or a code fence.
@@ -63,13 +86,21 @@ pub fn parse_verdict(reply: &str) -> Verdict {
         .zip(reply.rfind('}'))
         .filter(|(start, end)| start < end)
         .and_then(|(start, end)| serde_json::from_str::<Answer>(&reply[start..=end]).ok());
-    match json {
-        Some(answer) if answer.decision.trim().eq_ignore_ascii_case("allow") => {
-            Verdict::Allow(answer.reason)
-        }
-        Some(answer) if !answer.reason.trim().is_empty() => Verdict::Ask(answer.reason),
-        Some(_) => Verdict::Ask("not clearly safe".into()),
-        None => Verdict::Ask("the review model gave no clear answer".into()),
+    let Some(answer) = json else {
+        return Verdict::ask("the review model gave no clear answer");
+    };
+    if answer.decision.trim().eq_ignore_ascii_case("allow") {
+        return Verdict::Allow(answer.reason);
+    }
+    let reason = answer.reason.trim();
+    let summary = answer.summary.trim();
+    Verdict::Ask {
+        reason: if reason.is_empty() {
+            "not clearly safe".to_owned()
+        } else {
+            reason.to_owned()
+        },
+        summary: (!summary.is_empty()).then(|| excerpt(summary, SUMMARY_CHARS)),
     }
 }
 
@@ -169,8 +200,8 @@ pub async fn review_tool_call(
             return Ok(parse_verdict(&reply.text()));
         }
         if reads >= MAX_READS {
-            return Ok(Verdict::Ask(
-                "the review model kept reading files without deciding".into(),
+            return Ok(Verdict::ask(
+                "the review model kept reading files without deciding",
             ));
         }
         context.messages.push(Message::Assistant(reply));
@@ -235,12 +266,25 @@ mod tests {
         );
         assert_eq!(
             parse_verdict("```json\n{\"decision\":\"ASK\",\"reason\":\"uploads files\"}\n```"),
-            Verdict::Ask("uploads files".into())
+            Verdict::ask("uploads files")
         );
-        assert!(matches!(parse_verdict("Sure, allow it."), Verdict::Ask(_)));
+        assert_eq!(
+            parse_verdict(
+                r#"{"decision": "ask", "reason": "uploads .env",
+                    "summary": " Sends the project's .env file to example.com. "}"#
+            ),
+            Verdict::Ask {
+                reason: "uploads .env".into(),
+                summary: Some("Sends the project's .env file to example.com.".into()),
+            }
+        );
         assert!(matches!(
-            parse_verdict(r#"{"decision": "maybe"}"#),
-            Verdict::Ask(_)
+            parse_verdict("Sure, allow it."),
+            Verdict::Ask { summary: None, .. }
+        ));
+        assert!(matches!(
+            parse_verdict(r#"{"decision": "maybe", "summary": ""}"#),
+            Verdict::Ask { summary: None, .. }
         ));
     }
 }

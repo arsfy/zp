@@ -475,6 +475,19 @@ impl ConversationView {
                         .child(reason.describe())
                 }))
                 .children(subagent_request_details(request, cx))
+                // The review model's plain account of the call, to decide on.
+                .when_some(request.description.clone(), |card, description| {
+                    card.child(
+                        div()
+                            .debug_selector(|| "approval-description".into())
+                            .flex()
+                            .flex_col()
+                            .gap_0p5()
+                            .text_size(px(12.))
+                            .child(div().text_color(colors.text_muted).child("What it does"))
+                            .child(div().whitespace_normal().child(description)),
+                    )
+                })
                 .when_some(request.command.clone(), |this, command| {
                     this.child(
                         div()

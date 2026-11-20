@@ -451,6 +451,7 @@ impl SubagentTool {
                         args: call.args.clone(),
                         command: None,
                         destination: Some(destination),
+                        description: None,
                         reasons: vec![AskReason::Delegation],
                         grants: Vec::new(),
                     },

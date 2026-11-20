@@ -50,6 +50,12 @@ impl Approver for TerminalApprover {
                 request.command.as_deref().unwrap_or(&request.summary)
             );
             eprintln!("{}", style.paint("2", &format!("  {}", reasons.join("; "))));
+            if let Some(description) = &request.description {
+                eprintln!(
+                    "{}",
+                    style.paint("2", &format!("  What it does: {description}"))
+                );
+            }
             let Some(input) = input else {
                 eprintln!(
                     "{}",
