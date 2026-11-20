@@ -56,7 +56,11 @@ impl AgentHooks for CodingHooks {
                 return Ok(None);
             }
             if request.trigger == CompactionTrigger::ProviderError
-                && !request.messages.last().is_some_and(is_overflow_response)
+                && !request
+                    .messages
+                    .last()
+                    .and_then(AgentMessage::as_assistant)
+                    .is_some_and(|message| compaction::is_overflow(message, model))
             {
                 return Ok(None);
             }
@@ -68,7 +72,7 @@ impl AgentHooks for CodingHooks {
                 return Ok(None);
             }
             self.compaction
-                .perform(&self.models, model, before, overhead, None, cancel)
+                .perform(model, before, overhead, None, request.started, cancel)
                 .await
                 .map_err(|error| format!("Compaction failed: {error:#}"))
         })
@@ -152,16 +156,6 @@ impl AgentHooks for CodingHooks {
             })
             .collect()
     }
-}
-
-fn is_overflow_response(message: &AgentMessage) -> bool {
-    message.as_assistant().is_some_and(|assistant| {
-        assistant.stop_reason == StopReason::Error
-            && assistant
-                .error_message
-                .as_deref()
-                .is_some_and(compaction::is_context_overflow)
-    })
 }
 
 /// Options for [`CodingSession::new`].
@@ -332,6 +326,8 @@ pub struct CodingSession {
 struct CompactionState {
     session: Arc<Mutex<Session>>,
     settings: CompactionSettings,
+    /// Runs the summary requests.
+    models: Models,
 }
 
 impl CompactionState {
@@ -341,11 +337,11 @@ impl CompactionState {
 
     async fn perform(
         &self,
-        models: &Models,
         model: &Model,
         before: u64,
         overhead: u64,
         instructions: Option<&str>,
+        started: &(dyn Fn() + Send + Sync),
         cancel: &CancellationToken,
     ) -> anyhow::Result<Option<ContextCompaction>> {
         let (head, rewind, preparation) = {
@@ -360,6 +356,7 @@ impl CompactionState {
                         .and_then(AgentMessage::as_assistant)
                         .is_some_and(|message| {
                             matches!(message.stop_reason, StopReason::Error | StopReason::Aborted)
+                                || compaction::is_overflow(message, model)
                         })
                 });
             let rewind = failed.map(|index| {
@@ -376,8 +373,9 @@ impl CompactionState {
         let Some(preparation) = preparation else {
             return Ok(None);
         };
+        started();
         let result =
-            compaction::summarize(models, model, preparation, instructions, cancel).await?;
+            compaction::summarize(&self.models, model, preparation, instructions, cancel).await?;
         let (entry_id, messages) = {
             let mut session = self.session();
             if cancel.is_cancelled() {
@@ -551,6 +549,7 @@ impl CodingSession {
         let compaction = CompactionState {
             session: Arc::new(Mutex::new(session)),
             settings: compaction,
+            models: models.clone(),
         };
         let mut agent_options = AgentOptions::with_models(models.clone(), model);
         agent_options.thinking_level = thinking;
@@ -962,7 +961,8 @@ impl CodingSession {
         )
     }
 
-    /// Checks whether the current transcript is near the model's limit.
+    /// Whether the current transcript is near the model's limit. Runs compact by
+    /// themselves before a request; this is for showing it (and for tests).
     pub fn needs_compaction(&self) -> bool {
         self.agent.model().is_some_and(|model| {
             compaction::should_compact(
@@ -973,14 +973,18 @@ impl CodingSession {
         })
     }
 
-    /// Whether the last response failed due to context overflow.
+    /// Whether the last response ran out of context room. Runs compact and retry once by
+    /// themselves; this tells a client that the retry did not help either.
     pub fn overflowed(&self) -> bool {
+        let Some(model) = self.agent.model() else {
+            return false;
+        };
         self.agent
             .messages()
             .iter()
             .rev()
-            .find(|message| message.as_assistant().is_some())
-            .is_some_and(is_overflow_response)
+            .find_map(AgentMessage::as_assistant)
+            .is_some_and(|message| compaction::is_overflow(message, &model))
     }
 
     /// Summarizes older messages into a compaction entry. Returns `(tokens before,
@@ -995,11 +999,11 @@ impl CodingSession {
         let Some(result) = self
             .compaction
             .perform(
-                &self.models,
                 &model,
                 before,
                 overhead,
                 instructions,
+                &|| {},
                 &CancellationToken::new(),
             )
             .await?
@@ -1023,7 +1027,8 @@ impl CodingSession {
             .branch_path(None)
             .iter()
             .rev()
-            .find_map(|entry| entry.message().and_then(AgentMessage::as_assistant))
-            .and_then(|assistant| assistant.usage.cache_read_rate())
+            .filter_map(|entry| entry.message().and_then(AgentMessage::as_assistant))
+            // Failed requests report no input; look past them.
+            .find_map(|assistant| assistant.usage.cache_read_rate())
     }
 }

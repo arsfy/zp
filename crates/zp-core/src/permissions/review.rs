@@ -230,6 +230,8 @@ fn review_options(model: &Model, thinking: ThinkingLevel) -> StreamOptions {
         thinking,
         thinking_budgets: Some(budgets),
         max_tokens: Some(ANSWER_TOKENS + budgets.for_level(thinking)),
+        // Each review is a one-off request: a cache write would not be read again.
+        cache_retention: zp_ai::CacheRetention::None,
         ..StreamOptions::default()
     }
 }

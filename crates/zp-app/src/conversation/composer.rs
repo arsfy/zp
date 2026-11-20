@@ -813,7 +813,7 @@ impl ConversationView {
 
     /// Whether a compaction is running.
     pub fn is_compacting(&self) -> bool {
-        self.compacting
+        self.compacting || self.auto_compacting
     }
 
     /// Summarizes older messages; then runs `then` (a prompt or a retry) if given.

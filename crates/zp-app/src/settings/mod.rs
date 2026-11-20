@@ -573,7 +573,7 @@ impl SettingsWindow {
         let cache_choices = [
             ("Default", CacheRetention::Short),
             ("Extended", CacheRetention::Long),
-            ("Minimize writes", CacheRetention::None),
+            ("Off", CacheRetention::None),
         ];
         let titles = settings.generate_titles.unwrap_or(true);
         let notifications = settings.notifications.unwrap_or(true);
@@ -597,7 +597,7 @@ impl SettingsWindow {
             )))
             .child(section(
                 "Prompt cache retention",
-                "Applies to supported providers. Extended retention can increase cache-write costs.",
+                "How long providers keep the reused start of a conversation. Extended asks for 1 hour on Anthropic (2× the input price per cache write), 24 hours on earlier OpenAI models and 12 hours on GPT-5.6 and later (2.5× per write); other endpoints keep their default unless set up for it. Off stops cache writes, so every request pays the full input price: usually more expensive.",
                 cx,
             ))
             .child(div().flex().child(segmented(

@@ -589,6 +589,7 @@ fn apply_anthropic_cache_control(messages: &mut [Value], tools: &mut [Value], co
             break;
         }
     }
+    // On the tool object, not inside `function` (as pi-ai marks it for these endpoints).
     if let Some(tool) = tools.last_mut() {
         tool["cache_control"] = control.clone();
     }

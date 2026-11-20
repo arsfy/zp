@@ -41,6 +41,8 @@ pub async fn generate_title(
     let options = StreamOptions {
         thinking: model.clamp_thinking_level(ThinkingLevel::Off),
         max_tokens: Some(256),
+        // A one-off request: a cache write would not be read again.
+        cache_retention: zp_ai::CacheRetention::None,
         ..StreamOptions::default()
     };
     let reply = models.complete(model, &context, options).await;

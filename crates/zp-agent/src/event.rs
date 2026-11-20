@@ -33,6 +33,11 @@ pub enum AgentEvent {
     },
     /// A turn (one model response plus its tool calls) started.
     TurnStart,
+    /// The session started summarizing older messages before the next request.
+    ContextCompacting {
+        /// What triggered compaction.
+        trigger: CompactionTrigger,
+    },
     /// A committed compaction replaced the model's context before the request.
     ContextCompacted {
         /// The replacement context and its boundary.
@@ -110,6 +115,7 @@ impl AgentEvent {
             Self::AgentEnd { .. } => "agent_end",
             Self::TurnStart => "turn_start",
             Self::TurnEnd { .. } => "turn_end",
+            Self::ContextCompacting { .. } => "context_compacting",
             Self::ContextCompacted { .. } => "context_compacted",
             Self::ContextCompactionFailed { .. } => "context_compaction_failed",
             Self::MessageStart { .. } => "message_start",

@@ -232,6 +232,13 @@ pub fn should_compact(tokens: u64, context_window: u64, settings: &CompactionSet
 /// Whether a failed response means the request did not fit the context window.
 pub fn is_context_overflow(error: &str) -> bool {
     let error = error.to_ascii_lowercase();
+    // Throttling can also mention tokens ("Too many tokens, please wait").
+    if ["rate limit", "too many requests", "throttl"]
+        .iter()
+        .any(|needle| error.contains(needle))
+    {
+        return false;
+    }
     error.starts_with("http 413")
         || [
             "context length",
@@ -250,6 +257,72 @@ pub fn is_context_overflow(error: &str) -> bool {
         .any(|needle| error.contains(needle))
 }
 
+/// Whether response `message` from `model` ran out of room: an overflow error, or a
+/// stop at the length limit with no output and the input filling the window (servers
+/// that cut the input to fit instead of failing). Responses of another model do not
+/// count: its window may differ.
+pub fn is_overflow(message: &zp_ai::AssistantMessage, model: &Model) -> bool {
+    if message.provider != model.provider || message.model != model.id {
+        return false;
+    }
+    match message.stop_reason {
+        StopReason::Error => message
+            .error_message
+            .as_deref()
+            .is_some_and(is_context_overflow),
+        StopReason::Length => {
+            let input = message.usage.input + message.usage.cache_read;
+            message.usage.output == 0
+                && model.context_window > 0
+                && input * 100 >= model.context_window * 99
+        }
+        _ => false,
+    }
+}
+
+/// Output tokens a summary request gets at least.
+const MIN_SUMMARY_TOKENS: u64 = 1_024;
+/// Room kept free in a summary request for the system prompt and estimate error.
+const SUMMARY_MARGIN_TOKENS: u64 = 2_048;
+
+/// A summary request's output limit, and how many tokens its input may take: the output
+/// gets up to `output_cap` (and the model's limit), shrinking so input and output fit the
+/// window; when even the smallest output does not fit, the input must be cut.
+fn summary_budget(model: &Model, output_cap: u64, input_tokens: u64) -> (u64, Option<u64>) {
+    let mut output = output_cap.max(MIN_SUMMARY_TOKENS);
+    if model.max_tokens > 0 {
+        output = output.min(model.max_tokens.max(MIN_SUMMARY_TOKENS));
+    }
+    if model.context_window == 0 {
+        return (output, None);
+    }
+    let room = model.context_window.saturating_sub(SUMMARY_MARGIN_TOKENS);
+    if input_tokens + output <= room {
+        return (output, None);
+    }
+    let output = room.saturating_sub(input_tokens).max(MIN_SUMMARY_TOKENS);
+    let input_limit =
+        (input_tokens + output > room).then(|| room.saturating_sub(MIN_SUMMARY_TOKENS));
+    (output, input_limit)
+}
+
+/// Keeps the end of `conversation` within `tokens` (about four characters each), cutting
+/// the oldest part.
+fn keep_recent_text(conversation: &str, tokens: u64) -> String {
+    let limit = usize::try_from(tokens.saturating_mul(4)).unwrap_or(usize::MAX);
+    if conversation.len() <= limit {
+        return conversation.to_owned();
+    }
+    let mut start = conversation.len() - limit;
+    while !conversation.is_char_boundary(start) {
+        start += 1;
+    }
+    format!(
+        "[... earlier conversation omitted to fit the context window]\n\n{}",
+        &conversation[start..]
+    )
+}
+
 /// What a compaction will summarize.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Preparation {
@@ -263,6 +336,8 @@ pub struct Preparation {
     /// Files read and changed, carried over from earlier compactions.
     pub read_files: BTreeSet<String>,
     pub modified_files: BTreeSet<String>,
+    /// The settings' reserve: summaries get a share of it as their output limit.
+    pub reserve_tokens: u64,
 }
 
 /// The outcome of [`summarize`], ready for a compaction entry.
@@ -383,6 +458,7 @@ pub fn prepare(path: &[&SessionEntry], settings: &CompactionSettings) -> Option<
         previous_summary,
         read_files,
         modified_files,
+        reserve_tokens: settings.reserve_tokens,
     })
 }
 
@@ -490,23 +566,41 @@ pub fn serialize_conversation(messages: &[AgentMessage]) -> String {
     parts.join("\n\n")
 }
 
+/// Asks `model` for a summary of `conversation`, placed in a prompt by `prompt`. The
+/// output limit is `output_cap` at most and the request is sized to fit the window: the
+/// oldest part of the conversation is cut when needed.
 async fn ask(
     models: &Models,
     model: &Model,
-    prompt: String,
+    conversation: &str,
+    prompt: impl Fn(&str) -> String,
+    output_cap: u64,
     cancel: &tokio_util::sync::CancellationToken,
     usage: &mut UsageTotals,
 ) -> anyhow::Result<String> {
+    let full = prompt(conversation);
+    let input_tokens = (full.len() + SYSTEM_PROMPT.len()).div_ceil(4) as u64;
+    let (max_tokens, input_limit) = summary_budget(model, output_cap, input_tokens);
+    let text = match input_limit {
+        Some(limit) => {
+            let overhead = input_tokens - (conversation.len().div_ceil(4) as u64);
+            prompt(&keep_recent_text(
+                conversation,
+                limit.saturating_sub(overhead),
+            ))
+        }
+        None => full,
+    };
     let context = Context {
         system_prompt: Some(SYSTEM_PROMPT.to_owned()),
-        messages: vec![Message::user(prompt)],
+        messages: vec![Message::user(text)],
         tools: Vec::new(),
     };
     let options = StreamOptions {
         thinking: model.clamp_thinking_level(ThinkingLevel::Off),
         cache_retention: CacheRetention::None,
         cancel: cancel.clone(),
-        max_tokens: Some(model.max_tokens.clamp(1_024, 32_000)),
+        max_tokens: Some(max_tokens),
         ..StreamOptions::default()
     };
     let reply = models.complete(model, &context, options).await;
@@ -543,11 +637,8 @@ pub async fn summarize(
         .filter(|i| !i.trim().is_empty())
         .map(|i| format!("\n\nAdditional focus: {}", i.trim()))
         .unwrap_or_default();
-    let history = |messages: &[AgentMessage]| {
-        let mut prompt = format!(
-            "<conversation>\n{}\n</conversation>\n\n",
-            serialize_conversation(messages)
-        );
+    let history = |conversation: &str| {
+        let mut prompt = format!("<conversation>\n{conversation}\n</conversation>\n\n");
         match &preparation.previous_summary {
             Some(previous) => {
                 prompt.push_str(&format!("<previous-summary>\n{previous}\n</previous-summary>\n\n"));
@@ -568,10 +659,13 @@ pub async fn summarize(
             .clone()
             .unwrap_or_else(|| "No prior history.".to_owned())
     } else {
+        // Like pi: most of the reserve for the history, half of it for a turn prefix.
         ask(
             models,
             model,
-            history(&preparation.messages_to_summarize),
+            &serialize_conversation(&preparation.messages_to_summarize),
+            history,
+            preparation.reserve_tokens * 4 / 5,
             cancel,
             &mut usage,
         )
@@ -579,13 +673,20 @@ pub async fn summarize(
         .context("could not summarize the conversation")?
     };
     if !preparation.turn_prefix.is_empty() {
-        let prompt = format!(
-            "# Conversation\n{}\n\n# Instructions\n{TURN_PREFIX_PROMPT}{focus}",
-            serialize_conversation(&preparation.turn_prefix)
-        );
-        let prefix = ask(models, model, prompt, cancel, &mut usage)
-            .await
-            .context("could not summarize the current turn")?;
+        let prompt = |conversation: &str| {
+            format!("# Conversation\n{conversation}\n\n# Instructions\n{TURN_PREFIX_PROMPT}{focus}")
+        };
+        let prefix = ask(
+            models,
+            model,
+            &serialize_conversation(&preparation.turn_prefix),
+            prompt,
+            preparation.reserve_tokens / 2,
+            cancel,
+            &mut usage,
+        )
+        .await
+        .context("could not summarize the current turn")?;
         summary = format!("{summary}\n\n---\n\n**Turn Context (split turn):**\n\n{prefix}");
     }
 
@@ -789,6 +890,7 @@ mod tests {
             previous_summary: Some("before".into()),
             read_files: ["a.rs".to_owned(), "b.rs".to_owned()].into(),
             modified_files: ["b.rs".to_owned()].into(),
+            reserve_tokens: 16_384,
         };
         let result = summarize(
             &models,
@@ -811,5 +913,93 @@ mod tests {
         let prompt = joined(&user.content);
         assert!(prompt.contains("<previous-summary>\nbefore"));
         assert!(prompt.ends_with("Additional focus: the API"));
+    }
+
+    #[test]
+    fn summary_requests_fit_the_window() {
+        let mut model = zp_ai::FauxProvider::default().model();
+        model.context_window = 100_000;
+        model.max_tokens = 64_000;
+        let room = 100_000 - SUMMARY_MARGIN_TOKENS;
+        assert_eq!(summary_budget(&model, 13_107, 10_000), (13_107, None));
+        assert_eq!(
+            summary_budget(&model, 13_107, 90_000),
+            (room - 90_000, None),
+            "the output shrinks so both fit"
+        );
+        assert_eq!(
+            summary_budget(&model, 13_107, 120_000),
+            (MIN_SUMMARY_TOKENS, Some(room - MIN_SUMMARY_TOKENS)),
+            "the smallest output, and the input is cut"
+        );
+        model.max_tokens = 4_096;
+        assert_eq!(summary_budget(&model, 13_107, 10_000), (4_096, None));
+        let kept = keep_recent_text(&format!("{}end", "a".repeat(10_000)), 100);
+        assert!(kept.starts_with("[... earlier conversation omitted"));
+        assert!(kept.ends_with("end") && kept.len() < 500);
+    }
+
+    #[test]
+    fn overflow_covers_errors_and_empty_length_stops_of_the_same_model() {
+        assert!(!is_context_overflow(
+            "ThrottlingException: Too many tokens, please wait before trying again."
+        ));
+        let mut model = zp_ai::FauxProvider::default().model();
+        model.context_window = 100_000;
+        let mut message = AssistantMessage::empty(model.api.as_str(), &model.provider, &model.id);
+        message.stop_reason = StopReason::Length;
+        message.usage.input = 60_000;
+        message.usage.cache_read = 39_500;
+        assert!(is_overflow(&message, &model), "the input filled the window");
+        message.usage.output = 12;
+        assert!(
+            !is_overflow(&message, &model),
+            "an answer cut at its own limit"
+        );
+        message.usage.output = 0;
+        message.model = "other".into();
+        assert!(
+            !is_overflow(&message, &model),
+            "another model's window may differ"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_oversized_history_is_cut_to_fit_the_summary_request() {
+        let faux = zp_ai::FauxProvider::default();
+        faux.push(zp_ai::FauxResponse::text("## Goal\nShort"));
+        let mut models = Models::new();
+        models.set_provider(std::sync::Arc::new(faux.clone()));
+        let mut model = faux.model();
+        model.context_window = 8_000;
+        let history: Vec<AgentMessage> = (0..40)
+            .map(|i| AgentMessage::user(format!("message {i} {}", "x".repeat(2_000))))
+            .collect();
+        let prep = Preparation {
+            first_kept_entry_id: "k".into(),
+            messages_to_summarize: history,
+            turn_prefix: Vec::new(),
+            previous_summary: None,
+            read_files: BTreeSet::new(),
+            modified_files: BTreeSet::new(),
+            reserve_tokens: 16_384,
+        };
+        summarize(&models, &model, prep, None, &Default::default())
+            .await
+            .unwrap();
+        let Message::User(user) = &faux.requests()[0].messages[0] else {
+            panic!()
+        };
+        let prompt = joined(&user.content);
+        assert!(prompt.contains("[... earlier conversation omitted"));
+        assert!(
+            prompt.contains("message 39"),
+            "the newest messages are kept"
+        );
+        assert!(!prompt.contains("message 0 "));
+        assert!(
+            (prompt.len() + SYSTEM_PROMPT.len()) / 4 < 8_000 - MIN_SUMMARY_TOKENS as usize,
+            "the input leaves room for the output"
+        );
     }
 }

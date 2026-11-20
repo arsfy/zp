@@ -486,3 +486,66 @@ async fn overflow_with_no_history_to_compact_preserves_the_error() {
         coding.session().context().messages
     );
 }
+
+#[tokio::test]
+async fn an_empty_answer_at_the_length_limit_with_a_full_window_compacts_and_retries() {
+    let project = tempfile::tempdir().unwrap();
+    let faux = FauxProvider::default();
+    let mut model = faux.model();
+    model.context_window = 100_000;
+    // A server that cuts the input to fit leaves no room for the answer.
+    let mut full = zp_ai::Usage {
+        input: 99_500,
+        ..Default::default()
+    };
+    full.update_total();
+    for response in [
+        FauxResponse::text("old answer"),
+        FauxResponse::Message {
+            blocks: Vec::new(),
+            stop_reason: Some(zp_ai::StopReason::Length),
+            usage: full,
+        },
+        FauxResponse::text("compaction summary"),
+        FauxResponse::text("final answer"),
+    ] {
+        faux.push(response);
+    }
+    let session = zp_session::Session::in_memory(project.path());
+    let mut options = CodingSessionOptions::new(models(&faux), project.path(), session);
+    options.model = Some(model);
+    let coding = CodingSession::new(options).unwrap();
+    coding.prompt("old question").await.unwrap();
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let _subscription = coding.agent().subscribe({
+        let events = events.clone();
+        move |event| match event {
+            AgentEvent::ContextCompacting { .. } | AgentEvent::ContextCompacted { .. } => {
+                events.lock().unwrap().push(event.name());
+            }
+            _ => {}
+        }
+    });
+    let added = coding.prompt("new question").await.unwrap();
+
+    assert_eq!(faux.pending(), 0, "summarized once and retried");
+    assert_eq!(
+        *events.lock().unwrap(),
+        ["context_compacting", "context_compacted"],
+        "clients are told when summarizing starts"
+    );
+    let last = added.last().and_then(AgentMessage::as_assistant).unwrap();
+    assert_eq!(last.text(), "final answer");
+    assert!(
+        added
+            .iter()
+            .filter_map(AgentMessage::as_assistant)
+            .all(|message| message.stop_reason != zp_ai::StopReason::Length),
+        "the cut-off attempt is not part of the result"
+    );
+    assert!(!coding.overflowed());
+    assert_eq!(
+        coding.agent().messages(),
+        coding.session().context().messages
+    );
+}

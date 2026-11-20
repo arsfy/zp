@@ -272,6 +272,8 @@ pub struct ConversationView {
     /// The last attempt to send found no model selected.
     needs_model: bool,
     compacting: bool,
+    /// The run is summarizing older messages before its next request.
+    auto_compacting: bool,
     /// Whether the session tree overlay is shown.
     tree_open: bool,
     /// A model title was already requested for this session.
@@ -372,6 +374,7 @@ impl ConversationView {
             needs_key: None,
             needs_model: false,
             compacting: false,
+            auto_compacting: false,
             tree_open: false,
             title_requested: false,
             focus_handle,
@@ -530,8 +533,7 @@ impl ConversationView {
         self.turn_files_expanded.clear();
         self.change_log_cache.borrow_mut().take();
         self.disclosures.clear();
-        self.transcript = Transcript::from_session(&coding.session());
-        self.transcript.set_context_tokens(coding.context_tokens());
+        self.transcript = Transcript::from_session(&coding.session(), coding.context_tokens());
         // One more item at the end: room for the floating composer.
         self.list_state = ListState::new(self.transcript.len() + 1, ListAlignment::Top, px(1000.));
         self.list_state.set_follow_mode(gpui::FollowMode::Tail);
@@ -546,9 +548,13 @@ impl ConversationView {
         let mut changes = Changes::default();
         let mut compacted = false;
         for ReceivedEvent { at, event, timing } in &events {
+            if let AgentEvent::ContextCompacting { .. } = event {
+                self.auto_compacting = true;
+                continue;
+            }
             if let AgentEvent::ContextCompacted { compaction, .. } = event {
-                self.reload_transcript_at(Some(&compaction.entry_id));
-                self.transcript.set_context_tokens(compaction.tokens_after);
+                self.auto_compacting = false;
+                self.reload_transcript_at(Some(&compaction.entry_id), compaction.tokens_after);
                 self.info = Some(format!(
                     "Compacted the conversation: about {} → {} tokens",
                     crate::ui::format_tokens(compaction.tokens_before),
@@ -563,6 +569,7 @@ impl ConversationView {
                 continue;
             }
             if let AgentEvent::ContextCompactionFailed { error } = event {
+                self.auto_compacting = false;
                 self.info = Some(error.clone());
             }
             if self.time_response(*at, event) {
@@ -753,19 +760,22 @@ impl ConversationView {
 
     /// Rebuilds the rows from the agent's transcript (after retry or branch changes).
     fn reload_transcript(&mut self) {
-        self.reload_transcript_at(None);
-        if let Some(coding) = &self.coding {
-            self.transcript.set_context_tokens(coding.context_tokens());
-        }
+        let tokens = self
+            .coding
+            .as_ref()
+            .map_or(0, |coding| coding.context_tokens());
+        self.reload_transcript_at(None, tokens);
     }
 
-    fn reload_transcript_at(&mut self, leaf: Option<&str>) {
+    /// Rebuilds the rows up to entry `leaf` (the latest when `None`), with the context
+    /// measured at `context_tokens`.
+    fn reload_transcript_at(&mut self, leaf: Option<&str>, context_tokens: u64) {
         self.text_selection.clear();
         self.turn_changes.borrow_mut().clear();
         self.turn_files_expanded.clear();
         self.change_log_cache.borrow_mut().take();
         if let Some(coding) = &self.coding {
-            self.transcript = Transcript::from_session_at(&coding.session(), leaf);
+            self.transcript = Transcript::from_session_at(&coding.session(), leaf, context_tokens);
             self.editing = None;
             self.held_open.borrow_mut().clear();
             self.disclosures.clear();
@@ -989,6 +999,7 @@ impl ConversationView {
         self.abort(cx);
         self.running = false;
         self.compacting = false;
+        self.auto_compacting = false;
         self.run_task = None;
         self.stop_status_updates(cx);
     }
@@ -1583,6 +1594,8 @@ impl ConversationView {
     /// Marks the run as over once its last event has been shown.
     fn finish_run(&mut self, cx: &mut Context<Self>) {
         self.running = false;
+        // A compaction cancelled with the run ends without an event.
+        self.auto_compacting = false;
         self.turn_changes.borrow_mut().clear();
         self.change_log_cache.borrow_mut().take();
         self.refresh_last_row();

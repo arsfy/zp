@@ -672,6 +672,9 @@ impl Printer {
         let mut stdout = std::io::stdout();
         let mut stderr = std::io::stderr();
         match event {
+            AgentEvent::ContextCompacting { .. } => {
+                let _ = writeln!(stderr, "{}", self.style.paint("2", "compacting…"));
+            }
             AgentEvent::ContextCompacted {
                 compaction,
                 trigger,

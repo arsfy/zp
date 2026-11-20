@@ -391,6 +391,16 @@ fn automatic_compaction_before_a_prompt(cx: &mut TestAppContext) {
     wait_until(cx, |_| faux.pending() == 0);
     wait_quiet(&conversation, cx);
     assert_eq!(compactions(&conversation, cx), 1);
+    conversation.read_with(cx, |view, _| {
+        assert!(
+            !view.is_compacting(),
+            "the compacting note is gone once it is done"
+        );
+        assert!(
+            view.info_text()
+                .is_some_and(|info| info.starts_with("Compacted the conversation"))
+        );
+    });
     let requests = faux.requests();
     assert!(
         text_of(match &requests[2].messages[0] {

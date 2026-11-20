@@ -128,13 +128,19 @@ fn text_of(content: &[UserContent]) -> String {
 }
 
 impl Transcript {
-    /// Restores the transcript and message timing from the active session branch.
-    pub(super) fn from_session(session: &Session) -> Self {
-        Self::from_session_at(session, None)
+    /// Restores the transcript and message timing from the active session branch;
+    /// `context_tokens` is the current context size (the session knows the request
+    /// overhead it is measured with).
+    pub(super) fn from_session(session: &Session, context_tokens: u64) -> Self {
+        Self::from_session_at(session, None, context_tokens)
     }
 
     /// Restores the transcript at the event boundary, even if more messages have been saved.
-    pub(super) fn from_session_at(session: &Session, leaf: Option<&str>) -> Self {
+    pub(super) fn from_session_at(
+        session: &Session,
+        leaf: Option<&str>,
+        context_tokens: u64,
+    ) -> Self {
         let mut transcript = Self::default();
         let mut changes = Changes::default();
         let context = session.context_at(leaf);
@@ -147,19 +153,15 @@ impl Transcript {
             .and_then(|id| entries.iter().position(|entry| entry.id == id))
             .map_or(entries.len(), |index| index + 1);
         transcript.usage = UsageTotals::from_entries(&entries[..end]);
-        transcript.usage.last_context_tokens =
-            zp_core::compaction::context_tokens(&context.messages);
+        transcript.usage.last_context_tokens = context_tokens;
         transcript.last_cache_read_rate = session
             .branch_path(leaf)
             .iter()
             .rev()
-            .find_map(|entry| entry.message().and_then(AgentMessage::as_assistant))
-            .and_then(|assistant| assistant.usage.cache_read_rate());
+            .filter_map(|entry| entry.message().and_then(AgentMessage::as_assistant))
+            // Failed requests report no input; look past them.
+            .find_map(|assistant| assistant.usage.cache_read_rate());
         transcript
-    }
-
-    pub(super) fn set_context_tokens(&mut self, tokens: u64) {
-        self.usage.last_context_tokens = tokens;
     }
 
     pub fn rows(&self) -> &[Row] {
@@ -328,7 +330,9 @@ impl Transcript {
                     self.tool_rows.insert(call.id.clone(), row);
                 }
                 self.usage.add_message(message);
-                self.last_cache_read_rate = assistant.usage.cache_read_rate();
+                if let Some(rate) = assistant.usage.cache_read_rate() {
+                    self.last_cache_read_rate = Some(rate);
+                }
                 if !matches!(
                     assistant.stop_reason,
                     StopReason::Error | StopReason::Aborted
@@ -486,7 +490,7 @@ mod tests {
         for message in messages {
             session.append_message(message.clone()).unwrap();
         }
-        Transcript::from_session(&session)
+        Transcript::from_session(&session, 0)
     }
 
     #[test]
@@ -508,7 +512,7 @@ mod tests {
         let text = lines.map(|line| line.to_string()).join("\n");
         std::fs::write(&file, text).unwrap();
 
-        let transcript = Transcript::from_session(&Session::open(&file).unwrap());
+        let transcript = Transcript::from_session(&Session::open(&file).unwrap(), 0);
         assert!(matches!(
             transcript.rows()[0],
             Row::User {

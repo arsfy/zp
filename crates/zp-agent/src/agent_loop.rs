@@ -125,6 +125,8 @@ pub(crate) async fn run_loop(
                     )
                     .await
                 {
+                    // The failed attempt is gone from the context; retry without it.
+                    added.pop();
                     recovered_overflow = true;
                     continue;
                 }
@@ -135,6 +137,32 @@ pub(crate) async fn run_loop(
             }
 
             let calls: Vec<ToolCall> = message.tool_calls().cloned().collect();
+            // Cut off at the length limit before producing anything: the context may have
+            // left no room for the answer. The session decides; one recovery per run.
+            if message.stop_reason == StopReason::Length && calls.is_empty() && !recovered_overflow
+            {
+                emit(AgentEvent::TurnEnd {
+                    message,
+                    tool_results: Vec::new(),
+                });
+                if compact_context(
+                    config,
+                    &mut context,
+                    &declarations,
+                    CompactionTrigger::ProviderError,
+                    emit,
+                    cancel,
+                )
+                .await
+                {
+                    added.pop();
+                    recovered_overflow = true;
+                } else {
+                    has_more_tool_calls = false;
+                    pending = poll(&mut queues.steering, cancel);
+                }
+                continue;
+            }
             let mut tool_results = Vec::new();
             has_more_tool_calls = false;
             if !calls.is_empty() {
@@ -210,12 +238,14 @@ async fn compact_context(
     if cancel.is_cancelled() {
         return false;
     }
+    let started = || emit(AgentEvent::ContextCompacting { trigger });
     let request = BeforeModelRequest {
         trigger,
         run: &config.run,
         messages: context,
         system_prompt: config.system_prompt.as_deref(),
         tools: declarations,
+        started: &started,
     };
     match config.hooks.compact_context(request, cancel).await {
         Ok(Some(compaction)) => {

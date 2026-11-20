@@ -98,7 +98,8 @@ impl ToolResultOverride {
 pub enum CompactionTrigger {
     /// Before sending the next request.
     Threshold,
-    /// After the provider rejected the current response attempt.
+    /// After the current response attempt failed for lack of room: the provider rejected
+    /// it, or stopped it at the length limit before it produced anything.
     ProviderError,
 }
 
@@ -114,6 +115,9 @@ pub struct BeforeModelRequest<'a> {
     pub system_prompt: Option<&'a str>,
     /// Tool declarations sent with this request.
     pub tools: &'a [Tool],
+    /// Call when summarizing actually starts (not for a check that finds nothing to
+    /// do), so clients can show that the run is compacting.
+    pub started: &'a (dyn Fn() + Send + Sync),
 }
 
 /// A committed compaction that replaces the agent's transcript.

@@ -2023,7 +2023,7 @@ impl ConversationView {
                             ),
                     )
                 })
-                .when(self.compacting, |this| {
+                .when(self.compacting || self.auto_compacting, |this| {
                     this.child(
                         div()
                             .text_size(px(12.))
