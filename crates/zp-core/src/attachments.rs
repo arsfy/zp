@@ -66,15 +66,21 @@ impl ImageAttachment {
 }
 
 /// The `@path` references in `text`: `@` at the start or after whitespace, up to the next
-/// whitespace, without trailing punctuation.
+/// whitespace, without trailing punctuation; or `@"a path"` in quotes, which may contain
+/// spaces.
 pub fn references(text: &str) -> Vec<String> {
     let mut refs = Vec::new();
     let mut previous = ' ';
     for (index, c) in text.char_indices() {
         if c == '@' && previous.is_whitespace() {
             let rest = &text[index + 1..];
-            let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
-            let path = rest[..end].trim_end_matches([',', '.', ';', ':', ')', '!', '?', '"', '\'']);
+            let path = match rest.strip_prefix('"') {
+                Some(quoted) => quoted.find('"').map_or("", |end| &quoted[..end]),
+                None => {
+                    let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+                    rest[..end].trim_end_matches([',', '.', ';', ':', ')', '!', '?', '"', '\''])
+                }
+            };
             if !path.is_empty() && !refs.iter().any(|r| r == path) {
                 refs.push(path.to_owned());
             }
@@ -82,6 +88,67 @@ pub fn references(text: &str) -> Vec<String> {
         previous = c;
     }
     refs
+}
+
+/// `@path` as typed: quoted when it contains whitespace. A folder ends with `/` and, when
+/// quoted, leaves the quote open so its contents can be completed next.
+pub fn reference(path: &str, dir: bool) -> String {
+    let path = if dir {
+        format!("{}/", path.trim_end_matches('/'))
+    } else {
+        path.to_owned()
+    };
+    match (path.contains(char::is_whitespace), dir) {
+        (false, _) => format!("@{path}"),
+        (true, false) => format!("@\"{path}\""),
+        (true, true) => format!("@\"{path}"),
+    }
+}
+
+/// An `@path` being typed at the caret.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReferenceAt {
+    /// Byte range of the whole reference, from `@` to its end (past the caret too).
+    pub range: std::ops::Range<usize>,
+    /// What follows `@` up to the caret, without an opening quote.
+    pub query: String,
+}
+
+/// The `@path` reference the caret at byte `caret` is in, if any: `@` at the start or
+/// after whitespace, then no whitespace up to the caret (or an open `@"` quote).
+pub fn reference_at(text: &str, caret: usize) -> Option<ReferenceAt> {
+    let caret = caret.min(text.len());
+    let before = text.get(..caret)?;
+    for (at, _) in before
+        .match_indices('@')
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+    {
+        if before[..at]
+            .chars()
+            .next_back()
+            .is_some_and(|c| !c.is_whitespace())
+        {
+            continue;
+        }
+        let typed = &before[at + 1..];
+        let after = &text[caret..];
+        return match typed.strip_prefix('"') {
+            // A closed quote ends the reference before the caret.
+            Some(quoted) if quoted.contains('"') => None,
+            Some(quoted) => Some(ReferenceAt {
+                range: at..caret + after.find('"').map_or(after.len(), |end| end + 1),
+                query: quoted.to_owned(),
+            }),
+            None if typed.contains(char::is_whitespace) => None,
+            None => Some(ReferenceAt {
+                range: at..caret + after.find(char::is_whitespace).unwrap_or(after.len()),
+                query: typed.to_owned(),
+            }),
+        };
+    }
+    None
 }
 
 /// The user message for `text` with its `@file` references and `images` attached.
@@ -151,6 +218,84 @@ pub fn split_file_blocks(text: &str) -> (Vec<String>, &str) {
     (names, rest)
 }
 
+/// A file or folder offered for `@` completion (a project-relative path with `/`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PathEntry {
+    pub path: String,
+    pub dir: bool,
+}
+
+/// The project's files and the folders that contain them, sorted (`.gitignore` respected).
+pub fn project_entries(cwd: &Path, limit: usize) -> Vec<PathEntry> {
+    let files = project_files(cwd, limit);
+    let mut dirs = std::collections::BTreeSet::new();
+    for file in &files {
+        let mut path = file.as_str();
+        while let Some((parent, _)) = path.rsplit_once('/') {
+            if !dirs.insert(parent.to_owned()) {
+                break;
+            }
+            path = parent;
+        }
+    }
+    let mut entries: Vec<PathEntry> = dirs
+        .into_iter()
+        .map(|path| PathEntry { path, dir: true })
+        .chain(files.into_iter().map(|path| PathEntry { path, dir: false }))
+        .collect();
+    entries.sort_by(|a, b| a.path.cmp(&b.path));
+    entries
+}
+
+/// Completions for `query`, what follows `@`. An empty query, or one ending in `/`, lists
+/// what that folder contains (folders first); otherwise (or when there is no such folder)
+/// the best fuzzy matches, paths starting with the query first.
+pub fn complete_path<'a>(
+    entries: &'a [PathEntry],
+    query: &str,
+    limit: usize,
+) -> Vec<&'a PathEntry> {
+    if query.is_empty() || query.ends_with('/') {
+        let prefix = query.to_lowercase();
+        let mut children: Vec<&PathEntry> = entries
+            .iter()
+            .filter(|entry| {
+                let lower = entry.path.to_lowercase();
+                lower
+                    .strip_prefix(&prefix)
+                    .is_some_and(|rest| !rest.is_empty() && !rest.contains('/'))
+            })
+            .collect();
+        children.sort_by(|a, b| b.dir.cmp(&a.dir).then(a.path.cmp(&b.path)));
+        children.truncate(limit);
+        if !children.is_empty() || query.is_empty() {
+            return children;
+        }
+    }
+    let lower = query.to_lowercase();
+    let mut scored: Vec<(i64, &PathEntry)> = entries
+        .iter()
+        .filter_map(|entry| {
+            let shown = if entry.dir {
+                format!("{}/", entry.path)
+            } else {
+                entry.path.clone()
+            };
+            let mut score = fuzzy_score(&shown, query)?;
+            if shown.to_lowercase().starts_with(&lower) {
+                score += 1_000_000;
+            }
+            Some((score, entry))
+        })
+        .collect();
+    scored.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.path.cmp(&b.1.path)));
+    scored
+        .into_iter()
+        .take(limit)
+        .map(|(_, entry)| entry)
+        .collect()
+}
+
 /// Files of the project for `@` completion (relative paths, `.gitignore` respected).
 pub fn project_files(cwd: &Path, limit: usize) -> Vec<String> {
     let mut files: Vec<String> = ignore::WalkBuilder::new(cwd)
@@ -212,6 +357,83 @@ pub fn fuzzy_filter<'a>(files: &'a [String], query: &str, limit: usize) -> Vec<&
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn quoted_references_may_contain_spaces() {
+        assert_eq!(
+            references(r#"see @"docs/my notes.md" and @"unclosed path"#),
+            ["docs/my notes.md"]
+        );
+        assert_eq!(
+            reference("docs/my notes.md", false),
+            r#"@"docs/my notes.md""#
+        );
+        assert_eq!(reference("my docs", true), r#"@"my docs/"#);
+        assert_eq!(reference("src", true), "@src/");
+        assert_eq!(reference("src/main.rs", false), "@src/main.rs");
+    }
+
+    #[test]
+    fn finds_the_reference_at_the_caret() {
+        let text = "fix @src/ma and email@host";
+        // In the middle of a reference: it reaches past the caret to its end.
+        assert_eq!(
+            reference_at(text, 10),
+            Some(ReferenceAt {
+                range: 4..11,
+                query: "src/m".into()
+            })
+        );
+        assert_eq!(reference_at(text, 3), None, "before the @");
+        assert_eq!(reference_at(text, 15), None, "after the reference");
+        assert_eq!(reference_at(text, text.len()), None, "an email address");
+        assert_eq!(
+            reference_at("@", 1),
+            Some(ReferenceAt {
+                range: 0..1,
+                query: String::new()
+            })
+        );
+        let quoted = r#"open @"my do"#;
+        assert_eq!(
+            reference_at(quoted, quoted.len()).map(|r| r.query),
+            Some("my do".into())
+        );
+        assert_eq!(reference_at(r#"open @"my doc" now"#, 18), None);
+    }
+
+    #[test]
+    fn completes_folders_by_listing_and_names_by_fuzzy_match() {
+        let dir = tempfile::tempdir().unwrap();
+        for file in [
+            "src/main.rs",
+            "src/ui/view.rs",
+            "README.md",
+            "scripts/main.sh",
+        ] {
+            let path = dir.path().join(file);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, "").unwrap();
+        }
+        let entries = project_entries(dir.path(), 100);
+        let shown = |query: &str| {
+            complete_path(&entries, query, 10)
+                .into_iter()
+                .map(|entry| {
+                    if entry.dir {
+                        format!("{}/", entry.path)
+                    } else {
+                        entry.path.clone()
+                    }
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(shown(""), ["scripts/", "src/", "README.md"]);
+        assert_eq!(shown("src/"), ["src/ui/", "src/main.rs"]);
+        assert_eq!(shown("src/u"), ["src/ui/", "src/ui/view.rs"]);
+        assert_eq!(shown("sr/")[0], "src/", "no such folder: a fuzzy match");
+        assert_eq!(shown("main")[..2], ["src/main.rs", "scripts/main.sh"]);
+    }
 
     #[test]
     fn finds_references() {

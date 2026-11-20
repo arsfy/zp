@@ -264,7 +264,8 @@ pub struct ConversationView {
     /// The draft the user closed the menu for (not reopened until it changes).
     suppress_completion: Option<String>,
     /// Project files for `@` completion.
-    file_list: Option<Arc<Vec<String>>>,
+    /// Files and folders for `@` completion, and when they were listed.
+    file_list: Option<(Arc<Vec<zp_core::attachments::PathEntry>>, Instant)>,
     loading_files: bool,
     /// Images for the next message.
     attachments: Vec<zp_core::attachments::ImageAttachment>,
@@ -1426,7 +1427,7 @@ impl ConversationView {
                 .items
                 .get(completion.selected)
                 .is_some_and(|item| match &item.action {
-                    composer::CompletionAction::Insert(text) => text.trim_end() != draft,
+                    composer::CompletionAction::Insert { text, .. } => text.trim_end() != draft,
                     _ => true,
                 })
         });

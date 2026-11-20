@@ -193,6 +193,12 @@ impl EditableTextState {
         self.selection_movement.result.byte_range()
     }
 
+    /// The selection as a UTF-8 byte range (empty at the caret). Local addition: the
+    /// app needs the caret without a window (see README).
+    pub fn selected_range(&self) -> Range<usize> {
+        self.selected_byte_range()
+    }
+
     pub(super) fn caret_selection(&self) -> CaretSelection {
         self.selection_movement.result
     }

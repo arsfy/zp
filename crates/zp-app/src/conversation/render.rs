@@ -2623,7 +2623,7 @@ impl ConversationView {
                                 "↑↓ to choose · Tab or Enter to complete · Esc to close"
                             }
                             super::composer::CompletionKind::File => {
-                                "↑↓ to choose · Tab or Enter to attach · Esc to close"
+                                "↑↓ to choose · Tab or Enter to insert (a folder opens) · Esc to close"
                             }
                             super::composer::CompletionKind::Option => {
                                 "Type to filter · ↑↓ to choose · Tab or Enter to select · Esc to close"

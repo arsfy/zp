@@ -4,12 +4,15 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use gpui::{
     App, Bounds, ClipboardEntry, Context, EntityInputHandler as _, ExternalPaths, Window, px,
 };
 use zp_ai::ThinkingLevel;
-use zp_core::attachments::{ImageAttachment, fuzzy_filter, image_mime};
+use zp_core::attachments::{
+    ImageAttachment, PathEntry, complete_path, image_mime, reference, reference_at,
+};
 use zp_core::permissions::PermissionMode;
 
 use super::{ConversationEvent, ConversationView};
@@ -18,6 +21,8 @@ use super::{ConversationEvent, ConversationView};
 const MENU_ITEMS: usize = 50;
 /// Files listed for `@` completion.
 const FILE_LIMIT: usize = 20_000;
+/// Age after which the listed files are read again (in the background) as `@` is typed.
+const FILES_STALE: Duration = Duration::from_secs(15);
 
 /// A built-in `/` command.
 pub struct BuiltinCommand {
@@ -85,8 +90,11 @@ const OPTION_COMMANDS: [&str; 3] = ["model", "thinking", "permissions"];
 /// What accepting a completion does.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CompletionAction {
-    /// Replaces the whole draft.
-    Insert(String),
+    /// Replaces the whole draft and puts the caret at byte `caret`.
+    Insert {
+        text: String,
+        caret: usize,
+    },
     /// Switches to the model with this qualified id.
     Model(String),
     Thinking(ThinkingLevel),
@@ -105,10 +113,14 @@ pub struct CompletionItem {
 
 impl CompletionItem {
     fn insert(label: String, detail: String, replacement: String) -> Self {
+        let caret = replacement.len();
         Self {
             label,
             detail,
-            action: CompletionAction::Insert(replacement),
+            action: CompletionAction::Insert {
+                text: replacement,
+                caret,
+            },
             current: false,
         }
     }
@@ -290,21 +302,43 @@ impl ConversationView {
             let items = self.option_items(name, query.trim(), cx);
             return (!items.is_empty()).then_some((CompletionKind::Option, items));
         }
-        if draft.ends_with(char::is_whitespace) {
-            return None;
-        }
-        let start = draft.rfind(char::is_whitespace).map_or(0, |i| i + 1);
-        let token = &draft[start..];
-        let query = token.strip_prefix('@')?;
-        let files = self.project_files(cx)?;
-        let items: Vec<CompletionItem> = fuzzy_filter(&files, query, MENU_ITEMS)
+        // `@path` at the caret, also in the middle of the text.
+        let caret = self.composer.read(cx).selected_range().end;
+        let at = reference_at(draft, caret)?;
+        let entries = self.project_entries(cx)?;
+        let (before, after) = (&draft[..at.range.start], &draft[at.range.end..]);
+        let items: Vec<CompletionItem> = complete_path(&entries, &at.query, MENU_ITEMS)
             .into_iter()
-            .map(|file| {
-                CompletionItem::insert(
-                    file.to_owned(),
-                    String::new(),
-                    format!("{}@{file} ", &draft[..start]),
-                )
+            .map(|entry| {
+                // A file ends the reference; a folder stays open to pick what is in it.
+                let mut inserted = reference(&entry.path, entry.dir);
+                if !entry.dir && !after.starts_with(char::is_whitespace) {
+                    inserted.push(' ');
+                }
+                let text = format!("{before}{inserted}{after}");
+                // After a file, past the space that ends it.
+                let space = !entry.dir && !inserted.ends_with(' ');
+                let caret = before.len()
+                    + inserted.len()
+                    + if space {
+                        after.chars().next().map_or(0, char::len_utf8)
+                    } else {
+                        0
+                    };
+                CompletionItem {
+                    label: if entry.dir {
+                        format!("{}/", entry.path)
+                    } else {
+                        entry.path.clone()
+                    },
+                    detail: if entry.dir {
+                        "folder".to_owned()
+                    } else {
+                        String::new()
+                    },
+                    action: CompletionAction::Insert { text, caret },
+                    current: false,
+                }
             })
             .collect();
         (!items.is_empty()).then_some((CompletionKind::File, items))
@@ -434,33 +468,46 @@ impl ConversationView {
         items
     }
 
-    /// The project's files, loaded in the background on first use.
-    fn project_files(&mut self, cx: &mut Context<Self>) -> Option<Arc<Vec<String>>> {
-        if let Some(files) = &self.file_list {
-            return Some(files.clone());
-        }
-        if !self.loading_files {
+    /// The project's files and folders, loaded in the background on first use and read
+    /// again when stale (the old list is offered meanwhile).
+    fn project_entries(&mut self, cx: &mut Context<Self>) -> Option<Arc<Vec<PathEntry>>> {
+        let stale = self
+            .file_list
+            .as_ref()
+            .is_none_or(|(_, loaded)| loaded.elapsed() >= FILES_STALE);
+        if stale && !self.loading_files {
             self.loading_files = true;
             let root = self.root.clone();
             let task = cx
                 .background_executor()
-                .spawn(async move { zp_core::attachments::project_files(&root, FILE_LIMIT) });
+                .spawn(async move { zp_core::attachments::project_entries(&root, FILE_LIMIT) });
             cx.spawn(async move |this, cx| {
-                let files = Arc::new(task.await);
+                let entries = Arc::new(task.await);
                 let _ = this.update(cx, |this, cx| {
-                    this.file_list = Some(files);
+                    let changed = this
+                        .file_list
+                        .as_ref()
+                        .is_none_or(|(old, _)| **old != *entries);
+                    this.file_list = Some((entries, Instant::now()));
                     this.loading_files = false;
-                    this.update_completion(cx);
+                    if changed {
+                        this.update_completion(cx);
+                    }
                 });
             })
             .detach();
         }
-        None
+        self.file_list.as_ref().map(|(entries, _)| entries.clone())
     }
 
-    /// Forgets the cached file list (files may have changed).
+    /// Marks the listed files as stale (files may have changed): they are listed again
+    /// the next time `@` is typed, offering the old list meanwhile.
     pub(super) fn invalidate_files(&mut self) {
-        self.file_list = None;
+        if let Some((_, loaded)) = &mut self.file_list
+            && let Some(stale) = Instant::now().checked_sub(FILES_STALE)
+        {
+            *loaded = stale;
+        }
     }
 
     pub(crate) fn move_completion(&mut self, delta: isize, cx: &mut Context<Self>) {
@@ -485,8 +532,8 @@ impl ConversationView {
         let Some(item) = completion.items.get(index.unwrap_or(completion.selected)) else {
             return false;
         };
-        let text = match item.action.clone() {
-            CompletionAction::Insert(text) => text,
+        let (text, caret) = match item.action.clone() {
+            CompletionAction::Insert { text, caret } => (text, caret),
             action => {
                 self.composer
                     .update(cx, |composer, cx| composer.emplace("", cx));
@@ -497,16 +544,18 @@ impl ConversationView {
                     CompletionAction::Permissions(mode) => {
                         self.select_permission_mode(mode, window, cx)
                     }
-                    CompletionAction::Insert(_) => unreachable!(),
+                    CompletionAction::Insert { .. } => unreachable!(),
                 }
                 return true;
             }
         };
         self.composer.update(cx, |composer, cx| {
             composer.emplace(&text, cx);
-            composer.move_to(text.len(), cx);
+            composer.move_to(caret, cx);
         });
         self.focus_composer(window, cx);
+        // The text changed before the caret moved: look again from the caret (a folder
+        // keeps the menu open on its contents).
         self.update_completion(cx);
         cx.notify();
         true

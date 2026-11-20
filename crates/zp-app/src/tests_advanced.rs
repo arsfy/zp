@@ -714,3 +714,70 @@ fn terminal_panel_runs_a_shell(cx: &mut TestAppContext) {
             .is_none()
     );
 }
+
+#[gpui::test]
+fn at_completion_works_at_the_caret_browses_folders_and_quotes_spaces(cx: &mut TestAppContext) {
+    let faux = FauxProvider::default();
+    faux.push(FauxResponse::text("read"));
+    let _data = setup_models(cx, &[&faux], false);
+    let (_dir, project) = project_dir();
+    write(project.join("src/main.rs"), "fn main() {}\n");
+    write(project.join("src/ui/view.rs"), "\n");
+    write(project.join("docs/my notes.md"), "notes\n");
+    let window = open(cx, &project);
+    let conversation = active(window, cx);
+    let labels = |cx: &mut TestAppContext| {
+        conversation.read_with(cx, |view, _| {
+            view.completion().map(|completion| {
+                completion
+                    .items
+                    .iter()
+                    .map(|item| item.label.clone())
+                    .collect::<Vec<_>>()
+            })
+        })
+    };
+    let draft = |cx: &mut TestAppContext| conversation.read_with(cx, |v, cx| v.draft(cx));
+    let accept = |cx: &mut TestAppContext| {
+        cx.dispatch_action(window.into(), crate::actions::AcceptCompletion);
+        cx.run_until_parked();
+    };
+
+    // Typed in the middle of the draft: only the reference at the caret is replaced.
+    set_draft(window, "fix  please", cx);
+    conversation.update(cx, |view, cx| {
+        view.composer_input()
+            .update(cx, |input, cx| input.move_to(4, cx))
+    });
+    cx.simulate_input(window.into(), "@ma");
+    wait_until(cx, |cx| labels(cx).is_some());
+    assert_eq!(labels(cx).unwrap()[0], "src/main.rs");
+    accept(cx);
+    assert_eq!(draft(cx), "fix @src/main.rs please");
+    assert!(labels(cx).is_none(), "a file ends the reference");
+
+    // `@` alone lists the top folder; a folder opens on its contents.
+    set_draft(window, "look at @", cx);
+    wait_until(cx, |cx| labels(cx).is_some());
+    assert_eq!(labels(cx).unwrap(), ["docs/", "src/"]);
+    cx.simulate_input(window.into(), "sr");
+    wait_until(cx, |cx| {
+        labels(cx).is_some_and(|labels| labels[0] == "src/")
+    });
+    accept(cx);
+    assert_eq!(draft(cx), "look at @src/");
+    assert_eq!(labels(cx).unwrap(), ["src/ui/", "src/main.rs"]);
+
+    // Paths with spaces are quoted.
+    set_draft(window, "summarize @notes", cx);
+    wait_until(cx, |cx| labels(cx).is_some());
+    accept(cx);
+    assert_eq!(draft(cx), "summarize @\"docs/my notes.md\" ");
+    cx.dispatch_action(window.into(), crate::actions::SendMessage);
+    idle(&conversation, 2, cx);
+    assert!(
+        text_of(&last_prompt(&faux))
+            .starts_with("<file name=\"docs/my notes.md\">\nnotes\n</file>"),
+        "the quoted file is attached"
+    );
+}
