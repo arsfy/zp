@@ -7,6 +7,7 @@ mod keybindings;
 mod mcp;
 mod models;
 pub(crate) mod providers;
+mod subagents;
 
 use gpui::{
     AnyElement, App, AppContext as _, ColorExt as _, Context, Entity, FocusHandle, Focusable,
@@ -38,6 +39,7 @@ pub enum Page {
     Models,
     Providers,
     Permissions,
+    Subagents,
     Appearance,
     Keybindings,
     Mcp,
@@ -45,12 +47,13 @@ pub enum Page {
 }
 
 impl Page {
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 9] = [
         Self::General,
         Self::Models,
         Self::Providers,
         Self::Mcp,
         Self::Permissions,
+        Self::Subagents,
         Self::Appearance,
         Self::Keybindings,
         Self::About,
@@ -62,6 +65,7 @@ impl Page {
             Self::Models => "Models",
             Self::Providers => "Providers",
             Self::Permissions => "Permissions",
+            Self::Subagents => "Subagents",
             Self::Appearance => "Appearance",
             Self::Keybindings => "Keybindings",
             Self::Mcp => "MCP Servers",
@@ -150,6 +154,7 @@ pub struct SettingsWindow {
     review_model_subscription: Option<Subscription>,
     allow_commands: Entity<EditableTextState>,
     directories: Entity<EditableTextState>,
+    subagent_form: subagents::SubagentForm,
     // Keybindings
     recording: Option<&'static str>,
     _interceptor: Option<Subscription>,
@@ -219,6 +224,10 @@ impl SettingsWindow {
         let model_search = input("", cx);
         let allow_commands = input(permissions.allow_commands.join("\n"), cx);
         let directories = input(permissions.additional_directories.join("\n"), cx);
+        let subagent_form = subagents::SubagentForm::new(
+            settings.subagents.as_ref().unwrap_or(&Default::default()),
+            cx,
+        );
         let subscriptions = vec![
             cx.subscribe(
                 &model_filter,
@@ -250,6 +259,7 @@ impl SettingsWindow {
             review_model_subscription: None,
             allow_commands,
             directories,
+            subagent_form,
             recording: None,
             _interceptor: None,
             focus_handle,
@@ -738,6 +748,7 @@ impl Render for SettingsWindow {
             Page::Models => self.render_models(cx),
             Page::Providers => self.render_providers(cx),
             Page::Permissions => self.render_permissions(cx),
+            Page::Subagents => self.render_subagents(cx),
             Page::Appearance => self.render_appearance(cx),
             Page::Keybindings => self.render_keybindings(cx),
             Page::Mcp => self.render_mcp(cx),

@@ -139,6 +139,14 @@ impl AgentToolResult {
     }
 }
 
+/// The run's identity and model selection, shared by all of its tool calls.
+#[derive(Clone, Debug)]
+pub struct ToolRun {
+    pub id: u64,
+    pub model: zp_ai::Model,
+    pub thinking_level: zp_ai::ThinkingLevel,
+}
+
 /// Per-call context handed to [`AgentTool::execute`].
 #[derive(Clone)]
 pub struct ToolContext {
@@ -146,6 +154,8 @@ pub struct ToolContext {
     pub tool_call_id: String,
     /// Cancelled when the run is aborted.
     pub cancel: CancellationToken,
+    /// The parent run for calls executed by an agent.
+    pub run: Option<Arc<ToolRun>>,
     updates: Arc<UpdateSink>,
 }
 
@@ -167,11 +177,13 @@ impl ToolContext {
     pub(crate) fn new(
         tool_call_id: String,
         cancel: CancellationToken,
+        run: Option<Arc<ToolRun>>,
         emit: impl Fn(AgentToolResult) + Send + Sync + 'static,
     ) -> Self {
         Self {
             tool_call_id,
             cancel,
+            run,
             updates: Arc::new(UpdateSink {
                 open: AtomicBool::new(true),
                 emit: Box::new(emit),
@@ -182,7 +194,7 @@ impl ToolContext {
     /// A context for calling a tool outside the agent (e.g. in tests); updates are
     /// dropped.
     pub fn detached(tool_call_id: impl Into<String>, cancel: CancellationToken) -> Self {
-        Self::new(tool_call_id.into(), cancel, |_| {})
+        Self::new(tool_call_id.into(), cancel, None, |_| {})
     }
 
     /// Streams a partial result (e.g. command output so far). Ignored once the call has

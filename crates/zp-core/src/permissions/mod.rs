@@ -115,6 +115,8 @@ pub enum AskReason {
     Dangerous(String),
     /// The review model did not approve it.
     Review(String),
+    /// The delegation policy asks before sending a task to a child model.
+    Delegation,
 }
 
 impl AskReason {
@@ -131,6 +133,9 @@ impl AskReason {
             ),
             Self::Dangerous(why) => format!("Potentially destructive: {why}"),
             Self::Review(why) => format!("Review model: {why}"),
+            Self::Delegation => {
+                "The task and the files the subagent reads are sent to this model".to_owned()
+            }
         }
     }
 }
@@ -171,6 +176,8 @@ pub struct PermissionRequest {
     pub args: Value,
     /// The full command of a `bash` call.
     pub command: Option<String>,
+    /// Where a delegated call sends its task: the model and its endpoint.
+    pub destination: Option<String>,
     pub reasons: Vec<AskReason>,
     /// What "approve for session" would grant; empty when it is not offered (destructive
     /// commands).
@@ -511,9 +518,19 @@ impl PermissionGate {
                 .as_str()
                 .filter(|_| call.name == "bash")
                 .map(str::to_owned),
+            destination: None,
             reasons,
             grants: grants.clone(),
         };
+        self.ask(request, cancel).await
+    }
+
+    pub(crate) async fn ask(
+        &self,
+        request: PermissionRequest,
+        cancel: &CancellationToken,
+    ) -> ToolCallDecision {
+        let grants = request.grants.clone();
         let decision = tokio::select! {
             decision = self.approver.approve(request) => decision,
             () = cancel.cancelled() => return aborted(),

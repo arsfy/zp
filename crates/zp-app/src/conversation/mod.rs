@@ -232,6 +232,8 @@ pub struct ConversationView {
     turn_changes: RefCell<HashMap<usize, Option<Rc<files::TurnChanges>>>>,
     /// Rows whose full list of changed files is open.
     turn_files_expanded: HashSet<usize>,
+    /// Subagent calls whose whole conclusion is shown.
+    full_subagent_results: HashSet<String>,
     change_log_cache: RefCell<Option<zp_core::changes::ChangeLog>>,
     /// Tool calls waiting for the user.
     approvals: Vec<permissions::Approval>,
@@ -350,6 +352,7 @@ impl ConversationView {
             tool_diffs: RefCell::default(),
             turn_changes: RefCell::default(),
             turn_files_expanded: HashSet::new(),
+            full_subagent_results: HashSet::new(),
             change_log_cache: RefCell::default(),
             approvals: Vec::new(),
             questions: Vec::new(),
@@ -424,6 +427,7 @@ impl ConversationView {
             .compaction
             .unwrap_or_default();
         options.tools = Some(crate::mcp::project_tools(&self.root, cx));
+        options.subagents = crate::approvals::project_subagents(&self.root, cx);
         let (approval_sender, mut approval_receiver) = futures::channel::mpsc::unbounded();
         options.permissions = Some(Arc::new(zp_core::permissions::PermissionGate::new(
             crate::approvals::project_policy(&self.root, cx),
@@ -1520,6 +1524,7 @@ impl ConversationView {
         let Some(coding) = self.coding.clone() else {
             return;
         };
+        coding.set_subagents(crate::approvals::project_subagents(&self.root, cx));
         if let Some(model) = coding.agent().model() {
             AppModels::remember_model(&model, cx);
         }

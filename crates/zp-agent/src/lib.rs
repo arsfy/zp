@@ -31,4 +31,4 @@ pub use hooks::{
 };
 pub use message::{AgentMessage, CustomMessage, CustomRole, default_convert_to_llm};
 pub use schema::validate_arguments;
-pub use tool::{AgentTool, AgentToolResult, ToolContext, ToolExecutionMode};
+pub use tool::{AgentTool, AgentToolResult, ToolContext, ToolExecutionMode, ToolRun};

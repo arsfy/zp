@@ -170,6 +170,9 @@ pub(crate) async fn run(models: &Models, args: RunArgs) -> Result<()> {
     }
     // `ask` is added below when there is a terminal to answer on.
     let mut ask = !args.no_tools;
+    let mut delegate = !args.no_tools && args.tools.is_none();
+    // `subagent` named in `--tools`, so the user expects it.
+    let mut delegate_requested = false;
     let tools = if args.no_tools {
         Some(Vec::new())
     } else if let Some(names) = &args.tools {
@@ -180,9 +183,14 @@ pub(crate) async fn run(models: &Models, args: RunArgs) -> Result<()> {
                 ask = true;
                 continue;
             }
+            if name == zp_core::subagents::TOOL_NAME {
+                delegate = true;
+                delegate_requested = true;
+                continue;
+            }
             tools.push(zp_tools::create_tool(name, &cwd).with_context(|| {
                 format!(
-                    "unknown tool `{name}` (available: {}, ask)",
+                    "unknown tool `{name}` (available: {}, ask, subagent)",
                     zp_tools::ALL_TOOLS.join(", ")
                 )
             })?);
@@ -215,6 +223,15 @@ pub(crate) async fn run(models: &Models, args: RunArgs) -> Result<()> {
         .trusted
         != Some(false);
     let settings = ProjectSettings::load(Some(&data_dir), &cwd, trusted);
+    if delegate {
+        options.subagents = settings.subagents();
+        if delegate_requested && !options.subagents.is_usable() {
+            eprintln!(
+                "warning: the subagent tool is not available: enable subagents (and add a task \
+                 profile when using task profiles) in the settings"
+            );
+        }
+    }
     let policy = settings.permission_policy(&cwd, args.permissions);
     // Approvals read the same stdin as the interactive prompt.
     let input: Option<InputLines> = std::io::stdin().is_terminal().then(|| {

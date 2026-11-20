@@ -314,6 +314,15 @@ impl Transcript {
                 changes.usage = true;
             }
             AgentMessage::Llm(Message::ToolResult(result)) => {
+                if result.tool_name == zp_core::subagents::TOOL_NAME
+                    && let Some(report) = result
+                        .details
+                        .as_ref()
+                        .and_then(zp_core::subagents::Report::from_details)
+                {
+                    self.usage.add_subagent(&report.usage);
+                    changes.usage = true;
+                }
                 let state = ToolState {
                     status: if result.is_error {
                         ToolStatus::Error
@@ -398,6 +407,9 @@ impl Transcript {
             } => {
                 if let Some(state) = self.tools.get_mut(tool_call_id) {
                     state.output = text_of(&partial_result.content);
+                    if partial_result.details.is_some() {
+                        state.details.clone_from(&partial_result.details);
+                    }
                 }
                 self.touch_tool(tool_call_id, changes);
             }

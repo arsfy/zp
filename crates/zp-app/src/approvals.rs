@@ -94,6 +94,22 @@ pub fn is_trusted(root: &Path, cx: &App) -> bool {
     AppStore::state(cx).project(root).trusted == Some(true)
 }
 
+/// The delegation policy of the project at `root`: the personal settings, restricted by
+/// the project's settings when it is trusted.
+pub fn project_subagents(root: &Path, cx: &App) -> zp_core::subagents::SubagentSettings {
+    let project = is_trusted(root, cx).then(|| {
+        zp_core::settings::Settings::load_or_default(&zp_core::settings::project_settings_file(
+            root,
+        ))
+    });
+    zp_core::subagents::SubagentSettings::effective(
+        crate::store::AppSettings::get(cx).subagents.as_ref(),
+        project
+            .as_ref()
+            .and_then(|settings| settings.subagents.as_ref()),
+    )
+}
+
 /// The permission policy of the project at `root`: the mode chosen for it in the app,
 /// else the project's settings (if trusted), else the global settings.
 pub fn project_policy(root: &Path, cx: &App) -> PermissionPolicy {

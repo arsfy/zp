@@ -50,6 +50,96 @@ fn transcript_display_settings_are_saved_and_applied(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+fn subagent_assignment_modes_can_be_switched_in_settings(cx: &mut TestAppContext) {
+    use zp_ai::FauxResponse;
+    use zp_core::subagents::{Approval, Assignment, Profile, Report};
+
+    let faux = FauxProvider::default();
+    let child = FauxProvider::new("child");
+    let data = setup_models(cx, &[&faux, &child], false);
+    let (_dir, project) = project_dir();
+    let window = open(cx, &project);
+    let conversation = active(window, cx);
+    let settings = settings_window(Page::Subagents, cx);
+    let click = |selector, cx: &mut TestAppContext| {
+        let mut visual = VisualTestContext::from_window(settings.into(), cx);
+        let bounds = visual
+            .debug_bounds(selector)
+            .expect("settings control is visible");
+        visual.simulate_click(bounds.center(), Modifiers::none());
+        cx.run_until_parked();
+    };
+
+    click("enable-subagents", cx);
+    assert!(saved(&data).subagents.unwrap().is_enabled());
+    cx.update(|cx| {
+        AppSettings::update(cx, |settings| {
+            let settings = settings.subagents.as_mut().unwrap();
+            settings.approval = Some(Approval::Allowlisted);
+            settings.default_profile = Some("explore".into());
+            settings.profiles.insert(
+                "explore".into(),
+                Profile {
+                    model: child.model().qualified_id(),
+                    description: "Find code".into(),
+                    thinking: ThinkingLevel::Low,
+                },
+            );
+        })
+        .unwrap()
+    });
+    click("task-profiles", cx);
+    assert_eq!(
+        saved(&data).subagents.unwrap().assignment(),
+        Assignment::TaskProfiles
+    );
+    faux.push(FauxResponse::tool_call(
+        "subagent",
+        serde_json::json!({"task": "Find code"}),
+    ));
+    child.push(FauxResponse::text("Found code in the workspace"));
+    faux.push(FauxResponse::text("Done"));
+    crate::tests_conversation::send(window, "Use a profile", cx);
+    crate::tests_conversation::idle(&conversation, 3, cx);
+    let report = conversation.read_with(cx, |view, _| {
+        let call = view
+            .transcript()
+            .assistant(1)
+            .unwrap()
+            .tool_calls()
+            .next()
+            .unwrap();
+        Report::from_details(
+            view.transcript()
+                .tool(&call.id)
+                .unwrap()
+                .details
+                .as_ref()
+                .unwrap(),
+        )
+        .unwrap()
+    });
+    assert_eq!(report.model, "child/faux-1");
+    assert_eq!(
+        conversation.read_with(cx, |view, _| view.status().usage.input),
+        30
+    );
+
+    click("follow-main-model", cx);
+    assert_eq!(
+        saved(&data).subagents.unwrap().assignment(),
+        Assignment::FollowMainModel
+    );
+    assert!(
+        saved(&data)
+            .subagents
+            .unwrap()
+            .profiles
+            .contains_key("explore")
+    );
+}
+
+#[gpui::test]
 fn one_settings_window(cx: &mut TestAppContext) {
     let faux = FauxProvider::default();
     let _data = setup_models(cx, &[&faux], false);
@@ -842,4 +932,103 @@ fn signing_in_to_providers(cx: &mut TestAppContext) {
         .update(cx, |view, _, cx| view.sign_out("openai-codex", cx))
         .unwrap();
     assert!(!models.is_signed_in("openai-codex"));
+}
+
+#[gpui::test]
+fn subagent_limits_apply_as_typed_and_profiles_keep_their_model_when_edited(
+    cx: &mut TestAppContext,
+) {
+    use zp_core::subagents::{Assignment, Profile};
+
+    let faux = FauxProvider::default();
+    let data = setup_models(cx, &[&faux], false);
+    cx.update(|cx| {
+        AppSettings::update(cx, |settings| {
+            let subagents = settings.subagents.get_or_insert_default();
+            subagents.enabled = Some(true);
+            subagents.assignment = Some(Assignment::TaskProfiles);
+            subagents.profiles.insert(
+                "explore".into(),
+                Profile {
+                    model: "gone/model".into(),
+                    description: "Find code".into(),
+                    thinking: ThinkingLevel::Low,
+                },
+            );
+        })
+        .unwrap()
+    });
+    let window = settings_window(Page::Subagents, cx);
+    let fields = window
+        .update(cx, |view, _, _| view.subagent_fields())
+        .unwrap();
+    let (id, purpose, concurrency, requests, timeout, output_tokens) = (
+        &fields[0], &fields[1], &fields[2], &fields[4], &fields[5], &fields[6],
+    );
+    let set = |field: &gpui::Entity<gpui_elements::editable_text::EditableTextState>,
+               text: &str,
+               cx: &mut TestAppContext| {
+        field.update(cx, |field, cx| field.emplace(text, cx));
+        cx.run_until_parked();
+    };
+    let notice = |cx: &mut TestAppContext| {
+        window
+            .update(cx, |view, _, _| view.notice().cloned())
+            .unwrap()
+    };
+
+    set(output_tokens, "64000", cx);
+    assert_eq!(
+        saved(&data).subagents.unwrap().max_output_tokens,
+        Some(64_000)
+    );
+    set(output_tokens, "", cx);
+    assert_eq!(
+        saved(&data).subagents.unwrap().max_output_tokens,
+        None,
+        "empty uses the model's own limit"
+    );
+    // Request and time limits are optional too: none by default, empty removes them.
+    assert_eq!(
+        requests.read_with(cx, |field, _| field.as_str().to_owned()),
+        ""
+    );
+    set(timeout, "600", cx);
+    assert_eq!(saved(&data).subagents.unwrap().timeout_seconds, Some(600));
+    set(timeout, "", cx);
+    assert_eq!(saved(&data).subagents.unwrap().timeout_seconds, None);
+    set(requests, "0", cx);
+    assert!(notice(cx).is_some_and(|(text, _)| text.contains("or empty for no limit")));
+    set(requests, "20", cx);
+    assert_eq!(
+        saved(&data).subagents.unwrap().max_model_requests_per_task,
+        Some(20)
+    );
+    set(concurrency, "", cx);
+    assert!(notice(cx).is_none(), "an emptied field is being retyped");
+    set(concurrency, "99", cx);
+    assert!(notice(cx).is_some_and(|(text, error)| error && text.contains("Parallel tasks")));
+    assert_eq!(saved(&data).subagents.unwrap().max_concurrent, None);
+    set(concurrency, "3", cx);
+    assert!(notice(cx).is_none());
+    assert_eq!(saved(&data).subagents.unwrap().max_concurrent, Some(3));
+
+    // Editing an existing profile saves its purpose and keeps its (now unavailable) model.
+    set(id, "explore", cx);
+    set(purpose, "Find code and tests", cx);
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    // Tall enough to show the form without scrolling.
+    visual.simulate_resize(gpui::size(gpui::px(980.), gpui::px(1400.)));
+    let save = visual.debug_bounds("save-subagent-profile").unwrap();
+    visual.simulate_click(save.center(), Modifiers::none());
+    cx.run_until_parked();
+    let profile = saved(&data).subagents.unwrap().profiles["explore"].clone();
+    assert_eq!(
+        (profile.model.as_str(), profile.description.as_str()),
+        ("gone/model", "Find code and tests")
+    );
+    assert!(
+        id.read_with(cx, |id, _| id.as_str().is_empty()),
+        "the form is cleared"
+    );
 }

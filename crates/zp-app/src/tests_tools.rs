@@ -181,3 +181,59 @@ fn single_choice_answers_on_click_and_skip_dismisses(cx: &mut TestAppContext) {
     assert_eq!(results[0], "Q: Ship it?\nA: Yes");
     assert!(results[1].starts_with("The user dismissed the questions"));
 }
+
+#[gpui::test]
+fn a_subagent_card_stays_open_while_it_runs_and_a_cancelled_one_does_not_count_as_failed(
+    cx: &mut TestAppContext,
+) {
+    use zp_core::subagents::{Approval, Report, Status, SubagentSettings};
+
+    let faux = FauxProvider::default().with_chunk_delay(std::time::Duration::from_millis(50));
+    faux.push(FauxResponse::tool_call(
+        "subagent",
+        json!({"task": "Find where add() is tested"}),
+    ));
+    // The child (on the main model) streams slowly enough to be cancelled.
+    faux.push(FauxResponse::text("word ".repeat(200)));
+    faux.push(FauxResponse::text("Done"));
+    let _data = setup_models(cx, &[&faux], false);
+    cx.update(|cx| {
+        crate::store::AppSettings::update(cx, |settings| {
+            settings.subagents = Some(SubagentSettings {
+                enabled: Some(true),
+                approval: Some(Approval::Allowlisted),
+                ..SubagentSettings::default()
+            });
+        })
+        .unwrap()
+    });
+    let (_dir, project) = project_dir();
+    let window = open(cx, &project);
+    let conversation = active(window, cx);
+    send(window, "Delegate it", cx);
+    let report = |cx: &mut TestAppContext| {
+        conversation.read_with(cx, |view, _| {
+            let call = view.transcript().assistant(1)?.tool_calls().next()?.clone();
+            let details = view.transcript().tool(&call.id)?.details.clone()?;
+            Some((call, Report::from_details(&details)?))
+        })
+    };
+    wait_until(cx, |cx| {
+        report(cx).is_some_and(|(_, report)| report.status == Status::Running)
+    });
+    let (call, _) = report(cx).unwrap();
+    assert!(
+        conversation.update(cx, |view, cx| view.tool_is_expanded(1, &call, false, cx)),
+        "open while running, though other tools are collapsed"
+    );
+
+    click(window, "subagent-cancel", cx);
+    idle(&conversation, 3, cx);
+    assert_eq!(report(cx).unwrap().1.status, Status::Cancelled);
+    cx.executor()
+        .advance_clock(crate::conversation::MIN_EXPANDED);
+    assert!(
+        !conversation.update(cx, |view, cx| view.tool_is_expanded(1, &call, false, cx)),
+        "a cancelled task is not opened like a failure"
+    );
+}

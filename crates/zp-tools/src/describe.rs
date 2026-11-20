@@ -42,6 +42,7 @@ pub fn describe_call(tool: &str, args: &Value, max_chars: usize) -> String {
             .and_then(|question| question["question"].as_str())
             .unwrap_or_default()
             .to_owned(),
+        "subagent" => field("task").to_owned(),
         _ => args.to_string(),
     };
     shorten(&summary, max_chars)

@@ -36,6 +36,8 @@ impl ToolCallDecision {
 /// The call being decided by [`AgentHooks::before_tool_call`].
 #[derive(Clone, Copy, Debug)]
 pub struct BeforeToolCall<'a> {
+    /// The model and identity captured when the run started.
+    pub run: &'a crate::ToolRun,
     /// The assistant message that requested the call.
     pub assistant_message: &'a AssistantMessage,
     /// The raw call.

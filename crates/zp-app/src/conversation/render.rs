@@ -32,11 +32,38 @@ use crate::ui::{
     TAB_WIDTH, TERMINAL_TAB_WIDTH, baseline_shift, disclosure_icon, expand_tabs,
     model_display_name, ui_font,
 };
+use zp_core::settings::BlockDisplay;
+use zp_core::subagents::Status as SubagentStatus;
 
 /// Readable width of the transcript and composer.
 const CONTENT_WIDTH: f32 = 820.0;
 /// Lines of tool output shown in an expanded card.
 const OUTPUT_PREVIEW_LINES: usize = 30;
+/// Lines of a subagent's conclusion shown before "Show all".
+const SUBAGENT_PREVIEW_LINES: usize = 24;
+
+/// What a finished subagent took: time, model requests, tokens and cost, leaving out
+/// what is zero.
+fn subagent_stats(report: &zp_core::subagents::Report) -> Option<String> {
+    let usage = &report.usage;
+    let tokens = usage.input + usage.output + usage.cache_read + usage.cache_write;
+    let mut parts = Vec::new();
+    if report.elapsed_ms >= 1000 {
+        parts.push(format_elapsed(report.elapsed_ms / 1000));
+    }
+    match report.model_requests {
+        0 => {}
+        1 => parts.push("1 model request".to_owned()),
+        count => parts.push(format!("{count} model requests")),
+    }
+    if tokens > 0 {
+        parts.push(format!("{} tokens", crate::ui::format_tokens(tokens)));
+    }
+    if usage.cost > 0. {
+        parts.push(format!("${:.4}", usage.cost));
+    }
+    (!parts.is_empty()).then(|| parts.join(" · "))
+}
 /// Diff rows shown under a tool card.
 const INLINE_DIFF_ROWS: usize = 40;
 /// Changed files initially shown in a completed answer.
@@ -969,17 +996,37 @@ impl ConversationView {
             Some(ToolStatus::Done | ToolStatus::Error) => false,
         };
         let display = AppSettings::transcript(cx);
-        let kind = if changed_file || matches!(call.name.as_str(), "write" | "edit") {
+        let subagent = call.name == zp_core::subagents::TOOL_NAME;
+        let mut kind = if changed_file || matches!(call.name.as_str(), "write" | "edit") {
             display.file_edits()
         } else if call.name == "bash" {
             display.commands()
         } else {
             display.other_tools()
         };
-        if matches!(status, Some(ToolStatus::Error)) {
+        // A subagent stays open while it works, so its progress shows, whatever the
+        // settings say for other tools.
+        if subagent && kind == BlockDisplay::Collapsed {
+            kind = BlockDisplay::WhileRunning;
+        }
+        // Failures open, but not a subagent the user cancelled.
+        let cancelled = subagent
+            && self
+                .subagent_report(&call.id)
+                .is_some_and(|report| report.status == SubagentStatus::Cancelled);
+        if matches!(status, Some(ToolStatus::Error)) && !cancelled {
             return true;
         }
         self.open_while_in_progress(super::HeldBlock::Tool(call.id.clone()), kind, running, cx)
+    }
+
+    /// The report of subagent call `id`, while it runs and once it is done.
+    fn subagent_report(&self, id: &str) -> Option<zp_core::subagents::Report> {
+        self.transcript
+            .tool(id)?
+            .details
+            .as_ref()
+            .and_then(zp_core::subagents::Report::from_details)
     }
 
     fn render_tool(&self, row: usize, call: &ToolCall, cx: &mut Context<Self>) -> AnyElement {
@@ -987,6 +1034,11 @@ impl ConversationView {
         let mono = cx.theme().metrics.mono_font.clone();
         let state = self.transcript.tool(&call.id);
         let status = state.map(|state| state.status);
+        let is_subagent = call.name == zp_core::subagents::TOOL_NAME;
+        let subagent = is_subagent
+            .then(|| self.subagent_report(&call.id))
+            .flatten();
+        let subagent_status = subagent.as_ref().map(|report| report.status);
         let change = state
             .filter(|state| state.status == ToolStatus::Done)
             .and_then(|state| state.details.as_ref())
@@ -999,13 +1051,19 @@ impl ConversationView {
 
         let approval = self.render_approval(&call.id, cx);
         let question = self.render_questions(&call.id, cx);
-        let (status_text, status_color) = match status {
-            _ if approval.is_some() => ("awaiting approval".to_owned(), colors.warning),
-            _ if question.is_some() => ("waiting for you".to_owned(), colors.accent),
-            None => ("pending".to_owned(), colors.text_muted),
-            Some(ToolStatus::Running) => ("running…".to_owned(), colors.accent),
-            Some(ToolStatus::Done) => ("done".to_owned(), colors.success),
-            Some(ToolStatus::Error) => ("failed".to_owned(), colors.error),
+        let (status_text, status_color) = match (status, subagent_status) {
+            _ if approval.is_some() => ("awaiting approval", colors.warning),
+            _ if question.is_some() => ("waiting for you", colors.accent),
+            (_, Some(SubagentStatus::Queued)) => ("queued", colors.text_muted),
+            (_, Some(SubagentStatus::Truncated)) => ("truncated", colors.warning),
+            (_, Some(SubagentStatus::Cancelled)) => ("cancelled", colors.text_muted),
+            (_, Some(SubagentStatus::TimedOut)) => ("timed out", colors.warning),
+            (_, Some(SubagentStatus::RequestLimit)) => ("request limit", colors.warning),
+            (None, _) if is_subagent && !self.is_busy() => ("interrupted", colors.text_muted),
+            (None, _) => ("pending", colors.text_muted),
+            (Some(ToolStatus::Running), _) => ("running…", colors.accent),
+            (Some(ToolStatus::Done), _) => ("done", colors.success),
+            (Some(ToolStatus::Error), _) => ("failed", colors.error),
         };
         let status_label = if let Some(change) = change.as_ref().filter(|_| approval.is_none()) {
             div()
@@ -1083,6 +1141,26 @@ impl ConversationView {
                     .text_size(small)
                     .child(status_label),
             )
+            .when_some(
+                subagent_status.filter(|status| status.is_active()),
+                |header, _| {
+                    let id = call.id.clone();
+                    header.child(
+                        ghost_button(
+                            ElementId::Name(format!("cancel-subagent-{id}").into()),
+                            "Cancel",
+                            cx,
+                        )
+                        .debug_selector(|| "subagent-cancel".into())
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            cx.stop_propagation();
+                            if let Some(coding) = &this.coding {
+                                coding.cancel_subagent(&id);
+                            }
+                        })),
+                    )
+                },
+            )
             .when(reverted, |header| {
                 header.child(
                     div()
@@ -1129,7 +1207,7 @@ impl ConversationView {
 
         let waiting = approval.is_some() || question.is_some();
         let content = collapsible(&openness, || {
-            self.render_tool_body(call, change.as_ref(), waiting, question.is_some(), cx)
+            self.render_tool_body(row, call, change.as_ref(), waiting, question.is_some(), cx)
         });
 
         div()
@@ -1137,10 +1215,18 @@ impl ConversationView {
             .flex_col()
             .rounded(px(6.))
             .border_1()
-            .border_color(if matches!(status, Some(ToolStatus::Error)) {
-                colors.error
-            } else {
-                colors.border
+            .border_color(match (status, subagent_status) {
+                (_, Some(SubagentStatus::Cancelled)) => colors.border,
+                (
+                    _,
+                    Some(
+                        SubagentStatus::Truncated
+                        | SubagentStatus::TimedOut
+                        | SubagentStatus::RequestLimit,
+                    ),
+                ) => colors.warning,
+                (Some(ToolStatus::Error), _) => colors.error,
+                _ => colors.border,
             })
             .bg(colors.surface)
             .overflow_hidden()
@@ -1157,6 +1243,7 @@ impl ConversationView {
     /// tool's own details, or its output.
     fn render_tool_body(
         &self,
+        row: usize,
         call: &ToolCall,
         change: Option<&RecordedChange>,
         waiting: bool,
@@ -1167,6 +1254,12 @@ impl ConversationView {
         let mono = cx.theme().metrics.mono_font.clone();
         let state = self.transcript.tool(&call.id);
         let status = state.map(|state| state.status);
+        if call.name == zp_core::subagents::TOOL_NAME
+            && let Some(state) = state
+            && let Some(report) = self.subagent_report(&call.id)
+        {
+            return Some(self.render_subagent_body(row, call, &state.output, &report, cx));
+        }
         if let Some(change) = change {
             return Some(self.render_inline_diff(&call.id, change, cx));
         }
@@ -1232,6 +1325,108 @@ impl ConversationView {
                 })
                 .into_any_element()
         })
+    }
+
+    /// A subagent's card: its model and progress while it works; then what the run took
+    /// and its conclusion as Markdown (long conclusions start shortened).
+    fn render_subagent_body(
+        &self,
+        row: usize,
+        call: &ToolCall,
+        output: &str,
+        report: &zp_core::subagents::Report,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let colors = cx.theme().colors.clone();
+        let model = match &report.profile {
+            Some(profile) => format!("{profile} · {}", report.model),
+            None => report.model.clone(),
+        };
+        let body = div()
+            .px_3()
+            .py_2()
+            .border_t_1()
+            .border_color(colors.border)
+            .flex()
+            .flex_col()
+            .gap_1()
+            .text_size(px(12.))
+            .child(div().text_color(colors.text_muted).child(model));
+        if report.status.is_active() {
+            return body
+                .child(div().text_color(colors.text_muted).child(output.to_owned()))
+                .into_any_element();
+        }
+        let body = body.children(
+            subagent_stats(report).map(|stats| div().text_color(colors.text_muted).child(stats)),
+        );
+        let concluded = matches!(
+            report.status,
+            SubagentStatus::Completed | SubagentStatus::Truncated
+        );
+        if !concluded {
+            return body
+                .child(div().whitespace_normal().child(output.to_owned()))
+                .into_any_element();
+        }
+        let lines = output.lines().count();
+        let full = self.full_subagent_results.contains(&call.id);
+        let shown = if full || lines <= SUBAGENT_PREVIEW_LINES {
+            output.to_owned()
+        } else {
+            output
+                .lines()
+                .take(SUBAGENT_PREVIEW_LINES)
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        // The call's block in the message, so selections across the row stay in order.
+        let block = self
+            .transcript
+            .assistant(row)
+            .and_then(|message| {
+                message.content.iter().position(
+                    |content| matches!(content, AssistantContent::ToolCall(c) if c.id == call.id),
+                )
+            })
+            .unwrap_or_default();
+        let blocks = self.parsed_markdown(&shown);
+        let mut ids = IdGen::new(
+            format!("subagent-md-{}", call.id),
+            (row, block),
+            self.text_selection.clone(),
+        );
+        let markdown = render_markdown(&blocks, &MarkdownStyle::from_theme(cx), &mut ids);
+        let toggle = (lines > SUBAGENT_PREVIEW_LINES).then(|| {
+            let id = call.id.clone();
+            div()
+                .id(ElementId::Name(format!("subagent-more-{}", call.id).into()))
+                .debug_selector(|| "subagent-show-more".into())
+                .cursor_pointer()
+                .text_color(colors.text_muted)
+                .hover_style(|s| s.text_color(colors.text))
+                .child(if full {
+                    "Show less".to_owned()
+                } else {
+                    format!("Show all {lines} lines")
+                })
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    cx.stop_propagation();
+                    if !this.full_subagent_results.remove(&id) {
+                        this.full_subagent_results.insert(id.clone());
+                    }
+                    this.list_state.remeasure_items(row..row + 1);
+                    cx.notify();
+                }))
+        });
+        body.child(
+            div()
+                .pt_1()
+                .text_size(cx.theme().metrics.font_size)
+                .child(markdown),
+        )
+        .children(toggle)
+        .into_any_element()
     }
 
     /// The diff of a file change under its tool card (the first lines; the rest in the

@@ -23,7 +23,9 @@ use crate::agent_loop::{
 use crate::event::AgentEvent;
 use crate::hooks::{AgentHooks, NoHooks};
 use crate::message::{AgentMessage, CustomMessage};
-use crate::tool::{AgentTool, ToolExecutionMode};
+use crate::tool::{AgentTool, ToolExecutionMode, ToolRun};
+
+static NEXT_RUN_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Adapts [`Models`] (credential resolution and provider routing) into a [`StreamFn`].
 pub fn stream_fn(models: Models) -> StreamFn {
@@ -463,6 +465,14 @@ impl Agent {
         lock(&self.shared.state).tools = tools;
     }
 
+    /// Replaces the tools and their hooks together for future runs.
+    pub fn set_tools_and_hooks(&self, tools: Vec<Arc<dyn AgentTool>>, hooks: Arc<dyn AgentHooks>) {
+        let mut state = lock(&self.shared.state);
+        let mut settings = lock(&self.shared.settings);
+        state.tools = tools;
+        settings.hooks = hooks;
+    }
+
     /// Sets the hooks for future runs.
     pub fn set_hooks(&self, hooks: Arc<dyn AgentHooks>) {
         lock(&self.shared.settings).hooks = hooks;
@@ -647,11 +657,21 @@ impl Agent {
         &self,
         input: impl Into<PromptInput>,
     ) -> Result<Vec<AgentMessage>, AgentError> {
+        self.prompt_with_cancel(input, CancellationToken::new())
+            .await
+    }
+
+    /// Runs a prompt with a supplied cancellation token, for a scoped child agent.
+    pub async fn prompt_with_cancel(
+        &self,
+        input: impl Into<PromptInput>,
+        cancel: CancellationToken,
+    ) -> Result<Vec<AgentMessage>, AgentError> {
         let PromptInput(messages) = input.into();
         if messages.is_empty() {
             return Err(AgentError::EmptyPrompt);
         }
-        let guard = self.begin_run()?;
+        let guard = self.begin_run(cancel)?;
         Ok(self.execute(guard, messages, false).await)
     }
 
@@ -659,7 +679,7 @@ impl Agent {
     /// last message is from the assistant, queued steering (or else follow-up) messages
     /// are used as the prompt.
     pub async fn continue_run(&self) -> Result<Vec<AgentMessage>, AgentError> {
-        let guard = self.begin_run()?;
+        let guard = self.begin_run(CancellationToken::new())?;
         let last_is_assistant = {
             let state = lock(&self.shared.state);
             match state.messages.last() {
@@ -681,8 +701,7 @@ impl Agent {
         Err(AgentError::CannotContinueFromAssistant)
     }
 
-    fn begin_run(&self) -> Result<RunGuard, AgentError> {
-        let cancel = CancellationToken::new();
+    fn begin_run(&self, cancel: CancellationToken) -> Result<RunGuard, AgentError> {
         {
             let mut state = lock(&self.shared.state);
             if state.run.is_some() {
@@ -712,9 +731,12 @@ impl Agent {
             let state = lock(&self.shared.state);
             let settings = lock(&self.shared.settings);
             let config = LoopConfig {
-                // Checked by `begin_run`; a model cannot be unset.
-                model: state.model.clone().expect("a run has a model"),
-                thinking_level: state.thinking_level,
+                run: Arc::new(ToolRun {
+                    id: NEXT_RUN_ID.fetch_add(1, Ordering::Relaxed),
+                    // Checked by `begin_run`; a model cannot be unset.
+                    model: state.model.clone().expect("a run has a model"),
+                    thinking_level: state.thinking_level,
+                }),
                 system_prompt: state.system_prompt.clone(),
                 tools: state.tools.clone(),
                 tool_execution: settings.tool_execution,
@@ -764,7 +786,7 @@ impl Agent {
                 };
                 let error = format!("agent loop panicked: {}", panic_message(panic.as_ref()));
                 tracing::error!(%error);
-                let message = failed_message(&config.model, reason, &error);
+                let message = failed_message(&config.run.model, reason, &error);
                 emit(AgentEvent::MessageStart {
                     message: message.clone().into(),
                 });

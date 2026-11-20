@@ -17,6 +17,7 @@ pub enum ReviewModelEvent {
 }
 
 pub struct ReviewModelPicker {
+    title: &'static str,
     filter: Entity<EditableTextState>,
     current: Option<String>,
     selected: usize,
@@ -28,6 +29,15 @@ impl EventEmitter<ReviewModelEvent> for ReviewModelPicker {}
 
 impl ReviewModelPicker {
     pub fn new(current: Option<String>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        Self::with_title("Review model", current, window, cx)
+    }
+
+    pub fn with_title(
+        title: &'static str,
+        current: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let filter = cx.new(|cx| EditableTextState::new(StringStorage::default(), cx));
         let scroll = ScrollHandle::new();
         let changed = cx.subscribe(&filter, |this, _, _: &TextChanged, cx| {
@@ -37,6 +47,7 @@ impl ReviewModelPicker {
         });
         filter.read(cx).focus_handle(cx).focus(window, cx);
         let mut this = Self {
+            title,
             filter,
             current,
             selected: 0,
@@ -155,7 +166,7 @@ impl Render for ReviewModelPicker {
                     .bg(colors.surface)
                     .shadow_lg()
                     .text_size(font_size)
-                    .child(div().flex_shrink_0().child("Review model"))
+                    .child(div().flex_shrink_0().child(self.title))
                     .child(
                         text_input("review-model-filter")
                             .state(self.filter.downgrade())

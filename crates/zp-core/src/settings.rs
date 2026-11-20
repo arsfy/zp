@@ -155,6 +155,9 @@ pub struct Settings {
     #[serde(skip_serializing_if = "TranscriptSettings::is_default")]
     pub transcript: TranscriptSettings,
     pub permissions: PermissionSettings,
+    /// Optional read-only delegation and model assignments.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subagents: Option<crate::subagents::SubagentSettings>,
     /// System notifications for background conversations (default on).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub notifications: Option<bool>,
@@ -226,6 +229,16 @@ pub struct ProjectSettings {
 }
 
 impl ProjectSettings {
+    /// The delegation policy: personal settings, restricted by the project's.
+    pub fn subagents(&self) -> crate::subagents::SubagentSettings {
+        crate::subagents::SubagentSettings::effective(
+            self.global.subagents.as_ref(),
+            self.project
+                .as_ref()
+                .and_then(|project| project.subagents.as_ref()),
+        )
+    }
+
     /// Loads the global settings from `data_dir` and, if `trusted`, the project's.
     pub fn load(data_dir: Option<&Path>, root: &Path, trusted: bool) -> Self {
         let global = data_dir

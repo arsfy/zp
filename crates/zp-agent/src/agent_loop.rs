@@ -16,14 +16,14 @@ use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 use zp_ai::{
     AssistantMessage, AssistantMessageEvent, AssistantMessageStream, Context, Model, StopReason,
-    StreamOptions, ThinkingLevel, Tool, ToolCall, ToolResultMessage, now_ms,
+    StreamOptions, Tool, ToolCall, ToolResultMessage, now_ms,
 };
 
 use crate::event::AgentEvent;
 use crate::hooks::{AfterToolCall, AgentHooks, BeforeToolCall, ToolCallDecision};
 use crate::message::AgentMessage;
 use crate::schema::validate_arguments;
-use crate::tool::{AgentTool, AgentToolResult, ToolContext, ToolExecutionMode};
+use crate::tool::{AgentTool, AgentToolResult, ToolContext, ToolExecutionMode, ToolRun};
 
 /// Produces a response stream; [`crate::stream_fn`] adapts [`zp_ai::Models`].
 pub type StreamFn =
@@ -37,8 +37,7 @@ const TOOL_ABORTED: &str = "Operation aborted";
 
 /// Everything a run needs, captured when it starts.
 pub(crate) struct LoopConfig {
-    pub model: Model,
-    pub thinking_level: ThinkingLevel,
+    pub run: Arc<ToolRun>,
     pub system_prompt: Option<String>,
     pub tools: Vec<Arc<dyn AgentTool>>,
     pub tool_execution: ToolExecutionMode,
@@ -193,7 +192,7 @@ async fn stream_response(
     };
     if cancel.is_cancelled() {
         return finish(
-            failed_message(&config.model, StopReason::Aborted, ABORTED),
+            failed_message(&config.run.model, StopReason::Aborted, ABORTED),
             false,
         );
     }
@@ -208,12 +207,12 @@ async fn stream_response(
         tools: declarations.to_vec(),
     };
     let options = StreamOptions {
-        thinking: config.thinking_level,
+        thinking: config.run.thinking_level,
         cancel: cancel.clone(),
         ..config.request_options.clone()
     };
 
-    let mut stream = (config.stream)(&config.model, &request, options);
+    let mut stream = (config.stream)(&config.run.model, &request, options);
     let mut started = false;
     while let Some(event) = stream.next().await {
         match event {
@@ -236,7 +235,11 @@ async fn stream_response(
         StopReason::Error
     };
     finish(
-        failed_message(&config.model, reason, "response stream ended unexpectedly"),
+        failed_message(
+            &config.run.model,
+            reason,
+            "response stream ended unexpectedly",
+        ),
         started,
     )
 }
@@ -473,6 +476,7 @@ async fn prepare<'a>(
         .hooks
         .before_tool_call(
             BeforeToolCall {
+                run: &config.run,
                 assistant_message: message,
                 tool_call: call,
                 args: &args,
@@ -507,13 +511,18 @@ async fn execute(
     let ctx = {
         let emit = emit.clone();
         let (id, name) = (call.id.clone(), call.name.clone());
-        ToolContext::new(call.id.clone(), cancel.clone(), move |partial_result| {
-            emit(AgentEvent::ToolExecutionUpdate {
-                tool_call_id: id.clone(),
-                tool_name: name.clone(),
-                partial_result,
-            });
-        })
+        ToolContext::new(
+            call.id.clone(),
+            cancel.clone(),
+            Some(config.run.clone()),
+            move |partial_result| {
+                emit(AgentEvent::ToolExecutionUpdate {
+                    tool_call_id: id.clone(),
+                    tool_name: name.clone(),
+                    partial_result,
+                });
+            },
+        )
     };
     let started = Instant::now();
     let outcome = AssertUnwindSafe(async { tool.execute(args.clone(), ctx.clone()).await })

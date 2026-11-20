@@ -6,6 +6,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use anyhow::{Context as _, bail};
 use futures::future::BoxFuture;
+use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 use zp_agent::{
     AfterToolCall, Agent, AgentError, AgentEvent, AgentHooks, AgentMessage, AgentOptions,
@@ -19,6 +20,7 @@ use crate::checkpoint::{BlobStore, RecordedChange, store_tool_change};
 use crate::compaction::CompactionSettings;
 use crate::permissions::PermissionGate;
 use crate::resources::Resources;
+use crate::subagents::{self, SubagentSettings, SubagentTool};
 use crate::system_prompt::{SystemPromptOptions, build_system_prompt, load_context_files};
 
 const COMPACTION_PREFIX: &str = "The conversation history before this point was compacted into the following summary:\n\n<summary>\n";
@@ -36,6 +38,7 @@ pub struct CodingHooks {
     pub permissions: Option<Arc<PermissionGate>>,
     /// Resolves the model of a call (for auto-review).
     pub models: Models,
+    pub(crate) subagent: Option<Arc<SubagentTool>>,
 }
 
 impl AgentHooks for CodingHooks {
@@ -45,6 +48,11 @@ impl AgentHooks for CodingHooks {
         cancel: &'a CancellationToken,
     ) -> BoxFuture<'a, ToolCallDecision> {
         Box::pin(async move {
+            if call.tool_call.name == subagents::TOOL_NAME
+                && let Some(subagent) = &self.subagent
+            {
+                return subagent.prepare(call, cancel).await;
+            }
             let Some(gate) = &self.permissions else {
                 return ToolCallDecision::Allow;
             };
@@ -149,6 +157,8 @@ pub struct CodingSessionOptions {
     pub compaction: CompactionSettings,
     /// Prompt templates and skills.
     pub resources: Arc<Resources>,
+    /// The effective delegation policy.
+    pub subagents: SubagentSettings,
     /// Samples the active run clock when an assistant response finishes.
     pub response_elapsed_seconds: Option<Arc<dyn Fn() -> u64 + Send + Sync>>,
 }
@@ -173,6 +183,7 @@ impl CodingSessionOptions {
             trusted: true,
             compaction: CompactionSettings::default(),
             resources: Arc::default(),
+            subagents: SubagentSettings::default(),
             response_elapsed_seconds: None,
         }
     }
@@ -185,7 +196,8 @@ pub fn session_model(models: &Models, session: &Session) -> Option<Model> {
 }
 
 /// Token and cost totals of a transcript.
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
 pub struct UsageTotals {
     /// Uncached input tokens.
     pub input: u64,
@@ -210,6 +222,15 @@ impl UsageTotals {
         self.cache_write += usage.cache_write;
         self.cost += usage.cost.total;
     }
+
+    /// Adds a child task without changing the main model's context size.
+    pub fn add_subagent(&mut self, child: &Self) {
+        self.input += child.input;
+        self.output += child.output;
+        self.cache_read += child.cache_read;
+        self.cache_write += child.cache_write;
+        self.cost += child.cost;
+    }
 }
 
 /// An agent bound to a project directory and a persisted session.
@@ -226,21 +247,43 @@ pub struct CodingSession {
     blobs: BlobStore,
     permissions: Option<Arc<PermissionGate>>,
     asker: Option<Arc<dyn zp_tools::Asker>>,
+    subagent: Mutex<Option<Arc<SubagentTool>>>,
     compaction: CompactionSettings,
     _persistence: Subscription,
 }
 
 /// `tools` plus `ask` when someone can answer.
-fn with_ask(
+fn with_session_tools(
     mut tools: Vec<Arc<dyn AgentTool>>,
     asker: Option<&Arc<dyn zp_tools::Asker>>,
+    subagent: Option<&Arc<SubagentTool>>,
 ) -> Vec<Arc<dyn AgentTool>> {
     if let Some(asker) = asker
         && !tools.iter().any(|tool| tool.name() == "ask")
     {
         tools.push(Arc::new(zp_tools::AskTool::new(asker.clone())));
     }
+    tools.retain(|tool| tool.name() != subagents::TOOL_NAME);
+    if let Some(subagent) = subagent {
+        tools.push(subagent.clone());
+    }
     tools
+}
+
+impl CodingHooks {
+    fn new(
+        blobs: &BlobStore,
+        permissions: Option<&Arc<PermissionGate>>,
+        models: &Models,
+        subagent: Option<&Arc<SubagentTool>>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            blobs: blobs.clone(),
+            permissions: permissions.cloned(),
+            models: models.clone(),
+            subagent: subagent.cloned(),
+        })
+    }
 }
 
 /// What the system prompt is built from (to rebuild it when trust, resources or tools
@@ -293,6 +336,7 @@ impl CodingSession {
             trusted,
             compaction,
             resources,
+            subagents,
             response_elapsed_seconds,
         } = options;
         let blobs = blobs.unwrap_or_else(BlobStore::in_memory);
@@ -311,9 +355,18 @@ impl CodingSession {
             session.append_thinking_level_change(thinking)?;
         }
 
-        let tools = with_ask(
+        let subagent = subagents.is_usable().then(|| {
+            Arc::new(SubagentTool::new(
+                cwd.clone(),
+                models.clone(),
+                subagents,
+                permissions.clone(),
+            ))
+        });
+        let tools = with_session_tools(
             tools.unwrap_or_else(|| zp_tools::coding_tools(&cwd)),
             asker.as_ref(),
+            subagent.as_ref(),
         );
         let context_files = context_files(&cwd, global_context_dir.as_deref(), trusted);
         let skills = resources.skills_prompt();
@@ -331,11 +384,8 @@ impl CodingSession {
         agent_options.system_prompt = Some(system_prompt.clone());
         agent_options.tools = tools;
         agent_options.messages = context.messages;
-        agent_options.hooks = Arc::new(CodingHooks {
-            blobs: blobs.clone(),
-            permissions: permissions.clone(),
-            models: models.clone(),
-        });
+        agent_options.hooks =
+            CodingHooks::new(&blobs, permissions.as_ref(), &models, subagent.as_ref());
         agent_options.request_options = StreamOptions {
             session_id: Some(session.id().to_owned()),
             ..request_options
@@ -376,6 +426,7 @@ impl CodingSession {
             blobs,
             permissions,
             asker,
+            subagent: Mutex::new(subagent),
             compaction,
             _persistence: persistence,
         })
@@ -505,8 +556,60 @@ impl CodingSession {
     /// Replaces the tools (e.g. MCP servers connected) and updates the system prompt;
     /// `ask` stays when there is an asker.
     pub fn set_tools(&self, tools: Vec<Arc<dyn AgentTool>>) {
-        self.agent.set_tools(with_ask(tools, self.asker.as_ref()));
+        let subagent = self.subagent.lock().unwrap_or_else(PoisonError::into_inner);
+        self.agent.set_tools(with_session_tools(
+            tools,
+            self.asker.as_ref(),
+            subagent.as_ref(),
+        ));
+        drop(subagent);
         self.rebuild_system_prompt();
+    }
+
+    /// Applies a new policy to future runs.
+    pub fn set_subagents(&self, settings: SubagentSettings) {
+        let enabled = settings.is_usable();
+        let mut current = self.subagent.lock().unwrap_or_else(PoisonError::into_inner);
+        if (enabled
+            && current
+                .as_ref()
+                .is_some_and(|tool| tool.settings() == &settings))
+            || (!enabled && current.is_none())
+        {
+            return;
+        }
+        *current = enabled.then(|| {
+            Arc::new(SubagentTool::new(
+                self.cwd.clone(),
+                self.models.clone(),
+                settings,
+                self.permissions.clone(),
+            ))
+        });
+        let tools = with_session_tools(self.agent.tools(), self.asker.as_ref(), current.as_ref());
+        self.agent.set_tools_and_hooks(
+            tools,
+            CodingHooks::new(
+                &self.blobs,
+                self.permissions.as_ref(),
+                &self.models,
+                current.as_ref(),
+            ),
+        );
+        drop(current);
+        self.rebuild_system_prompt();
+    }
+
+    /// Cancels a queued or running subagent.
+    pub fn cancel_subagent(&self, call_id: &str) {
+        if let Some(tool) = self
+            .subagent
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+        {
+            tool.cancel(call_id);
+        }
     }
 
     /// Expands a `/template` or `/skill:name` command; other input is returned as is.
@@ -755,6 +858,14 @@ impl CodingSession {
                 {
                     totals.last_context_tokens = assistant.usage.total_tokens;
                 }
+            } else if let Some(result) = message.as_tool_result()
+                && result.tool_name == subagents::TOOL_NAME
+                && let Some(report) = result
+                    .details
+                    .as_ref()
+                    .and_then(subagents::Report::from_details)
+            {
+                totals.add_subagent(&report.usage);
             }
         }
         totals

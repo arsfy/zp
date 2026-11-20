@@ -397,6 +397,9 @@ impl ConversationView {
             ToolKind::Edit if outside => "Change a file outside the project?",
             ToolKind::Edit => "Apply this change?",
             ToolKind::Read => "Read outside the project?",
+            ToolKind::Other if request.tool_name == zp_core::subagents::TOOL_NAME => {
+                "Start this subagent?"
+            }
             ToolKind::Interaction | ToolKind::Other => "Allow this tool call?",
         };
         let accent = if dangerous {
@@ -471,6 +474,7 @@ impl ConversationView {
                         })
                         .child(reason.describe())
                 }))
+                .children(subagent_request_details(request, cx))
                 .when_some(request.command.clone(), |this, command| {
                     this.child(
                         div()
@@ -543,4 +547,70 @@ impl ConversationView {
                 .into_any_element(),
         )
     }
+}
+
+/// What a subagent would receive and where it would send it: its model, the paths it
+/// may read and the attached context. The task itself is in the card's header.
+fn subagent_request_details(
+    request: &zp_core::permissions::PermissionRequest,
+    cx: &Context<ConversationView>,
+) -> Option<AnyElement> {
+    if request.tool_name != zp_core::subagents::TOOL_NAME {
+        return None;
+    }
+    let colors = cx.theme().colors.clone();
+    let paths: Vec<&str> = request.args["paths"]
+        .as_array()
+        .map(|paths| paths.iter().filter_map(|path| path.as_str()).collect())
+        .unwrap_or_default();
+    let context = request.args["context"]
+        .as_str()
+        .map(str::trim)
+        .filter(|context| !context.is_empty());
+    let mut rows = vec![(
+        "Model",
+        request
+            .destination
+            .clone()
+            .unwrap_or_else(|| "The main model".to_owned()),
+    )];
+    rows.push((
+        "Reads",
+        if paths.is_empty() {
+            "Any file in the project".to_owned()
+        } else {
+            paths.join(", ")
+        },
+    ));
+    if let Some(context) = context {
+        let characters = context.chars().count();
+        rows.push((
+            "Context",
+            format!(
+                "{characters} character{} of attached context",
+                if characters == 1 { "" } else { "s" }
+            ),
+        ));
+    }
+    Some(
+        div()
+            .flex()
+            .flex_col()
+            .gap_0p5()
+            .text_size(px(12.))
+            .children(rows.into_iter().map(|(label, value)| {
+                div()
+                    .flex()
+                    .gap_2()
+                    .child(
+                        div()
+                            .w(px(56.))
+                            .flex_shrink_0()
+                            .text_color(colors.text_muted)
+                            .child(label),
+                    )
+                    .child(div().flex_1().min_w_0().whitespace_normal().child(value))
+            }))
+            .into_any_element(),
+    )
 }

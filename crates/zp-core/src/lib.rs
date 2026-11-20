@@ -22,6 +22,7 @@ pub mod providers;
 pub mod resources;
 pub mod restore;
 pub mod settings;
+pub mod subagents;
 pub mod system_prompt;
 pub mod title;
 pub mod update;
