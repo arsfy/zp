@@ -1,4 +1,40 @@
-## v0.1.0-rc.4 19 Nov 2026
+## v0.1.0 20 Nov 2026
+
+#### Subagents
+
+- The agent can hand read-only research to subagents that work in parallel and report back a conclusion. Turn them on in **Settings → Subagents** (off by default). A subagent can only read the project (`read`, `grep`, `find`, `ls`), optionally limited to the paths the agent names, and sends what it reads to its model.
+- **Follow main model** uses the model and thinking level of the current run. **Task profiles** let the agent choose among profiles you set up, each with a purpose, a model (or the main model) and a thinking level; one is the default.
+- Tasks start on their own by default. Choose **Ask each time** to confirm each one; the approval card shows the model and its endpoint, what the subagent may read and how much context it gets. A trusted project can turn subagents off, require asking, limit the profiles and tighten the limits in the `subagents` section of `.zp/settings.json`.
+- Limits: 4 parallel tasks and 4 tasks per run by default. Model requests per task, a timeout and output tokens per request can be set and have no limit by default; time spent waiting for a free slot does not count toward the timeout.
+- A subagent's card stays open while it works, whatever the tool display settings, and shows its latest tool calls and the end of what it is thinking or writing, with a **Cancel** button. When done it shows the time, model requests, tool calls, tokens and cost, the files and searches it used, and its conclusion as Markdown (long conclusions start shortened). A conclusion cut off at the output limit is marked as such; a cancelled task is not shown as a failure.
+- Subagent tokens and cost count toward the conversation's totals once a task finishes; they do not count toward its context size.
+- `zp-cli run` offers the subagent tool when subagents are enabled, and warns when `--tools subagent` names it while it is unavailable.
+
+#### Permissions and tools
+
+- When **Auto-review** hands a call to you, the approval card explains in plain words what it would do (what it runs, which files or services it touches), next to the review model's reason. Both are written in the language of your request. `zp-cli` prints the explanation too.
+- A call the review model is deciding on shows **reviewing…** instead of **running…**; it only runs once allowed.
+- The tool calls of one response are checked and run independently: a call waiting for review or approval no longer holds back the others, which run as soon as they are allowed. You are still asked about one call at a time, and approving a command for the session also covers the waiting calls it applies to.
+- A command that leaves background processes holding its output returns after 100 ms instead of 250 ms.
+
+#### Context and prompt caching
+
+- Automatic compaction runs inside the agent's run, before each model request, so a long run of tool calls is compacted between steps instead of overflowing. While it summarizes, the composer shows **Compacting the conversation…**.
+- When a request does not fit (an overflow error, or a response stopped at the length limit with nothing written and the window full), ZP compacts once and retries; the failed attempt is dropped from the conversation. Rate-limit errors that mention tokens are no longer mistaken for an overflow.
+- Summary requests are sized to fit the context window: their output gets a share of the reserve, and the oldest history is cut when even that does not fit. Summaries, reviews and titles do not write to the prompt cache.
+- The context size includes the system prompt and tool definitions, and usage measured before a compaction or with another model no longer counts, so the context percentage is right after compacting or switching models.
+- **Settings → General → Prompt cache retention**: **Default**, **Extended** (1 hour on Anthropic, 24 hours on earlier OpenAI models, 12 hours on GPT-5.6 and later; cache writes cost more) or **Off** (no cache writes, so every request pays the full input price). `zp-cli` uses the same setting. Custom providers can set `promptCacheKeyMode` and `supportsLongCacheRetention` in `settings.json`.
+- The conversation's totals include summary requests and abandoned attempts. The cache percentage in the status bar is that of the latest request; `zp-cli` prints cache reads and writes separately.
+
+#### Conversation and sessions
+
+- Typing `@` completes files at the caret, also in the middle of a message. `@` alone lists the project's top folder; picking a folder inserts it and lists what it contains. Paths with spaces are quoted (`@"docs/my notes.md"`) and attached when sent.
+- Thinking blocks are expanded by default. A display you chose in **Settings → Appearance** is kept.
+- Hiding a session from the sidebar also closes its tab. If its agent is still running, ZP asks first; keeping it running leaves the session listed.
+- In the model picker, **↑** / **↓** move through the list (wrapping around) and **Enter** picks the highlighted model. The current model is highlighted when the picker opens; typing a filter moves the highlight to the first match.
+- Models of a gateway or custom provider whose model list carries no prices use the same model's list price (from models.dev or a built-in catalog), so the status bar cost is no longer stuck at $0.0000. Requests already recorded keep their cost of 0.
+
+## v0.1.0-rc.4 19 Nov 2026 `34800d6`
 
 #### Conversation
 
