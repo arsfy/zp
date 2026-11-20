@@ -29,6 +29,10 @@ pub struct PermissionSettings {
     /// Directories outside the project the tools may use without asking.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub additional_directories: Vec<String>,
+    /// Whether the system's temporary directories count as scratch space the tools may
+    /// use like the project (default on; `false` in either settings file turns it off).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub temp_directories: Option<bool>,
 }
 
 /// Light or dark UI.
@@ -287,6 +291,17 @@ impl ProjectSettings {
                 .and_then(|p| p.review_thinking)
                 .or(global.review_thinking)
                 .unwrap_or_default(),
+            temp_directories: if std::iter::once(global)
+                .chain(project)
+                .any(|settings| settings.temp_directories == Some(false))
+            {
+                Vec::new()
+            } else {
+                crate::temp::scratch_roots(root)
+                    .into_iter()
+                    .map(|root| root.path)
+                    .collect()
+            },
         }
     }
 }

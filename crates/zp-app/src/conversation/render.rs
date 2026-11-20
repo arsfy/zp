@@ -350,6 +350,7 @@ impl ConversationView {
                 .gap_1()
                 .child(content)
                 .children(footer)
+                .children(self.render_temp_use(ix, cx))
                 .children(self.render_turn_changes(ix, cx)),
         )
         .into_any_element();

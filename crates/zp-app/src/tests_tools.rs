@@ -244,3 +244,51 @@ fn a_subagent_card_stays_open_while_it_runs_and_a_cancelled_one_does_not_count_a
         "a cancelled task is not opened like a failure"
     );
 }
+
+#[gpui::test]
+fn temporary_files_a_run_created_can_be_measured_and_deleted(cx: &mut TestAppContext) {
+    let (_dir, project) = project_dir();
+    // A temporary directory other than the one holding the test project.
+    let Some(root) = zp_core::temp::scratch_roots(&project).into_iter().next() else {
+        return;
+    };
+    let name = format!(
+        "zp-test-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let made = root.path.join(&name);
+    let faux = FauxProvider::default();
+    faux.push(FauxResponse::tool_call(
+        "bash",
+        json!({"command": format!("mkdir -p '{0}' && printf hello > '{0}/out.txt'", made.display())}),
+    ));
+    faux.push(FauxResponse::text("Done"));
+    let _data = setup_models(cx, &[&faux], false);
+    let window = open(cx, &project);
+    let conversation = active(window, cx);
+    send(window, "Use a scratch directory", cx);
+    idle(&conversation, 3, cx);
+    cx.run_until_parked();
+
+    assert_eq!(
+        conversation.read_with(cx, |view, _| view.temp_paths(2)),
+        Some(vec![made.clone()]),
+        "listed under the run's last row"
+    );
+    assert!(
+        VisualTestContext::from_window(window.into(), cx)
+            .debug_bounds("temp-files")
+            .is_some()
+    );
+    click(window, "temp-files-size", cx);
+    wait_until(cx, |cx| {
+        conversation.read_with(cx, |view, _| view.temp_size(2)) == Some(5)
+    });
+    click(window, "temp-files-clean", cx);
+    wait_until(cx, |_| !made.exists());
+    assert!(root.path.exists(), "only what the run created");
+}

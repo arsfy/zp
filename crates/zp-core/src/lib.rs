@@ -24,6 +24,7 @@ pub mod restore;
 pub mod settings;
 pub mod subagents;
 pub mod system_prompt;
+pub mod temp;
 pub mod title;
 pub mod update;
 

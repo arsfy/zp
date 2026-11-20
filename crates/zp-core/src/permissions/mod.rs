@@ -244,6 +244,9 @@ pub struct PermissionPolicy {
     pub review_model: Option<String>,
     /// How much the review model reasons; clamped to what the model supports.
     pub review_thinking: zp_ai::ThinkingLevel,
+    /// Temporary directories (canonical) the tools may use like the project: file tools
+    /// work there without asking, and removals there count as edits.
+    pub temp_directories: Vec<PathBuf>,
 }
 
 /// Grants made with "approve for session".
@@ -334,6 +337,7 @@ impl PermissionPolicy {
             || self
                 .additional_directories
                 .iter()
+                .chain(&self.temp_directories)
                 .chain(&grants.directories)
                 .any(|dir| path.starts_with(dir))
     }
@@ -388,7 +392,14 @@ impl PermissionPolicy {
                     if edits {
                         allowed.extend(["git", "echo", "python", "python3"].map(str::to_owned));
                     }
-                    match shell::assess(command, &allowed, edits.then_some(self.root.as_path())) {
+                    let removable: Vec<&Path> = if edits {
+                        std::iter::once(self.root.as_path())
+                            .chain(self.temp_directories.iter().map(PathBuf::as_path))
+                            .collect()
+                    } else {
+                        Vec::new()
+                    };
+                    match shell::assess(command, &allowed, &removable) {
                         shell::CommandAssessment::Allowed => {}
                         shell::CommandAssessment::Dangerous(why) => {
                             reasons.push(AskReason::Dangerous(why));
@@ -659,6 +670,51 @@ mod tests {
             allow_commands: vec!["git status".into()],
             ..PermissionPolicy::default()
         }
+    }
+
+    #[test]
+    fn temporary_directories_are_scratch_space_like_the_project() {
+        let project = tempfile::tempdir().unwrap();
+        let scratch = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let root = project.path().canonicalize().unwrap();
+        let temp = scratch.path().canonicalize().unwrap();
+        std::fs::create_dir(temp.join("build")).unwrap();
+        let none = Grants::default();
+        let mut policy = policy(PermissionMode::AutoEdit, &root);
+        policy.temp_directories = vec![temp.clone()];
+        let write = |path: &Path| json!({"path": path, "content": "x"});
+        assert_eq!(
+            policy.evaluate("write", &write(&temp.join("notes.txt")), &none),
+            Evaluation::Allow
+        );
+        assert_eq!(
+            policy.evaluate("read", &json!({"path": temp.join("build")}), &none),
+            Evaluation::Allow
+        );
+        let outside = elsewhere.path().canonicalize().unwrap().join("x.txt");
+        assert!(matches!(
+            policy.evaluate("write", &write(&outside), &none),
+            Evaluation::Ask { .. }
+        ));
+        let rm = |target: &Path| json!({"command": format!("rm -rf {}", target.display())});
+        assert_eq!(
+            policy.evaluate("bash", &rm(&temp.join("build")), &none),
+            Evaluation::Allow,
+            "removing inside a temporary directory counts as an edit"
+        );
+        assert!(
+            matches!(
+                policy.evaluate("bash", &rm(&temp), &none),
+                Evaluation::Ask { .. }
+            ),
+            "never the directory itself"
+        );
+        policy.temp_directories.clear();
+        assert!(matches!(
+            policy.evaluate("write", &write(&temp.join("notes.txt")), &none),
+            Evaluation::Ask { .. }
+        ));
     }
 
     fn ask(evaluation: Evaluation) -> (Vec<AskReason>, Vec<SessionGrant>) {

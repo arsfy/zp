@@ -11,6 +11,7 @@ mod permissions;
 mod progress;
 mod questions;
 mod render;
+mod temp_files;
 pub mod transcript;
 pub mod tree;
 
@@ -274,6 +275,10 @@ pub struct ConversationView {
     compacting: bool,
     /// The run is summarizing older messages before its next request.
     auto_compacting: bool,
+    /// What the running run has named in the temporary directories.
+    temp_run: Option<temp_files::TempRun>,
+    /// Temporary files finished runs created, by the row they are shown under.
+    temp_uses: temp_files::TempUses,
     /// Whether the session tree overlay is shown.
     tree_open: bool,
     /// A model title was already requested for this session.
@@ -375,6 +380,8 @@ impl ConversationView {
             needs_model: false,
             compacting: false,
             auto_compacting: false,
+            temp_run: None,
+            temp_uses: temp_files::TempUses::default(),
             tree_open: false,
             title_requested: false,
             focus_handle,
@@ -548,6 +555,7 @@ impl ConversationView {
         let mut changes = Changes::default();
         let mut compacted = false;
         for ReceivedEvent { at, event, timing } in &events {
+            self.track_temp_paths(event);
             if let AgentEvent::ContextCompacting { .. } = event {
                 self.auto_compacting = true;
                 continue;
@@ -774,6 +782,8 @@ impl ConversationView {
         self.turn_changes.borrow_mut().clear();
         self.turn_files_expanded.clear();
         self.change_log_cache.borrow_mut().take();
+        // Rows change meaning; the cards would sit under the wrong ones.
+        self.temp_uses.clear();
         if let Some(coding) = &self.coding {
             self.transcript = Transcript::from_session_at(&coding.session(), leaf, context_tokens);
             self.editing = None;
@@ -1564,6 +1574,7 @@ impl ConversationView {
             AppModels::remember_model(&model, cx);
         }
         self.running = true;
+        self.start_temp_tracking();
         self.tokens_per_second = None;
         self.response_timer = ResponseTimer::default();
         self.start_status_updates(cx);
@@ -1594,6 +1605,7 @@ impl ConversationView {
     /// Marks the run as over once its last event has been shown.
     fn finish_run(&mut self, cx: &mut Context<Self>) {
         self.running = false;
+        self.finish_temp_tracking();
         // A compaction cancelled with the run ends without an event.
         self.auto_compacting = false;
         self.turn_changes.borrow_mut().clear();

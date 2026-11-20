@@ -510,30 +510,35 @@ pub(super) enum CommandAssessment {
     Dangerous(String),
 }
 
-/// Applies the shell rules, treating verified project-local removals as edits.
-pub(super) fn assess(
-    command: &str,
-    allowed: &[String],
-    edit_root: Option<&Path>,
-) -> CommandAssessment {
+/// Applies the shell rules, treating verified removals inside `removable` (the project
+/// first, where commands start, then temporary directories) as edits.
+pub(super) fn assess(command: &str, allowed: &[String], removable: &[&Path]) -> CommandAssessment {
     let parsed = split(command);
-    let root = edit_root
-        .filter(|_| {
-            !parsed.compound
-                && parsed
-                    .segments
-                    .iter()
-                    .any(|segment| direct_rm_args(segment).is_some())
-                && (!cfg!(windows) || zp_tools::Shell::detect().name() == "bash")
-        })
+    let checks_removals = !parsed.compound
+        && parsed
+            .segments
+            .iter()
+            .any(|segment| direct_rm_args(segment).is_some())
+        && (!cfg!(windows) || zp_tools::Shell::detect().name() == "bash");
+    let roots: Vec<PathBuf> = if checks_removals {
+        removable
+            .iter()
+            .filter_map(|root| root.canonicalize().ok())
+            .collect()
+    } else {
+        Vec::new()
+    };
+    // Commands start in the project; without it, directories cannot be tracked.
+    let mut cwd = removable
+        .first()
+        .filter(|_| checks_removals)
         .and_then(|root| root.canonicalize().ok());
-    let mut cwd = root.clone();
     let mut preceding_program = false;
     let mut needs_approval = parsed.segments.is_empty();
     let mut prefixes = Vec::new();
     for segment in &parsed.segments {
-        if let (Some(root), Some(cwd)) = (&root, &cwd)
-            && workspace_rm(segment, cwd, root, preceding_program)
+        if let Some(cwd) = &cwd
+            && workspace_rm(segment, cwd, &roots, preceding_program)
         {
             continue;
         }
@@ -600,7 +605,7 @@ fn direct_rm_args(segment: &Segment) -> Option<&[String]> {
     matches!(executable.as_str(), "rm" | "/bin/rm" | "/usr/bin/rm").then_some(args)
 }
 
-fn workspace_rm(segment: &Segment, cwd: &Path, root: &Path, preceding_program: bool) -> bool {
+fn workspace_rm(segment: &Segment, cwd: &Path, roots: &[PathBuf], preceding_program: bool) -> bool {
     let Some(args) = direct_rm_args(segment).filter(|_| !segment.expanded && !segment.redirected)
     else {
         return false;
@@ -619,8 +624,11 @@ fn workspace_rm(segment: &Segment, cwd: &Path, root: &Path, preceding_program: b
             if preceding_program && arg.trim_start_matches("./").contains('/') {
                 return false;
             }
-            if !literal_path(cwd, arg).is_some_and(|path| removal_target_in_workspace(&path, root))
-            {
+            if !literal_path(cwd, arg).is_some_and(|path| {
+                roots
+                    .iter()
+                    .any(|root| removal_target_in_workspace(&path, root))
+            }) {
                 return false;
             }
             saw_target = true;
