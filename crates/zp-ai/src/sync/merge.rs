@@ -12,7 +12,8 @@
 //!   modalities and base prices the provider reports win over the other layers.
 //! - Listed models neither the catalog nor the provider's models.dev entry describe (models
 //!   of gateways that resell other vendors' models) borrow capabilities from a [`Reference`]:
-//!   the same model in another provider's built-in catalog or models.dev entry.
+//!   the same model in another provider's built-in catalog or models.dev entry, including
+//!   its prices when the listing reports none.
 //! - A listing that names the routes a model is served on (`supported_endpoints`) moves the
 //!   model to a protocol it supports, e.g. Claude to `/messages` on a gateway whose default is
 //!   Chat Completions.
@@ -456,6 +457,14 @@ impl Templates {
             ),
             (None, None) => (None, None, None),
         };
+        // Prices the listing leaves out: the same model's list price, so usage is not shown
+        // as free (models.dev first, kept current; then the built-in catalog).
+        if entry.cost.is_none() {
+            model.cost = info
+                .and_then(ModelsDevModel::model_cost)
+                .or_else(|| peer.map(|peer| peer.cost.clone()))
+                .unwrap_or_default();
+        }
         model.reasoning = entry.reasoning.unwrap_or(reasoning);
         model.thinking_level_map = map.filter(|_| model.reasoning);
         model.input = entry
@@ -686,13 +695,15 @@ mod tests {
         claude.reasoning = true;
         claude.compat.force_adaptive_thinking = Some(true);
         claude.max_tokens = 128_000;
+        claude.cost.input = 5.0;
         let catalog = ModelsDevCatalog::parse(
             &serde_json::to_vec(&json!({"other": {"id": "other", "models": {
                 "reasoner": {
                     "id": "reasoner", "reasoning": true, "tool_call": true,
                     "modalities": {"input": ["text", "image"], "output": ["text"]},
                     "reasoning_options": [{"type": "effort", "values": ["none", "low", "high"]}],
-                    "limit": {"context": 200000, "output": 64000}
+                    "limit": {"context": 200000, "output": 64000},
+                    "cost": {"input": 2, "output": 8}
                 }
             }}}))
             .unwrap(),
@@ -745,9 +756,13 @@ mod tests {
         // `off` sends nothing rather than another provider's value.
         assert_eq!(reasoner.thinking_level_value(ThinkingLevel::Off), None);
         assert_eq!(reasoner.max_tokens, 64_000);
+        // Unpriced listings borrow the same model's list price.
+        assert_eq!((reasoner.cost.input, reasoner.cost.output), (2.0, 8.0));
+        assert_eq!(claude.cost.input, 5.0);
 
         let plain = find("vendor/plain");
         assert!(!plain.reasoning);
+        assert_eq!(plain.cost, ModelCost::default());
         assert_eq!(
             (plain.context_window, plain.max_tokens),
             (1_000_000, 16_384)
