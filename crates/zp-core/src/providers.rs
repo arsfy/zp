@@ -92,6 +92,7 @@ pub fn custom_provider(def: &CustomProvider) -> anyhow::Result<Arc<dyn Provider>
     let mut provider =
         HttpProvider::new(def.id.clone(), name, Vec::<String>::new(), models.clone())
             .with_api_endpoint(api, base_url)
+            .with_cache_compat(def.prompt_cache_key_mode, def.supports_long_cache_retention)
             .without_api_key();
     if let Some(first) = models.first() {
         provider = provider.with_default_model(first.id.clone());
@@ -124,6 +125,7 @@ mod tests {
             api: None,
             headers: [("X-Team".to_owned(), "zp".to_owned())].into(),
             models: vec!["qwen3-coder".into(), " ".into()],
+            ..Default::default()
         };
         validate_custom_provider(&def, &["openai".into()]).unwrap();
         assert!(validate_custom_provider(&def, &["local".into()]).is_err());

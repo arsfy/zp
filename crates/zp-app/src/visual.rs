@@ -508,6 +508,7 @@ fn tool_done(cx: &mut VisualTestAppContext, root: &std::path::Path, out: &std::p
                 api: None,
                 headers: Default::default(),
                 models: vec!["m".into()],
+                ..Default::default()
             }],
         );
         crate::store::AppSettings::update(cx, |s| s.default_model = Some("local/m".into()))

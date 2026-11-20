@@ -10,14 +10,15 @@ use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 use zp_agent::{
     AfterToolCall, Agent, AgentError, AgentEvent, AgentHooks, AgentMessage, AgentOptions,
-    AgentTool, BeforeToolCall, PromptInput, Subscription, ToolCallDecision, ToolResultOverride,
+    AgentTool, BeforeModelRequest, BeforeToolCall, CompactionTrigger, ContextCompaction,
+    PromptInput, Subscription, ToolCallDecision, ToolResultOverride,
 };
 use zp_ai::{Message, Model, Models, StopReason, StreamOptions, ThinkingLevel, Usage, UserContent};
-use zp_session::{COMPACTION_SUMMARY_TYPE, EntryData, Session};
+use zp_session::{COMPACTION_SUMMARY_TYPE, EntryData, Session, SessionEntry};
 
 use crate::changes::{ChangeLog, RestoreSource, restore_message_with_sources};
 use crate::checkpoint::{BlobStore, RecordedChange, store_tool_change};
-use crate::compaction::CompactionSettings;
+use crate::compaction::{self, CompactionSettings};
 use crate::permissions::PermissionGate;
 use crate::resources::Resources;
 use crate::subagents::{self, SubagentSettings, SubagentTool};
@@ -39,9 +40,40 @@ pub struct CodingHooks {
     /// Resolves the model of a call (for auto-review).
     pub models: Models,
     pub(crate) subagent: Option<Arc<SubagentTool>>,
+    compaction: CompactionState,
 }
 
 impl AgentHooks for CodingHooks {
+    fn compact_context<'a>(
+        &'a self,
+        request: BeforeModelRequest<'a>,
+        cancel: &'a CancellationToken,
+    ) -> BoxFuture<'a, Result<Option<ContextCompaction>, String>> {
+        Box::pin(async move {
+            let model = &request.run.model;
+            let settings = &self.compaction.settings;
+            if !settings.enabled {
+                return Ok(None);
+            }
+            if request.trigger == CompactionTrigger::ProviderError
+                && !request.messages.last().is_some_and(is_overflow_response)
+            {
+                return Ok(None);
+            }
+            let overhead = compaction::request_overhead(request.system_prompt, request.tools);
+            let before = compaction::estimate_context(request.messages, Some(model), overhead);
+            if request.trigger == CompactionTrigger::Threshold
+                && !compaction::should_compact(before, model.context_window, settings)
+            {
+                return Ok(None);
+            }
+            self.compaction
+                .perform(&self.models, model, before, overhead, None, cancel)
+                .await
+                .map_err(|error| format!("Compaction failed: {error:#}"))
+        })
+    }
+
     fn before_tool_call<'a>(
         &'a self,
         call: BeforeToolCall<'a>,
@@ -120,6 +152,16 @@ impl AgentHooks for CodingHooks {
             })
             .collect()
     }
+}
+
+fn is_overflow_response(message: &AgentMessage) -> bool {
+    message.as_assistant().is_some_and(|assistant| {
+        assistant.stop_reason == StopReason::Error
+            && assistant
+                .error_message
+                .as_deref()
+                .is_some_and(compaction::is_context_overflow)
+    })
 }
 
 /// Options for [`CodingSession::new`].
@@ -209,7 +251,7 @@ pub struct UsageTotals {
     pub cache_write: u64,
     /// Cost in US dollars.
     pub cost: f64,
-    /// Input of the last successful response (≈ current context size).
+    /// Current context size when available.
     pub last_context_tokens: u64,
 }
 
@@ -221,6 +263,41 @@ impl UsageTotals {
         self.cache_read += usage.cache_read;
         self.cache_write += usage.cache_write;
         self.cost += usage.cost.total;
+    }
+
+    /// Adds one main response or recorded child task.
+    pub fn add_message(&mut self, message: &AgentMessage) {
+        if let Some(assistant) = message.as_assistant() {
+            self.add(&assistant.usage);
+        } else if let Some(result) = message.as_tool_result()
+            && result.tool_name == subagents::TOOL_NAME
+            && let Some(report) = result
+                .details
+                .as_ref()
+                .and_then(subagents::Report::from_details)
+        {
+            self.add_subagent(&report.usage);
+        }
+    }
+
+    /// Adds persisted usage, including requests no longer in the active model context.
+    pub fn from_entries(entries: &[SessionEntry]) -> Self {
+        let mut totals = Self::default();
+        for entry in entries {
+            if let Some(message) = entry.message() {
+                totals.add_message(message);
+            } else if let EntryData::Compaction {
+                details: Some(details),
+                ..
+            } = &entry.data
+                && let Some(usage) = details
+                    .get("usage")
+                    .and_then(|value| serde_json::from_value::<Self>(value.clone()).ok())
+            {
+                totals.add_subagent(&usage);
+            }
+        }
+        totals
     }
 
     /// Adds a child task without changing the main model's context size.
@@ -239,7 +316,6 @@ impl UsageTotals {
 /// level changes are recorded too, so reopening the session restores the conversation.
 pub struct CodingSession {
     agent: Agent,
-    session: Arc<Mutex<Session>>,
     models: Models,
     cwd: PathBuf,
     system_prompt: Mutex<String>,
@@ -248,8 +324,98 @@ pub struct CodingSession {
     permissions: Option<Arc<PermissionGate>>,
     asker: Option<Arc<dyn zp_tools::Asker>>,
     subagent: Mutex<Option<Arc<SubagentTool>>>,
-    compaction: CompactionSettings,
+    compaction: CompactionState,
     _persistence: Subscription,
+}
+
+#[derive(Clone)]
+struct CompactionState {
+    session: Arc<Mutex<Session>>,
+    settings: CompactionSettings,
+}
+
+impl CompactionState {
+    fn session(&self) -> MutexGuard<'_, Session> {
+        self.session.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    async fn perform(
+        &self,
+        models: &Models,
+        model: &Model,
+        before: u64,
+        overhead: u64,
+        instructions: Option<&str>,
+        cancel: &CancellationToken,
+    ) -> anyhow::Result<Option<ContextCompaction>> {
+        let (head, rewind, preparation) = {
+            let session = self.session();
+            let mut path = session.branch_path(None);
+            let failed = path
+                .iter()
+                .rposition(|entry| entry.message().is_some())
+                .filter(|&index| {
+                    path[index]
+                        .message()
+                        .and_then(AgentMessage::as_assistant)
+                        .is_some_and(|message| {
+                            matches!(message.stop_reason, StopReason::Error | StopReason::Aborted)
+                        })
+                });
+            let rewind = failed.map(|index| {
+                let parent = path[index].parent_id.clone();
+                path.truncate(index);
+                parent
+            });
+            (
+                session.leaf_id().map(str::to_owned),
+                rewind,
+                compaction::prepare(&path, &self.settings),
+            )
+        };
+        let Some(preparation) = preparation else {
+            return Ok(None);
+        };
+        let result =
+            compaction::summarize(models, model, preparation, instructions, cancel).await?;
+        let (entry_id, messages) = {
+            let mut session = self.session();
+            if cancel.is_cancelled() {
+                bail!("compaction cancelled");
+            }
+            if session.leaf_id() != head.as_deref() {
+                bail!("session changed while compacting");
+            }
+            if let Some(parent) = rewind {
+                match parent {
+                    Some(parent) => session.branch(&parent)?,
+                    None => session.reset_leaf(),
+                }
+            }
+            let entry_id = match session.append_compaction(
+                result.summary,
+                &result.first_kept_entry_id,
+                before,
+                Some(result.details),
+            ) {
+                Ok(id) => id,
+                Err(error) => {
+                    if let Some(head) = head {
+                        session.branch(&head)?;
+                    }
+                    return Err(error);
+                }
+            };
+            (entry_id, session.context().messages)
+        };
+        let tokens_after = compaction::estimate_context(&messages, Some(model), overhead);
+        Ok(Some(ContextCompaction {
+            entry_id,
+            messages,
+            tokens_before: before,
+            tokens_after,
+        }))
+    }
 }
 
 /// `tools` plus `ask` when someone can answer.
@@ -276,12 +442,14 @@ impl CodingHooks {
         permissions: Option<&Arc<PermissionGate>>,
         models: &Models,
         subagent: Option<&Arc<SubagentTool>>,
+        compaction: &CompactionState,
     ) -> Arc<Self> {
         Arc::new(Self {
             blobs: blobs.clone(),
             permissions: permissions.cloned(),
             models: models.clone(),
             subagent: subagent.cloned(),
+            compaction: compaction.clone(),
         })
     }
 }
@@ -379,22 +547,31 @@ impl CodingSession {
             skills: Some(&skills),
         });
 
+        let session_id = session.id().to_owned();
+        let compaction = CompactionState {
+            session: Arc::new(Mutex::new(session)),
+            settings: compaction,
+        };
         let mut agent_options = AgentOptions::with_models(models.clone(), model);
         agent_options.thinking_level = thinking;
         agent_options.system_prompt = Some(system_prompt.clone());
         agent_options.tools = tools;
         agent_options.messages = context.messages;
-        agent_options.hooks =
-            CodingHooks::new(&blobs, permissions.as_ref(), &models, subagent.as_ref());
+        agent_options.hooks = CodingHooks::new(
+            &blobs,
+            permissions.as_ref(),
+            &models,
+            subagent.as_ref(),
+            &compaction,
+        );
         agent_options.request_options = StreamOptions {
-            session_id: Some(session.id().to_owned()),
+            session_id: Some(session_id),
             ..request_options
         };
         let agent = Agent::new(agent_options);
 
-        let session = Arc::new(Mutex::new(session));
         let persistence = {
-            let session = session.clone();
+            let session = compaction.session.clone();
             agent.subscribe(move |event| {
                 if let AgentEvent::MessageEnd { message } = event {
                     let elapsed_seconds = message
@@ -412,7 +589,6 @@ impl CodingSession {
         };
         Ok(Self {
             agent,
-            session,
             models,
             cwd,
             system_prompt: Mutex::new(system_prompt),
@@ -439,7 +615,7 @@ impl CodingSession {
 
     /// The session. Do not hold the guard across `.await`.
     pub fn session(&self) -> MutexGuard<'_, Session> {
-        self.session.lock().unwrap_or_else(PoisonError::into_inner)
+        self.compaction.session()
     }
 
     /// Providers and credentials.
@@ -594,6 +770,7 @@ impl CodingSession {
                 self.permissions.as_ref(),
                 &self.models,
                 current.as_ref(),
+                &self.compaction,
             ),
         );
         drop(current);
@@ -766,37 +943,44 @@ impl CodingSession {
         Ok(())
     }
 
-    /// Estimated size of the current context in tokens.
-    pub fn context_tokens(&self) -> u64 {
-        crate::compaction::context_tokens(&self.agent.messages())
+    fn request_overhead(&self) -> u64 {
+        let tools = self
+            .agent
+            .tools()
+            .iter()
+            .map(|tool| tool.declaration())
+            .collect::<Vec<_>>();
+        compaction::request_overhead(self.agent.system_prompt().as_deref(), &tools)
     }
 
-    /// Whether the context is close enough to the window to compact before the next
-    /// request.
+    /// Estimated size of the current context in tokens.
+    pub fn context_tokens(&self) -> u64 {
+        compaction::estimate_context(
+            &self.agent.messages(),
+            self.agent.model().as_ref(),
+            self.request_overhead(),
+        )
+    }
+
+    /// Checks whether the current transcript is near the model's limit.
     pub fn needs_compaction(&self) -> bool {
         self.agent.model().is_some_and(|model| {
-            crate::compaction::should_compact(
+            compaction::should_compact(
                 self.context_tokens(),
                 model.context_window,
-                &self.compaction,
+                &self.compaction.settings,
             )
         })
     }
 
-    /// Whether the last response failed because the context was too large.
+    /// Whether the last response failed due to context overflow.
     pub fn overflowed(&self) -> bool {
         self.agent
             .messages()
             .iter()
             .rev()
-            .find_map(AgentMessage::as_assistant)
-            .is_some_and(|message| {
-                message.stop_reason == StopReason::Error
-                    && message
-                        .error_message
-                        .as_deref()
-                        .is_some_and(crate::compaction::is_context_overflow)
-            })
+            .find(|message| message.as_assistant().is_some())
+            .is_some_and(is_overflow_response)
     }
 
     /// Summarizes older messages into a compaction entry. Returns `(tokens before,
@@ -806,68 +990,40 @@ impl CodingSession {
             bail!("cannot compact while the agent is running");
         }
         let model = self.agent.model().context("no model is selected")?;
-        // A failed attempt (e.g. a context overflow) is dropped from the context first.
-        let failed = self
-            .agent
-            .messages()
-            .last()
-            .and_then(AgentMessage::as_assistant)
-            .is_some_and(|m| matches!(m.stop_reason, StopReason::Error | StopReason::Aborted));
-        if failed {
-            let _ = self.prepare_retry();
-        }
-        let preparation = {
-            let session = self.session();
-            crate::compaction::prepare(&session.branch_path(None), &self.compaction)
-        };
-        let Some(preparation) = preparation else {
+        let overhead = self.request_overhead();
+        let before = compaction::estimate_context(&self.agent.messages(), Some(&model), overhead);
+        let Some(result) = self
+            .compaction
+            .perform(
+                &self.models,
+                &model,
+                before,
+                overhead,
+                instructions,
+                &CancellationToken::new(),
+            )
+            .await?
+        else {
             return Ok(None);
         };
-        let before = self.context_tokens();
-        let result =
-            crate::compaction::summarize(&self.models, &model, preparation, instructions).await?;
-        let messages = {
-            let mut session = self.session();
-            session.append_compaction(
-                result.summary,
-                &result.first_kept_entry_id,
-                before,
-                Some(result.details),
-            )?;
-            session.context().messages
-        };
-        self.agent.set_messages(messages);
-        // Reported usage predates the summary; estimate the new context instead.
-        let after = self
-            .agent
-            .messages()
-            .iter()
-            .map(crate::compaction::estimate_tokens)
-            .sum();
-        Ok(Some((before, after)))
+        self.agent.set_messages(result.messages);
+        Ok(Some((result.tokens_before, result.tokens_after)))
     }
 
-    /// Usage of the assistant messages in the current transcript.
+    /// Total recorded usage and current context size.
     pub fn usage(&self) -> UsageTotals {
-        let mut totals = UsageTotals::default();
-        for message in self.agent.messages() {
-            if let Some(assistant) = message.as_assistant() {
-                totals.add(&assistant.usage);
-                if assistant.stop_reason != StopReason::Error
-                    && assistant.stop_reason != StopReason::Aborted
-                {
-                    totals.last_context_tokens = assistant.usage.total_tokens;
-                }
-            } else if let Some(result) = message.as_tool_result()
-                && result.tool_name == subagents::TOOL_NAME
-                && let Some(report) = result
-                    .details
-                    .as_ref()
-                    .and_then(subagents::Report::from_details)
-            {
-                totals.add_subagent(&report.usage);
-            }
-        }
+        let mut totals = UsageTotals::from_entries(self.session().entries());
+        totals.last_context_tokens = self.context_tokens();
         totals
+    }
+
+    /// Cache-read ratio reported by the latest main-model request on this branch.
+    pub fn last_cache_read_rate(&self) -> Option<f64> {
+        self.session()
+            .branch_path(None)
+            .iter()
+            .rev()
+            .find_map(|entry| entry.message().and_then(AgentMessage::as_assistant))
+            .and_then(|assistant| assistant.usage.cache_read_rate())
     }
 }

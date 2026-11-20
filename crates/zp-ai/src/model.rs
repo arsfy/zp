@@ -253,6 +253,27 @@ pub struct ModelCompat {
     /// Cache-control markers to add (`anthropic` for Claude behind OpenRouter).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_control_format: Option<String>,
+    /// Override cache-key routing for OpenAI-compatible endpoints.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_cache_key_mode: Option<PromptCacheKeyMode>,
+    /// Whether the endpoint accepts an extended cache lifetime.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supports_long_cache_retention: Option<bool>,
+    /// Whether Responses accepts explicit cache options, including disabling cache writes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supports_explicit_prompt_cache_mode: Option<bool>,
+}
+
+/// Whether an OpenAI-compatible endpoint accepts a prompt-cache routing key.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PromptCacheKeyMode {
+    /// Use endpoint defaults.
+    Auto,
+    /// Send the key when caching is active.
+    Enabled,
+    /// Omit the key.
+    Disabled,
 }
 
 /// Static description of a chat model.

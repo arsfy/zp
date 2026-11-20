@@ -112,6 +112,7 @@ pub struct Transcript {
     streaming: Option<(usize, StreamAccumulator)>,
     active_thinking: HashSet<usize>,
     usage: UsageTotals,
+    pub(super) last_cache_read_rate: Option<f64>,
     /// Ordinal of the next finished message.
     next_ordinal: usize,
     /// Used to estimate elapsed time for responses saved before the run clock was recorded.
@@ -129,14 +130,36 @@ fn text_of(content: &[UserContent]) -> String {
 impl Transcript {
     /// Restores the transcript and message timing from the active session branch.
     pub(super) fn from_session(session: &Session) -> Self {
+        Self::from_session_at(session, None)
+    }
+
+    /// Restores the transcript at the event boundary, even if more messages have been saved.
+    pub(super) fn from_session_at(session: &Session, leaf: Option<&str>) -> Self {
         let mut transcript = Self::default();
         let mut changes = Changes::default();
-        let context = session.context();
+        let context = session.context_at(leaf);
         for (message, id) in context.messages.iter().zip(&context.entry_ids) {
             let timing = session.entry(id).and_then(MessageTiming::from_entry);
             transcript.finish_message(message, timing, &mut changes);
         }
+        let entries = session.entries();
+        let end = leaf
+            .and_then(|id| entries.iter().position(|entry| entry.id == id))
+            .map_or(entries.len(), |index| index + 1);
+        transcript.usage = UsageTotals::from_entries(&entries[..end]);
+        transcript.usage.last_context_tokens =
+            zp_core::compaction::context_tokens(&context.messages);
+        transcript.last_cache_read_rate = session
+            .branch_path(leaf)
+            .iter()
+            .rev()
+            .find_map(|entry| entry.message().and_then(AgentMessage::as_assistant))
+            .and_then(|assistant| assistant.usage.cache_read_rate());
         transcript
+    }
+
+    pub(super) fn set_context_tokens(&mut self, tokens: u64) {
+        self.usage.last_context_tokens = tokens;
     }
 
     pub fn rows(&self) -> &[Row] {
@@ -304,23 +327,20 @@ impl Transcript {
                 for call in assistant.tool_calls() {
                     self.tool_rows.insert(call.id.clone(), row);
                 }
-                self.usage.add(&assistant.usage);
+                self.usage.add_message(message);
+                self.last_cache_read_rate = assistant.usage.cache_read_rate();
                 if !matches!(
                     assistant.stop_reason,
                     StopReason::Error | StopReason::Aborted
-                ) {
+                ) && assistant.usage.total_input() > 0
+                {
                     self.usage.last_context_tokens = assistant.usage.total_tokens;
                 }
                 changes.usage = true;
             }
             AgentMessage::Llm(Message::ToolResult(result)) => {
-                if result.tool_name == zp_core::subagents::TOOL_NAME
-                    && let Some(report) = result
-                        .details
-                        .as_ref()
-                        .and_then(zp_core::subagents::Report::from_details)
-                {
-                    self.usage.add_subagent(&report.usage);
+                if result.tool_name == zp_core::subagents::TOOL_NAME {
+                    self.usage.add_message(message);
                     changes.usage = true;
                 }
                 let state = ToolState {

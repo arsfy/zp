@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 
+use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 
 use crate::model::ThinkingLevel;
@@ -46,6 +47,31 @@ impl ThinkingBudgets {
 /// Default number of retries for rate limits and transient server errors.
 pub const DEFAULT_MAX_RETRIES: u32 = 2;
 
+/// Preferred prompt-cache lifetime. Adapters send controls supported by the model.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CacheRetention {
+    /// Skip client-directed cache writes and cache keys.
+    None,
+    /// Use the provider's normal cache lifetime.
+    #[default]
+    Short,
+    /// Request an extended lifetime on supported models.
+    Long,
+}
+
+impl CacheRetention {
+    pub(crate) fn anthropic_control(self, supports_long: bool) -> Option<serde_json::Value> {
+        match self {
+            Self::None => None,
+            Self::Long if supports_long => {
+                Some(serde_json::json!({"type": "ephemeral", "ttl": "1h"}))
+            }
+            _ => Some(serde_json::json!({"type": "ephemeral"})),
+        }
+    }
+}
+
 /// Options for one streaming request.
 #[derive(Clone, Debug, Default)]
 pub struct StreamOptions {
@@ -63,6 +89,8 @@ pub struct StreamOptions {
     pub headers: HashMap<String, String>,
     /// Stable session id used for provider-side caching hints.
     pub session_id: Option<String>,
+    /// Prompt-cache policy for adapters that support explicit controls.
+    pub cache_retention: CacheRetention,
     /// Cancels the request; the stream then ends with an `Aborted` error.
     pub cancel: CancellationToken,
     /// Retries before the stream starts (defaults to [`DEFAULT_MAX_RETRIES`]).

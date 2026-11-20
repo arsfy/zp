@@ -201,8 +201,19 @@ pub(crate) fn build_request_for(
     options: &StreamOptions,
     oauth: bool,
 ) -> Request {
-    let cache_control = json!({"type": "ephemeral"});
     let compat = &model.compat;
+    let cache_control = options.cache_retention.anthropic_control(
+        compat.supports_long_cache_retention.unwrap_or_else(|| {
+            model.provider == "anthropic" || model.base_url.contains("api.anthropic.com")
+        }),
+    );
+    let system_block = |text: &str| {
+        let mut block = json!({"type": "text", "text": text});
+        if let Some(control) = &cache_control {
+            block["cache_control"] = control.clone();
+        }
+        block
+    };
     let level = if model.reasoning {
         model.clamp_thinking_level(options.thinking)
     } else {
@@ -223,18 +234,13 @@ pub(crate) fn build_request_for(
 
     let system = context.system_prompt.as_deref().filter(|s| !s.is_empty());
     if oauth {
-        let mut blocks = vec![
-            json!({"type": "text", "text": CLAUDE_CODE_IDENTITY, "cache_control": cache_control}),
-        ];
+        let mut blocks = vec![system_block(CLAUDE_CODE_IDENTITY)];
         if let Some(system) = system {
-            blocks.push(json!({"type": "text", "text": system, "cache_control": cache_control}));
+            blocks.push(system_block(system));
         }
         body.insert("system".into(), Value::Array(blocks));
     } else if let Some(system) = system {
-        body.insert(
-            "system".into(),
-            json!([{"type": "text", "text": system, "cache_control": cache_control}]),
-        );
+        body.insert("system".into(), json!([system_block(system)]));
     }
 
     let mut interleaved_thinking = false;
@@ -296,8 +302,10 @@ pub(crate) fn build_request_for(
                 if eager {
                     definition["eager_input_streaming"] = Value::Bool(true);
                 }
-                if index == last {
-                    definition["cache_control"] = cache_control.clone();
+                if index == last
+                    && let Some(control) = &cache_control
+                {
+                    definition["cache_control"] = control.clone();
                 }
                 definition
             })
@@ -308,7 +316,9 @@ pub(crate) fn build_request_for(
     let messages = prepare_messages(&context.messages, model, normalize_tool_call_id);
     let mut converted =
         convert_messages(&messages, compat.allow_empty_signature == Some(true), oauth);
-    add_cache_control_to_last_user_message(&mut converted, &cache_control);
+    if let Some(control) = &cache_control {
+        add_cache_control_to_last_user_message(&mut converted, control);
+    }
     body.insert("messages".into(), Value::Array(converted));
 
     Request {
@@ -782,6 +792,34 @@ mod tests {
                 parameters: json!({"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}),
             }],
         }
+    }
+
+    #[test]
+    fn cache_retention_controls_all_breakpoints() {
+        use crate::CacheRetention;
+        let mut model = test_model(Api::AnthropicMessages);
+        model.provider = "anthropic".into();
+        let context = Context {
+            system_prompt: Some("instructions".into()),
+            messages: vec![Message::user("question")],
+            tools: vec![],
+        };
+        let options = StreamOptions {
+            cache_retention: CacheRetention::None,
+            ..Default::default()
+        };
+        let request = build_request_for(&model, &context, &options, true);
+        assert!(!request.body.to_string().contains("cache_control"));
+        let options = StreamOptions {
+            cache_retention: CacheRetention::Long,
+            ..Default::default()
+        };
+        let request = build_request(&model, &context, &options);
+        assert_eq!(request.body["system"][0]["cache_control"]["ttl"], "1h");
+        assert_eq!(
+            request.body["messages"][0]["content"][0]["cache_control"]["ttl"],
+            "1h"
+        );
     }
 
     #[test]

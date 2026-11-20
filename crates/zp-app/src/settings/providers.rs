@@ -28,6 +28,8 @@ pub struct ProviderForm {
     pub headers: Entity<EditableTextState>,
     pub models: Entity<EditableTextState>,
     anthropic: bool,
+    prompt_cache_key_mode: Option<zp_ai::PromptCacheKeyMode>,
+    supports_long_cache_retention: Option<bool>,
     error: Option<String>,
     /// The last "Test" of the endpoint's model list.
     test: Option<EndpointTest>,
@@ -61,6 +63,8 @@ impl ProviderForm {
             headers: input(headers.join("\n"), cx),
             models: input(def.map(|d| d.models.join("\n")).unwrap_or_default(), cx),
             anthropic: def.and_then(|d| d.api.as_deref()) == Some("anthropic-messages"),
+            prompt_cache_key_mode: def.and_then(|d| d.prompt_cache_key_mode),
+            supports_long_cache_retention: def.and_then(|d| d.supports_long_cache_retention),
             error: None,
             test: None,
             _test_task: None,
@@ -100,6 +104,8 @@ impl ProviderForm {
             base_url: text(&self.base_url),
             api: self.anthropic.then(|| "anthropic-messages".to_owned()),
             headers,
+            prompt_cache_key_mode: self.prompt_cache_key_mode,
+            supports_long_cache_retention: self.supports_long_cache_retention,
             models: text(&self.models)
                 .lines()
                 .map(str::trim)

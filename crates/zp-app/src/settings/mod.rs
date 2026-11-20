@@ -15,7 +15,7 @@ use gpui::{
     WindowBounds, WindowHandle, div, prelude::*, px, rgb_to_hsla, size,
 };
 use gpui_elements::editable_text::{EditableTextState, StringStorage, text_area, text_input};
-use zp_ai::ThinkingLevel;
+use zp_ai::{CacheRetention, ThinkingLevel};
 use zp_core::permissions::PermissionMode;
 use zp_core::settings::{BlockDisplay, ThemeChoice, TranscriptSettings};
 
@@ -569,6 +569,12 @@ impl SettingsWindow {
             ThinkingLevel::High,
             ThinkingLevel::XHigh,
         ];
+        let cache_retention = settings.cache_retention.unwrap_or_default();
+        let cache_choices = [
+            ("Default", CacheRetention::Short),
+            ("Extended", CacheRetention::Long),
+            ("Minimize writes", CacheRetention::None),
+        ];
         let titles = settings.generate_titles.unwrap_or(true);
         let notifications = settings.notifications.unwrap_or(true);
         page_body()
@@ -588,6 +594,22 @@ impl SettingsWindow {
                 levels.iter().map(|level| (level.as_str().to_owned(), *level == thinking)),
                 cx,
                 move |this, index, cx| this.set_default_thinking(levels[index], cx),
+            )))
+            .child(section(
+                "Prompt cache retention",
+                "Applies to supported providers. Extended retention can increase cache-write costs.",
+                cx,
+            ))
+            .child(div().flex().child(segmented(
+                "cache-retention",
+                cache_choices.iter().map(|(label, value)| (label.to_string(), *value == cache_retention)),
+                cx,
+                move |this, index, cx| {
+                    let result = AppSettings::update(cx, |settings| {
+                        settings.cache_retention = Some(cache_choices[index].1);
+                    });
+                    this.report(result, cx);
+                },
             )))
             .child(section(
                 "Conversation titles",

@@ -287,6 +287,10 @@ impl Shared {
                     state.streaming = None;
                     state.messages.push(message.clone());
                 }
+                AgentEvent::ContextCompacted { compaction, .. } => {
+                    state.messages.clone_from(&compaction.messages);
+                    state.error_message = None;
+                }
                 AgentEvent::ToolExecutionStart { tool_call_id, .. } => {
                     state.pending_tool_calls.insert(tool_call_id.clone());
                 }
@@ -491,6 +495,11 @@ impl Agent {
     /// Sets the request template for future runs.
     pub fn set_request_options(&self, options: StreamOptions) {
         lock(&self.shared.settings).request_options = options;
+    }
+
+    /// Sets the cache policy for subsequent runs, keeping other request settings.
+    pub fn set_cache_retention(&self, retention: zp_ai::CacheRetention) {
+        lock(&self.shared.settings).request_options.cache_retention = retention;
     }
 
     /// Whether a run is in progress.

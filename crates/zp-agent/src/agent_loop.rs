@@ -20,7 +20,10 @@ use zp_ai::{
 };
 
 use crate::event::AgentEvent;
-use crate::hooks::{AfterToolCall, AgentHooks, BeforeToolCall, ToolCallDecision};
+use crate::hooks::{
+    AfterToolCall, AgentHooks, BeforeModelRequest, BeforeToolCall, CompactionTrigger,
+    ToolCallDecision,
+};
 use crate::message::AgentMessage;
 use crate::schema::validate_arguments;
 use crate::tool::{AgentTool, AgentToolResult, ToolContext, ToolExecutionMode, ToolRun};
@@ -81,6 +84,7 @@ pub(crate) async fn run_loop(
     // The user may have typed while the run was starting.
     let mut pending = poll(&mut queues.steering, cancel);
     let mut first_turn = true;
+    let mut recovered_overflow = false;
     loop {
         let mut has_more_tool_calls = true;
         while has_more_tool_calls || !pending.is_empty() {
@@ -93,13 +97,37 @@ pub(crate) async fn run_loop(
                 push(&mut context, message, &mut added);
             }
 
+            compact_context(
+                config,
+                &mut context,
+                &declarations,
+                CompactionTrigger::Threshold,
+                emit,
+                cancel,
+            )
+            .await;
             let message = stream_response(config, &context, &declarations, emit, cancel).await;
             push(&mut context, message.clone().into(), &mut added);
             if matches!(message.stop_reason, StopReason::Error | StopReason::Aborted) {
+                let may_recover = !recovered_overflow && message.stop_reason == StopReason::Error;
                 emit(AgentEvent::TurnEnd {
                     message,
                     tool_results: Vec::new(),
                 });
+                if may_recover
+                    && compact_context(
+                        config,
+                        &mut context,
+                        &declarations,
+                        CompactionTrigger::ProviderError,
+                        emit,
+                        cancel,
+                    )
+                    .await
+                {
+                    recovered_overflow = true;
+                    continue;
+                }
                 emit(AgentEvent::AgentEnd {
                     messages: added.clone(),
                 });
@@ -170,6 +198,45 @@ pub(crate) fn failed_message(model: &Model, reason: StopReason, error: &str) -> 
     message
 }
 
+/// Applies a committed context replacement, if the session can compact at this boundary.
+async fn compact_context(
+    config: &LoopConfig,
+    context: &mut Vec<AgentMessage>,
+    declarations: &[Tool],
+    trigger: CompactionTrigger,
+    emit: &Emit,
+    cancel: &CancellationToken,
+) -> bool {
+    if cancel.is_cancelled() {
+        return false;
+    }
+    let request = BeforeModelRequest {
+        trigger,
+        run: &config.run,
+        messages: context,
+        system_prompt: config.system_prompt.as_deref(),
+        tools: declarations,
+    };
+    match config.hooks.compact_context(request, cancel).await {
+        Ok(Some(compaction)) => {
+            context.clone_from(&compaction.messages);
+            emit(AgentEvent::ContextCompacted {
+                compaction: Arc::new(compaction),
+                trigger,
+            });
+            true
+        }
+        result => {
+            if let Err(error) = result
+                && !cancel.is_cancelled()
+            {
+                emit(AgentEvent::ContextCompactionFailed { error });
+            }
+            false
+        }
+    }
+}
+
 /// Streams one response, emitting message events. Never fails: errors come back as an
 /// assistant message with stop reason `Error` or `Aborted`.
 async fn stream_response(
@@ -198,6 +265,12 @@ async fn stream_response(
     }
 
     let transformed = config.hooks.transform_context(context, cancel).await;
+    if cancel.is_cancelled() {
+        return finish(
+            failed_message(&config.run.model, StopReason::Aborted, ABORTED),
+            false,
+        );
+    }
     let messages = config
         .hooks
         .convert_to_llm(transformed.as_deref().unwrap_or(context));

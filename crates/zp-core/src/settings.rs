@@ -131,6 +131,12 @@ pub struct CustomProvider {
     /// Extra request headers.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub headers: BTreeMap<String, String>,
+    /// Override the endpoint's cache-key behavior.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_cache_key_mode: Option<zp_ai::PromptCacheKeyMode>,
+    /// Whether this endpoint accepts extended retention.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub supports_long_cache_retention: Option<bool>,
     /// Model ids; empty means the models the endpoint lists.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub models: Vec<String>,
@@ -170,6 +176,9 @@ pub struct Settings {
     /// Releases API endpoint (overridden for development and tests).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub update_feed: Option<String>,
+    /// Prompt-cache policy shared by the GUI and CLI (default `short`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_retention: Option<zp_ai::CacheRetention>,
     /// Context compaction.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub compaction: Option<crate::compaction::CompactionSettings>,

@@ -345,3 +345,144 @@ async fn a_session_can_start_without_a_model() {
     coding.prompt("hello").await.unwrap();
     assert_eq!(faux.requests().len(), 1);
 }
+
+#[tokio::test]
+async fn compacts_before_the_model_request_after_tool_results() {
+    let project = tempfile::tempdir().unwrap();
+    // This result crosses the threshold for a continuation that would otherwise fit.
+    std::fs::write(project.path().join("large.txt"), "x".repeat(1600)).unwrap();
+    let faux = FauxProvider::default();
+    for response in [
+        FauxResponse::text("old answer"),
+        call("read", json!({"path": "large.txt"})),
+        FauxResponse::text("old summary"),
+        FauxResponse::text("turn summary"),
+        FauxResponse::text("final answer"),
+    ] {
+        faux.push(response);
+    }
+    let model = faux.model();
+    let reserve_tokens = model.context_window - 340;
+    let session = zp_session::Session::in_memory(project.path());
+    let mut options = CodingSessionOptions::new(models(&faux), project.path(), session);
+    options.model = Some(model);
+    options.custom_system_prompt = Some("short system prompt".into());
+    options.compaction.reserve_tokens = reserve_tokens;
+    options.compaction.keep_recent_tokens = 100;
+    let coding = CodingSession::new(options).unwrap();
+    coding.prompt("old question").await.unwrap();
+    coding.prompt("read the file").await.unwrap();
+
+    assert_eq!(faux.pending(), 0);
+    let requests = faux.requests();
+    assert!(matches!(
+        &requests[1].messages.last(),
+        Some(Message::User(_))
+    ));
+    assert!(requests[2].tools.is_empty());
+    assert!(requests[3].tools.is_empty());
+    assert!(matches!(
+        &requests[4].messages[..],
+        [
+            Message::User(_),
+            Message::Assistant(_),
+            Message::ToolResult(_)
+        ]
+    ));
+    assert_eq!(
+        coding.agent().messages(),
+        coding.session().context().messages
+    );
+    assert_eq!(
+        coding.usage().output,
+        25,
+        "includes summarized responses and both summary requests"
+    );
+}
+
+#[tokio::test]
+async fn compaction_invalidates_retained_usage_and_failed_compaction_preserves_the_leaf() {
+    let project = tempfile::tempdir().unwrap();
+    let faux = FauxProvider::default();
+    let model = faux.model();
+    let mut session = zp_session::Session::in_memory(project.path());
+    session.append_message("old question".into()).unwrap();
+    let kept = session.append_message("recent question".into()).unwrap();
+    let mut reply = zp_ai::AssistantMessage::empty(model.api.as_str(), &model.provider, &model.id);
+    reply.usage.input = 125_000;
+    reply.usage.update_total();
+    session.append_message(reply.into()).unwrap();
+    session
+        .append_compaction("short summary".into(), &kept, 125_000, None)
+        .unwrap();
+    session.append_message("new question".into()).unwrap();
+    let mut options = CodingSessionOptions::new(models(&faux), project.path(), session);
+    options.model = Some(model);
+    let coding = CodingSession::new(options).unwrap();
+    assert!(coding.context_tokens() < 10_000);
+    assert!(!coding.needs_compaction());
+    assert_eq!(coding.usage().input, 125_000);
+
+    faux.push(FauxResponse::Error("context_length_exceeded".into()));
+    faux.push(FauxResponse::Error("auto summary failed".into()));
+    coding.prompt("overflow").await.unwrap();
+    let head = coding.session().leaf_id().unwrap().to_owned();
+    let messages = coding.agent().messages();
+    faux.push(FauxResponse::Error("cannot summarize".into()));
+    assert!(coding.compact(None).await.is_err());
+    assert_eq!(coding.session().leaf_id(), Some(head.as_str()));
+    assert_eq!(coding.agent().messages(), messages);
+}
+
+#[tokio::test]
+async fn overflow_retries_once_after_a_committed_compaction() {
+    let project = tempfile::tempdir().unwrap();
+    let faux = FauxProvider::default();
+    for response in [
+        FauxResponse::text("old answer"),
+        FauxResponse::Error("context_length_exceeded".into()),
+        FauxResponse::text("compaction summary"),
+        FauxResponse::Error("context_length_exceeded".into()),
+    ] {
+        faux.push(response);
+    }
+    let session = zp_session::Session::in_memory(project.path());
+    let mut options = CodingSessionOptions::new(models(&faux), project.path(), session);
+    options.model = Some(faux.model());
+    let coding = CodingSession::new(options).unwrap();
+    coding.prompt("old question").await.unwrap();
+    coding.prompt("new question").await.unwrap();
+    assert_eq!(faux.requests().len(), 4);
+    assert!(coding.overflowed());
+    assert_eq!(
+        coding
+            .session()
+            .entries()
+            .iter()
+            .filter(|entry| matches!(entry.data, EntryData::Compaction { .. }))
+            .count(),
+        1
+    );
+    assert_eq!(
+        coding.agent().messages(),
+        coding.session().context().messages
+    );
+}
+
+#[tokio::test]
+async fn overflow_with_no_history_to_compact_preserves_the_error() {
+    let project = tempfile::tempdir().unwrap();
+    let faux = FauxProvider::default();
+    faux.push(FauxResponse::Error("context_length_exceeded".into()));
+    let session = zp_session::Session::in_memory(project.path());
+    let mut options = CodingSessionOptions::new(models(&faux), project.path(), session);
+    options.model = Some(faux.model());
+    let coding = CodingSession::new(options).unwrap();
+    coding.prompt("only question").await.unwrap();
+    assert_eq!(faux.requests().len(), 1);
+    assert!(coding.overflowed());
+    assert_eq!(
+        coding.agent().messages(),
+        coding.session().context().messages
+    );
+}

@@ -3,7 +3,7 @@
 use futures::future::BoxFuture;
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
-use zp_ai::{AssistantMessage, Message, ToolCall, UserContent};
+use zp_ai::{AssistantMessage, Message, Tool, ToolCall, UserContent};
 
 use crate::message::{AgentMessage, default_convert_to_llm};
 use crate::tool::AgentToolResult;
@@ -93,11 +93,57 @@ impl ToolResultOverride {
     }
 }
 
+/// When the agent can compact its transcript.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CompactionTrigger {
+    /// Before sending the next request.
+    Threshold,
+    /// After the provider rejected the current response attempt.
+    ProviderError,
+}
+
+/// The assembled context just before a model request.
+pub struct BeforeModelRequest<'a> {
+    /// Whether the request is new or recovering from a provider error.
+    pub trigger: CompactionTrigger,
+    /// Model and request identity captured at the start of the run.
+    pub run: &'a crate::ToolRun,
+    /// Transcript including any new prompts and tool results.
+    pub messages: &'a [AgentMessage],
+    /// System prompt sent with this request.
+    pub system_prompt: Option<&'a str>,
+    /// Tool declarations sent with this request.
+    pub tools: &'a [Tool],
+}
+
+/// A committed compaction that replaces the agent's transcript.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ContextCompaction {
+    /// Identifies the compaction boundary for session-backed clients.
+    pub entry_id: String,
+    /// Summary and retained messages, in request order.
+    pub messages: Vec<AgentMessage>,
+    /// Estimated context size before compaction.
+    pub tokens_before: u64,
+    /// Estimated context size after compaction.
+    pub tokens_after: u64,
+}
+
 /// Hooks into the agent loop. Every method has a no-op default.
 ///
 /// Hooks receive the run's cancellation token and should honor it, e.g. when waiting
 /// for the user to approve a tool call.
 pub trait AgentHooks: Send + Sync {
+    /// Optionally compacts and replaces the stored transcript before a model request.
+    fn compact_context<'a>(
+        &'a self,
+        request: BeforeModelRequest<'a>,
+        cancel: &'a CancellationToken,
+    ) -> BoxFuture<'a, Result<Option<ContextCompaction>, String>> {
+        let _ = (request, cancel);
+        Box::pin(async { Ok(None) })
+    }
+
     /// Rewrites the transcript before each model request (pruning, compaction, injected
     /// context). Return `None` to use it unchanged. The agent's stored transcript is not
     /// modified.

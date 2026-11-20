@@ -41,11 +41,11 @@ pub use event::{
 };
 pub use faux::{FauxBlock, FauxProvider, FauxResponse};
 pub use model::{
-    Api, CostTier, InputModality, MaxTokensField, Model, ModelCompat, ModelCost, ThinkingFormat,
-    ThinkingLevel,
+    Api, CostTier, InputModality, MaxTokensField, Model, ModelCompat, ModelCost,
+    PromptCacheKeyMode, ThinkingFormat, ThinkingLevel,
 };
 pub use models::{ModelSource, Models};
-pub use options::{DEFAULT_MAX_RETRIES, StreamOptions, ThinkingBudgets};
+pub use options::{CacheRetention, DEFAULT_MAX_RETRIES, StreamOptions, ThinkingBudgets};
 pub use provider::{HttpProvider, Provider};
 pub use sync::{
     MODELS_DEV_URL, ModelsDevCatalog, ModelsDevFetch, SyncError, UpstreamModel, UpstreamModels,

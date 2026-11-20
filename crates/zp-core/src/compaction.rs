@@ -13,10 +13,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use zp_agent::AgentMessage;
 use zp_ai::{
-    AssistantContent, Context, Message, Model, Models, StopReason, StreamOptions, ThinkingLevel,
-    UserContent,
+    AssistantContent, CacheRetention, Context, Message, Model, Models, StopReason, StreamOptions,
+    ThinkingLevel, Tool, UserContent,
 };
-use zp_session::{EntryData, SessionEntry};
+use zp_session::{COMPACTION_SUMMARY_TYPE, EntryData, SessionEntry};
+
+use crate::UsageTotals;
 
 /// When and how much to compact.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -116,6 +118,14 @@ pub fn estimate_tokens(message: &AgentMessage) -> u64 {
     let chars = match message {
         AgentMessage::Llm(Message::User(user)) => text_chars(&user.content),
         AgentMessage::Llm(Message::ToolResult(result)) => text_chars(&result.content),
+        AgentMessage::Llm(Message::Assistant(assistant))
+            if matches!(
+                assistant.stop_reason,
+                StopReason::Error | StopReason::Aborted
+            ) =>
+        {
+            0
+        }
         AgentMessage::Llm(Message::Assistant(assistant)) => assistant
             .content
             .iter()
@@ -132,32 +142,84 @@ pub fn estimate_tokens(message: &AgentMessage) -> u64 {
     chars.div_ceil(4) as u64
 }
 
-/// The current context size: the last successful response's reported usage plus an
-/// estimate of what came after it (everything estimated without one).
-///
-/// Usage without any prompt tokens counts as unreported: a request always has a prompt,
-/// and some gateways send `prompt_tokens: 0` for certain models, which would otherwise make
-/// the context look empty and never trigger compaction.
-pub fn context_tokens(messages: &[AgentMessage]) -> u64 {
-    let last = messages.iter().rposition(|message| {
-        message.as_assistant().is_some_and(|a| {
-            a.usage.total_input() > 0
-                && !matches!(a.stop_reason, StopReason::Error | StopReason::Aborted)
+/// Usage on the retained side of a compaction was measured against the old prefix.
+fn fresh_usage_start(messages: &[AgentMessage]) -> usize {
+    messages
+        .iter()
+        .enumerate()
+        .rev()
+        .find_map(|(index, message)| {
+            let AgentMessage::Custom(summary) = message else {
+                return None;
+            };
+            if summary.custom_type != COMPACTION_SUMMARY_TYPE {
+                return None;
+            }
+            let retained = summary
+                .details
+                .as_ref()
+                .and_then(|details| details["retainedMessages"].as_u64())
+                .and_then(|count| usize::try_from(count).ok());
+            Some(retained.map_or(messages.len(), |count| {
+                index
+                    .saturating_add(1)
+                    .saturating_add(count)
+                    .min(messages.len())
+            }))
         })
-    });
-    match last {
-        Some(index) => {
-            let reported = messages[index]
+        .unwrap_or(0)
+}
+
+/// Measures the current prefix using a response from that prefix and model, when available.
+pub fn context_tokens(messages: &[AgentMessage]) -> u64 {
+    estimate_context(messages, None, 0)
+}
+
+pub(crate) fn estimate_context(
+    messages: &[AgentMessage],
+    model: Option<&Model>,
+    overhead: u64,
+) -> u64 {
+    let start = fresh_usage_start(messages);
+    let last = messages[start..]
+        .iter()
+        .enumerate()
+        .rev()
+        .find_map(|(index, message)| {
+            message
                 .as_assistant()
-                .map_or(0, |a| a.usage.total_tokens);
-            reported
-                + messages[index + 1..]
-                    .iter()
-                    .map(estimate_tokens)
-                    .sum::<u64>()
-        }
-        None => messages.iter().map(estimate_tokens).sum(),
+                .filter(|assistant| {
+                    assistant.usage.total_input() > 0
+                        && !matches!(
+                            assistant.stop_reason,
+                            StopReason::Error | StopReason::Aborted
+                        )
+                })
+                .map(|assistant| (start + index, assistant))
+        });
+    if let Some((index, last)) = last
+        && model.is_none_or(|model| {
+            last.provider == model.provider
+                && last.model == model.id
+                && last.api == model.api.as_str()
+        })
+    {
+        let trailing: u64 = messages[index + 1..].iter().map(estimate_tokens).sum();
+        return last.usage.total_input() + last.usage.output + trailing;
     }
+    overhead + messages.iter().map(estimate_tokens).sum::<u64>()
+}
+
+pub(crate) fn request_overhead(system_prompt: Option<&str>, tools: &[Tool]) -> u64 {
+    let system = system_prompt.map_or(0, |text| text.len().div_ceil(4) as u64);
+    system
+        + tools
+            .iter()
+            .map(|tool| {
+                (tool.name.len() + tool.description.len() + tool.parameters.to_string().len())
+                    .div_ceil(4) as u64
+            })
+            .sum::<u64>()
 }
 
 /// Whether a context of `tokens` should be compacted for a window of `context_window`.
@@ -169,20 +231,23 @@ pub fn should_compact(tokens: u64, context_window: u64, settings: &CompactionSet
 
 /// Whether a failed response means the request did not fit the context window.
 pub fn is_context_overflow(error: &str) -> bool {
-    let error = error.to_lowercase();
-    [
-        "context length",
-        "context window",
-        "context_length",
-        "maximum context",
-        "prompt is too long",
-        "too many tokens",
-        "exceeds the context",
-        "input is too long",
-        "request too large",
-    ]
-    .iter()
-    .any(|needle| error.contains(needle))
+    let error = error.to_ascii_lowercase();
+    error.starts_with("http 413")
+        || [
+            "context length",
+            "context window",
+            "context_length",
+            "maximum context",
+            "prompt is too long",
+            "too many tokens",
+            "exceeds the context",
+            "input is too long",
+            "request too large",
+            "request_too_large",
+            "request entity too large",
+        ]
+        .iter()
+        .any(|needle| error.contains(needle))
 }
 
 /// What a compaction will summarize.
@@ -425,7 +490,13 @@ pub fn serialize_conversation(messages: &[AgentMessage]) -> String {
     parts.join("\n\n")
 }
 
-async fn ask(models: &Models, model: &Model, prompt: String) -> anyhow::Result<String> {
+async fn ask(
+    models: &Models,
+    model: &Model,
+    prompt: String,
+    cancel: &tokio_util::sync::CancellationToken,
+    usage: &mut UsageTotals,
+) -> anyhow::Result<String> {
     let context = Context {
         system_prompt: Some(SYSTEM_PROMPT.to_owned()),
         messages: vec![Message::user(prompt)],
@@ -433,6 +504,8 @@ async fn ask(models: &Models, model: &Model, prompt: String) -> anyhow::Result<S
     };
     let options = StreamOptions {
         thinking: model.clamp_thinking_level(ThinkingLevel::Off),
+        cache_retention: CacheRetention::None,
+        cancel: cancel.clone(),
         max_tokens: Some(model.max_tokens.clamp(1_024, 32_000)),
         ..StreamOptions::default()
     };
@@ -449,6 +522,7 @@ async fn ask(models: &Models, model: &Model, prompt: String) -> anyhow::Result<S
         }
         _ => {}
     }
+    usage.add(&reply.usage);
     let text = reply.text();
     if text.trim().is_empty() {
         bail!("the model returned an empty summary");
@@ -462,7 +536,9 @@ pub async fn summarize(
     model: &Model,
     preparation: Preparation,
     instructions: Option<&str>,
+    cancel: &tokio_util::sync::CancellationToken,
 ) -> anyhow::Result<Compaction> {
+    let mut usage = UsageTotals::default();
     let focus = instructions
         .filter(|i| !i.trim().is_empty())
         .map(|i| format!("\n\nAdditional focus: {}", i.trim()))
@@ -492,16 +568,22 @@ pub async fn summarize(
             .clone()
             .unwrap_or_else(|| "No prior history.".to_owned())
     } else {
-        ask(models, model, history(&preparation.messages_to_summarize))
-            .await
-            .context("could not summarize the conversation")?
+        ask(
+            models,
+            model,
+            history(&preparation.messages_to_summarize),
+            cancel,
+            &mut usage,
+        )
+        .await
+        .context("could not summarize the conversation")?
     };
     if !preparation.turn_prefix.is_empty() {
         let prompt = format!(
             "# Conversation\n{}\n\n# Instructions\n{TURN_PREFIX_PROMPT}{focus}",
             serialize_conversation(&preparation.turn_prefix)
         );
-        let prefix = ask(models, model, prompt)
+        let prefix = ask(models, model, prompt, cancel, &mut usage)
             .await
             .context("could not summarize the current turn")?;
         summary = format!("{summary}\n\n---\n\n**Turn Context (split turn):**\n\n{prefix}");
@@ -539,7 +621,7 @@ pub async fn summarize(
     Ok(Compaction {
         summary,
         first_kept_entry_id: preparation.first_kept_entry_id,
-        details: json!({"readFiles": read, "modifiedFiles": modified}),
+        details: json!({"readFiles": read, "modifiedFiles": modified, "usage": usage}),
     })
 }
 
@@ -708,9 +790,15 @@ mod tests {
             read_files: ["a.rs".to_owned(), "b.rs".to_owned()].into(),
             modified_files: ["b.rs".to_owned()].into(),
         };
-        let result = summarize(&models, &faux.model(), prep, Some("the API"))
-            .await
-            .unwrap();
+        let result = summarize(
+            &models,
+            &faux.model(),
+            prep,
+            Some("the API"),
+            &Default::default(),
+        )
+        .await
+        .unwrap();
         assert_eq!(
             result.summary,
             "## Goal\nShip it\n\n<read-files>\na.rs\n</read-files>\n\n<modified-files>\nb.rs\n</modified-files>"

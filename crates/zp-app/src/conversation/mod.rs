@@ -119,14 +119,6 @@ pub enum ConversationEvent {
     QuestionAsked(String),
 }
 
-/// What runs after a compaction finishes.
-pub(crate) enum Followup {
-    /// Send this message.
-    Prompt(Box<zp_agent::AgentMessage>),
-    /// Retry the request that overflowed the context.
-    Retry,
-}
-
 /// A sent user message being edited in place.
 pub(crate) struct MessageEdit {
     pub(crate) row: usize,
@@ -150,6 +142,8 @@ pub struct ConversationStatus {
     #[cfg_attr(not(test), allow(dead_code))]
     pub thinking: ThinkingLevel,
     pub usage: UsageTotals,
+    /// Cached input fraction of the most recent main-model request.
+    pub cache_read_rate: Option<f64>,
     pub running: bool,
     /// Whether the in-flight output usage is estimated until provider usage arrives.
     pub output_estimated: bool,
@@ -278,8 +272,6 @@ pub struct ConversationView {
     /// The last attempt to send found no model selected.
     needs_model: bool,
     compacting: bool,
-    /// The current request was already retried after a context overflow.
-    overflow_retried: bool,
     /// Whether the session tree overlay is shown.
     tree_open: bool,
     /// A model title was already requested for this session.
@@ -380,7 +372,6 @@ impl ConversationView {
             needs_key: None,
             needs_model: false,
             compacting: false,
-            overflow_retried: false,
             tree_open: false,
             title_requested: false,
             focus_handle,
@@ -429,6 +420,9 @@ impl ConversationView {
         options.resources = crate::mcp::project_resources(&self.root, cx);
         options.compaction = crate::store::AppSettings::get(cx)
             .compaction
+            .unwrap_or_default();
+        options.request_options.cache_retention = crate::store::AppSettings::get(cx)
+            .cache_retention
             .unwrap_or_default();
         options.tools = Some(crate::mcp::project_tools(&self.root, cx));
         options.subagents = crate::approvals::project_subagents(&self.root, cx);
@@ -537,6 +531,7 @@ impl ConversationView {
         self.change_log_cache.borrow_mut().take();
         self.disclosures.clear();
         self.transcript = Transcript::from_session(&coding.session());
+        self.transcript.set_context_tokens(coding.context_tokens());
         // One more item at the end: room for the floating composer.
         self.list_state = ListState::new(self.transcript.len() + 1, ListAlignment::Top, px(1000.));
         self.list_state.set_follow_mode(gpui::FollowMode::Tail);
@@ -547,9 +542,29 @@ impl ConversationView {
     }
 
     fn apply_events(&mut self, events: Vec<ReceivedEvent>, cx: &mut Context<Self>) {
-        let old_len = self.transcript.len();
+        let mut old_len = self.transcript.len();
         let mut changes = Changes::default();
+        let mut compacted = false;
         for ReceivedEvent { at, event, timing } in &events {
+            if let AgentEvent::ContextCompacted { compaction, .. } = event {
+                self.reload_transcript_at(Some(&compaction.entry_id));
+                self.transcript.set_context_tokens(compaction.tokens_after);
+                self.info = Some(format!(
+                    "Compacted the conversation: about {} → {} tokens",
+                    crate::ui::format_tokens(compaction.tokens_before),
+                    crate::ui::format_tokens(compaction.tokens_after),
+                ));
+                old_len = self.transcript.len();
+                changes = Changes {
+                    usage: true,
+                    ..Changes::default()
+                };
+                compacted = true;
+                continue;
+            }
+            if let AgentEvent::ContextCompactionFailed { error } = event {
+                self.info = Some(error.clone());
+            }
             if self.time_response(*at, event) {
                 changes.usage = true;
             }
@@ -572,7 +587,7 @@ impl ConversationView {
         let files_changed = events.iter().any(|received| {
             matches!(&received.event, AgentEvent::ToolExecutionEnd { result, .. } if result.details.is_some())
         });
-        if files_changed {
+        if compacted || files_changed {
             self.turn_changes.borrow_mut().clear();
             self.change_log_cache.borrow_mut().take();
             cx.emit(ConversationEvent::FilesChanged);
@@ -738,12 +753,19 @@ impl ConversationView {
 
     /// Rebuilds the rows from the agent's transcript (after retry or branch changes).
     fn reload_transcript(&mut self) {
+        self.reload_transcript_at(None);
+        if let Some(coding) = &self.coding {
+            self.transcript.set_context_tokens(coding.context_tokens());
+        }
+    }
+
+    fn reload_transcript_at(&mut self, leaf: Option<&str>) {
         self.text_selection.clear();
         self.turn_changes.borrow_mut().clear();
         self.turn_files_expanded.clear();
         self.change_log_cache.borrow_mut().take();
         if let Some(coding) = &self.coding {
-            self.transcript = Transcript::from_session(&coding.session());
+            self.transcript = Transcript::from_session_at(&coding.session(), leaf);
             self.editing = None;
             self.held_open.borrow_mut().clear();
             self.disclosures.clear();
@@ -1251,6 +1273,7 @@ impl ConversationView {
         let agent = self.coding.as_ref().map(|coding| coding.agent());
         let model = agent.and_then(|agent| agent.model());
         let mut usage = self.transcript.usage().clone();
+        let mut cache_read_rate = self.transcript.last_cache_read_rate;
         let mut output_estimated = false;
         let mut tokens_per_second = self.tokens_per_second;
         if let Some(partial) = self.transcript.streaming_usage() {
@@ -1269,7 +1292,8 @@ impl ConversationView {
                 .first_output
                 .and_then(|_| self.response_timer.speed(Instant::now(), partial.output));
             usage.add(&partial);
-            if partial.total_input() > 0 {
+            if let Some(rate) = partial.cache_read_rate() {
+                cache_read_rate = Some(rate);
                 usage.last_context_tokens = partial.total_tokens;
             }
         }
@@ -1277,6 +1301,7 @@ impl ConversationView {
             model,
             thinking: agent.map_or(ThinkingLevel::Off, |agent| agent.thinking_level()),
             usage,
+            cache_read_rate,
             running: self.running,
             output_estimated,
             tokens_per_second,
@@ -1502,27 +1527,10 @@ impl ConversationView {
             cx.notify();
             return;
         }
-        self.overflow_retried = false;
-        if coding.needs_compaction() {
-            self.compact_then(None, Some(Followup::Prompt(Box::new(message))), cx);
-        } else {
-            self.run_followup(Followup::Prompt(Box::new(message)), cx);
-        }
+        self.start_run(cx, move |coding| async move {
+            coding.prompt(zp_agent::PromptInput(vec![message])).await
+        });
         self.focus_composer(window, cx);
-    }
-
-    pub(super) fn run_followup(&mut self, followup: Followup, cx: &mut Context<Self>) {
-        match followup {
-            Followup::Prompt(message) => self.start_run(cx, move |coding| async move {
-                coding.prompt(zp_agent::PromptInput(vec![*message])).await
-            }),
-            Followup::Retry => {
-                self.start_run(
-                    cx,
-                    |coding| async move { coding.agent().continue_run().await },
-                )
-            }
-        }
     }
 
     fn start_run<F, Fut>(&mut self, cx: &mut Context<Self>, run: F)
@@ -1536,6 +1544,11 @@ impl ConversationView {
             return;
         };
         coding.set_subagents(crate::approvals::project_subagents(&self.root, cx));
+        coding.agent().set_cache_retention(
+            crate::store::AppSettings::get(cx)
+                .cache_retention
+                .unwrap_or_default(),
+        );
         if let Some(model) = coding.agent().model() {
             AppModels::remember_model(&model, cx);
         }
@@ -1576,13 +1589,6 @@ impl ConversationView {
         self.clear_approvals();
         self.clear_questions();
         self.invalidate_files();
-        // A request too large for the context: compact once and try again.
-        if !self.overflow_retried && self.coding.as_ref().is_some_and(|c| c.overflowed()) {
-            self.overflow_retried = true;
-            cx.emit(ConversationEvent::StatusChanged);
-            self.compact_then(None, Some(Followup::Retry), cx);
-            return;
-        }
         let failed = self.has_failed();
         self.stop_status_updates(cx);
         cx.emit(ConversationEvent::StatusChanged);
@@ -1681,7 +1687,7 @@ impl ConversationView {
         let Some(coding) = self.coding.clone() else {
             return;
         };
-        if self.running {
+        if self.running || self.compacting {
             return;
         }
         if let Err(error) = coding.prepare_retry() {

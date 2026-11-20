@@ -27,7 +27,8 @@ pub use agent::{
 pub use agent_loop::StreamFn;
 pub use event::AgentEvent;
 pub use hooks::{
-    AfterToolCall, AgentHooks, BeforeToolCall, NoHooks, ToolCallDecision, ToolResultOverride,
+    AfterToolCall, AgentHooks, BeforeModelRequest, BeforeToolCall, CompactionTrigger,
+    ContextCompaction, NoHooks, ToolCallDecision, ToolResultOverride,
 };
 pub use message::{AgentMessage, CustomMessage, CustomRole, default_convert_to_llm};
 pub use schema::validate_arguments;

@@ -490,20 +490,24 @@ impl Session {
         else {
             unreachable!()
         };
+        let kept_from = path[..at]
+            .iter()
+            .position(|entry| &entry.id == first_kept_entry_id)
+            .unwrap_or(at);
+        let retained = path[kept_from..at]
+            .iter()
+            .filter(|entry| entry.message().is_some())
+            .count();
         context.messages.push(
             CustomMessage {
                 content: vec![UserContent::text(summary.clone())],
-                details: Some(json!({"tokensBefore": tokens_before})),
+                details: Some(json!({"tokensBefore": tokens_before, "retainedMessages": retained})),
                 timestamp: path[at].timestamp,
                 ..CustomMessage::text(COMPACTION_SUMMARY_TYPE, "")
             }
             .into(),
         );
         context.entry_ids.push(path[at].id.clone());
-        let kept_from = path[..at]
-            .iter()
-            .position(|entry| &entry.id == first_kept_entry_id)
-            .unwrap_or(at);
         for entry in path[kept_from..at].iter().chain(&path[at + 1..]) {
             push(entry, &mut context);
         }

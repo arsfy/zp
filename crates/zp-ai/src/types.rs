@@ -326,6 +326,12 @@ impl Usage {
         self.total_tokens = self.input + self.output + self.cache_read + self.cache_write;
     }
 
+    /// Fraction of reported input tokens read from cache, from zero to one.
+    pub fn cache_read_rate(&self) -> Option<f64> {
+        let input = self.total_input();
+        (input > 0).then(|| self.cache_read as f64 / input as f64)
+    }
+
     /// All input tokens, cached or not.
     pub fn total_input(&self) -> u64 {
         self.input + self.cache_read + self.cache_write

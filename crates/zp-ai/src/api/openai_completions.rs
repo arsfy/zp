@@ -232,7 +232,16 @@ pub(crate) fn build_request(
     let mut messages = convert_messages(model, context, compat);
     let mut tools = convert_tools(context, compat);
     if compat.anthropic_cache_control {
-        apply_anthropic_cache_control(&mut messages, &mut tools);
+        if let Some(control) = options.cache_retention.anthropic_control(
+            model
+                .compat
+                .supports_long_cache_retention
+                .unwrap_or(compat.send_session_header),
+        ) {
+            apply_anthropic_cache_control(&mut messages, &mut tools, &control);
+        }
+    } else {
+        super::add_openai_cache_options(&mut body, model, options, false);
     }
     body.insert("messages".into(), Value::Array(messages));
     if !tools.is_empty() {
@@ -546,37 +555,42 @@ fn convert_assistant(
 }
 
 /// Claude behind OpenRouter needs explicit cache breakpoints.
-fn apply_anthropic_cache_control(messages: &mut [Value], tools: &mut [Value]) {
-    let cache_control = json!({"type": "ephemeral"});
-    let mark = |message: &mut Value| match message.get_mut("content") {
-        Some(Value::String(text)) => {
-            let text = std::mem::take(text);
-            message["content"] =
-                json!([{"type": "text", "text": text, "cache_control": cache_control}]);
-        }
-        Some(Value::Array(parts)) => {
-            if let Some(part) = parts.iter_mut().rev().find(|part| part["type"] == "text") {
-                part["cache_control"] = cache_control.clone();
+fn apply_anthropic_cache_control(messages: &mut [Value], tools: &mut [Value], control: &Value) {
+    fn mark(message: &mut Value, control: &Value) -> bool {
+        match message.get_mut("content") {
+            Some(Value::String(text)) if !text.is_empty() => {
+                let text = std::mem::take(text);
+                message["content"] =
+                    json!([{"type": "text", "text": text, "cache_control": control}]);
+                true
             }
+            Some(Value::Array(parts)) => {
+                let Some(part) = parts.iter_mut().rev().find(|part| part["type"] == "text") else {
+                    return false;
+                };
+                part["cache_control"] = control.clone();
+                true
+            }
+            _ => false,
         }
-        _ => {}
-    };
+    }
     if let Some(system) = messages
         .iter_mut()
         .find(|m| m["role"] == "system" || m["role"] == "developer")
     {
-        mark(system);
+        mark(system, control);
     }
-    if let Some(last) = messages
-        .iter_mut()
-        .rev()
-        .find(|m| m["role"] == "user" || m["role"] == "tool")
-        .filter(|m| m["role"] == "user")
-    {
-        mark(last);
+    for message in messages.iter_mut().rev() {
+        if matches!(
+            message["role"].as_str(),
+            Some("user" | "assistant" | "tool")
+        ) && mark(message, control)
+        {
+            break;
+        }
     }
     if let Some(tool) = tools.last_mut() {
-        tool["function"]["cache_control"] = cache_control.clone();
+        tool["cache_control"] = control.clone();
     }
 }
 
@@ -1059,6 +1073,51 @@ mod tests {
             messages[2],
             json!({"role": "tool", "content": "contents", "tool_call_id": "call_1"})
         );
+    }
+
+    #[test]
+    fn cache_options_include_tool_results_and_respect_supported_endpoints() {
+        use crate::{CacheRetention, PromptCacheKeyMode};
+        let openai = model("openai", "https://api.openai.com/v1");
+        let mut options = StreamOptions {
+            session_id: Some("session".into()),
+            ..Default::default()
+        };
+        let context = Context::default();
+        let request = |model: &Model, options: &StreamOptions| {
+            build_request(model, &context, options, &Compat::resolve(model))
+        };
+        assert_eq!(request(&openai, &options)["prompt_cache_key"], "session");
+        let mut proxy = model("proxy", "https://proxy.example/v1");
+        assert!(request(&proxy, &options).get("prompt_cache_key").is_none());
+        proxy.compat.prompt_cache_key_mode = Some(PromptCacheKeyMode::Enabled);
+        assert_eq!(request(&proxy, &options)["prompt_cache_key"], "session");
+        options.cache_retention = CacheRetention::Long;
+        assert!(
+            request(&proxy, &options)
+                .get("prompt_cache_retention")
+                .is_none()
+        );
+        proxy.compat.supports_long_cache_retention = Some(true);
+        assert_eq!(request(&proxy, &options)["prompt_cache_retention"], "24h");
+        options.cache_retention = CacheRetention::None;
+        assert!(request(&proxy, &options).get("prompt_cache_key").is_none());
+        assert!(
+            request(&proxy, &options)
+                .get("prompt_cache_retention")
+                .is_none()
+        );
+
+        let mut messages = [
+            json!({"role": "user", "content": "question"}),
+            json!({"role": "tool", "content": "result"}),
+        ];
+        let mut tools = [json!({"type": "function", "function": {"name": "read"}})];
+        let control = json!({"type": "ephemeral"});
+        apply_anthropic_cache_control(&mut messages, &mut tools, &control);
+        assert_eq!(messages[1]["content"][0]["cache_control"], control);
+        assert_eq!(tools[0]["cache_control"], control);
+        assert_eq!(messages[0]["content"], "question");
     }
 
     async fn decode(model: &Model, chunks: &[&str]) -> AssistantMessage {

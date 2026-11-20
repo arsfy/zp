@@ -343,18 +343,27 @@ fn automatic_compaction_before_a_prompt(cx: &mut TestAppContext) {
     let faux = FauxProvider::default();
     for response in [
         FauxResponse::text("a1"),
-        FauxResponse::text("a2"),
+        FauxResponse::Message {
+            blocks: vec![zp_ai::FauxBlock::Text("a2".into())],
+            stop_reason: None,
+            usage: zp_ai::Usage {
+                input: 120_000,
+                output: 5,
+                total_tokens: 120_005,
+                ..Default::default()
+            },
+        },
         FauxResponse::text("## Goal\nAuto summary"),
         FauxResponse::text("a3"),
     ] {
         faux.push(response);
     }
     let data = setup_models(cx, &[&faux], false);
-    // Leave no room in the window, so every prompt compacts first.
+    // The second reply reports a context above the default compaction threshold.
     let mut settings =
         zp_core::settings::Settings::load(&zp_core::paths::settings_file(data.path())).unwrap();
     settings.compaction = Some(zp_core::compaction::CompactionSettings {
-        reserve_tokens: 1_000_000,
+        reserve_tokens: 16_384,
         ..Default::default()
     });
     settings.generate_titles = Some(false);
@@ -376,7 +385,7 @@ fn automatic_compaction_before_a_prompt(cx: &mut TestAppContext) {
     assert_eq!(
         compactions(&conversation, cx),
         0,
-        "nothing older than the last turn yet"
+        "the second response crossed the threshold for the next request"
     );
     send(window, "q3", cx);
     wait_until(cx, |_| faux.pending() == 0);

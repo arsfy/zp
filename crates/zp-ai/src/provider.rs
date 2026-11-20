@@ -7,7 +7,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::api;
 use crate::event::{AssistantMessageStream, error_stream};
-use crate::model::{Api, Model};
+use crate::model::{Api, Model, PromptCacheKeyMode};
 use crate::oauth::OAuthFlow;
 use crate::options::StreamOptions;
 use crate::sync::{SyncError, UpstreamModel, list_upstream_models};
@@ -98,6 +98,8 @@ pub struct HttpProvider {
     models: Arc<[Model]>,
     oauth: Option<Arc<dyn OAuthFlow>>,
     accepts_api_key: bool,
+    prompt_cache_key_mode: Option<PromptCacheKeyMode>,
+    supports_long_cache_retention: Option<bool>,
 }
 
 impl HttpProvider {
@@ -127,6 +129,8 @@ impl HttpProvider {
             models: models.into(),
             oauth: None,
             accepts_api_key: true,
+            prompt_cache_key_mode: None,
+            supports_long_cache_retention: None,
         }
     }
 
@@ -157,6 +161,17 @@ impl HttpProvider {
     /// Links the provider to its models.dev entry.
     pub fn with_models_dev_id(mut self, id: impl Into<String>) -> Self {
         self.models_dev_id = Some(id.into());
+        self
+    }
+
+    /// Overrides cache capabilities for models on this endpoint, including discovered models.
+    pub fn with_cache_compat(
+        mut self,
+        prompt_cache_key_mode: Option<PromptCacheKeyMode>,
+        supports_long_cache_retention: Option<bool>,
+    ) -> Self {
+        self.prompt_cache_key_mode = prompt_cache_key_mode;
+        self.supports_long_cache_retention = supports_long_cache_retention;
         self
     }
 
@@ -216,15 +231,20 @@ impl Provider for HttpProvider {
         context: &Context,
         options: StreamOptions,
     ) -> AssistantMessageStream {
+        let mut model = model.clone();
+        if let Some(mode) = self.prompt_cache_key_mode {
+            model.compat.prompt_cache_key_mode = Some(mode);
+        }
+        if let Some(supported) = self.supports_long_cache_retention {
+            model.compat.supports_long_cache_retention = Some(supported);
+        }
         match model.api {
-            Api::AnthropicMessages => {
-                api::anthropic::stream(model.clone(), context.clone(), options)
-            }
+            Api::AnthropicMessages => api::anthropic::stream(model, context.clone(), options),
             Api::OpenAiCompletions => {
-                api::openai_completions::stream(model.clone(), context.clone(), options)
+                api::openai_completions::stream(model, context.clone(), options)
             }
             Api::OpenAiResponses | Api::OpenAiCodexResponses => {
-                api::openai_responses::stream(model.clone(), context.clone(), options)
+                api::openai_responses::stream(model, context.clone(), options)
             }
             Api::Faux => error_stream(
                 AssistantMessage::empty(model.api.as_str(), &model.provider, &model.id),

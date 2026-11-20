@@ -1,8 +1,11 @@
 //! Lifecycle events emitted by the agent.
 
+use std::sync::Arc;
+
 use serde_json::Value;
 use zp_ai::{AssistantMessage, AssistantMessageEvent, ToolResultMessage};
 
+use crate::hooks::{CompactionTrigger, ContextCompaction};
 use crate::message::AgentMessage;
 use crate::tool::AgentToolResult;
 
@@ -30,6 +33,18 @@ pub enum AgentEvent {
     },
     /// A turn (one model response plus its tool calls) started.
     TurnStart,
+    /// A committed compaction replaced the model's context before the request.
+    ContextCompacted {
+        /// The replacement context and its boundary.
+        compaction: Arc<ContextCompaction>,
+        /// What triggered compaction.
+        trigger: CompactionTrigger,
+    },
+    /// Compaction failed and the existing context was preserved.
+    ContextCompactionFailed {
+        /// Failure reported by the summarizer or session store.
+        error: String,
+    },
     /// A turn finished.
     TurnEnd {
         /// The turn's assistant message.
@@ -95,6 +110,8 @@ impl AgentEvent {
             Self::AgentEnd { .. } => "agent_end",
             Self::TurnStart => "turn_start",
             Self::TurnEnd { .. } => "turn_end",
+            Self::ContextCompacted { .. } => "context_compacted",
+            Self::ContextCompactionFailed { .. } => "context_compaction_failed",
             Self::MessageStart { .. } => "message_start",
             Self::MessageUpdate { .. } => "message_update",
             Self::MessageEnd { .. } => "message_end",

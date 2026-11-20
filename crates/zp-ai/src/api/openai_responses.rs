@@ -223,10 +223,7 @@ pub(crate) fn build_request(model: &Model, context: &Context, options: &StreamOp
     input.extend(convert_messages(model, &messages));
     body.insert("input".into(), Value::Array(input));
 
-    if let Some(session) = options.session_id.as_deref() {
-        let key: String = session.chars().take(64).collect();
-        body.insert("prompt_cache_key".into(), Value::from(key));
-    }
+    super::add_openai_cache_options(&mut body, model, options, true);
     if !codex && !chatgpt_token {
         if let Some(max_tokens) = options.max_tokens {
             body.insert(
@@ -789,6 +786,29 @@ mod tests {
                 parameters: json!({"type": "object", "properties": {"path": {"type": "string"}}}),
             }],
         }
+    }
+
+    #[test]
+    fn modern_openai_cache_policy_does_not_use_legacy_retention_fields() {
+        let mut model = test_model(Api::OpenAiResponses);
+        model.base_url = OPENAI_BASE_URL.into();
+        model.id = "gpt-5.6".into();
+        let options = |cache_retention| StreamOptions {
+            session_id: Some("session".into()),
+            cache_retention,
+            ..Default::default()
+        };
+        let long = build_request(&model, &context(), &options(crate::CacheRetention::Long));
+        assert_eq!(long["prompt_cache_options"]["ttl"], "12h");
+        assert_eq!(long["prompt_cache_key"], "session");
+        assert!(long.get("prompt_cache_retention").is_none());
+
+        let disabled = build_request(&model, &context(), &options(crate::CacheRetention::None));
+        assert_eq!(
+            disabled["prompt_cache_options"],
+            json!({"mode": "explicit"})
+        );
+        assert!(disabled.get("prompt_cache_key").is_none());
     }
 
     #[test]

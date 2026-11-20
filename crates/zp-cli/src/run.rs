@@ -291,6 +291,7 @@ pub(crate) async fn run(models: &Models, args: RunArgs) -> Result<()> {
     options.append_system_prompt = args.append_system_prompt;
     options.request_options = StreamOptions {
         max_tokens: args.max_tokens,
+        cache_retention: user_settings.cache_retention.unwrap_or_default(),
         ..StreamOptions::default()
     };
     let coding = CodingSession::new(options)?;
@@ -368,6 +369,9 @@ fn print_usage(coding: &CodingSession, style: Style) {
         .agent()
         .model()
         .map_or(0, |model| model.context_window);
+    let cache = coding
+        .last_cache_read_rate()
+        .map_or_else(String::new, |rate| format!(" · cache {:.0}%", rate * 100.0));
     let context = if window > 0 && usage.last_context_tokens > 0 {
         format!(
             " · context {:.0}%",
@@ -381,11 +385,8 @@ fn print_usage(coding: &CodingSession, style: Style) {
         style.paint(
             "2",
             &format!(
-                "tokens: in {} (+{} cached) · out {} · cost ${:.4}{context}",
-                usage.input,
-                usage.cache_read + usage.cache_write,
-                usage.output,
-                usage.cost
+                "tokens: in {} (+{} read, +{} written) · out {} · cost ${:.4}{cache}{context}",
+                usage.input, usage.cache_read, usage.cache_write, usage.output, usage.cost
             )
         )
     );
@@ -419,19 +420,7 @@ async fn run_prompt(coding: &CodingSession, input: &str) -> Result<Vec<AgentMess
     for note in notes {
         eprintln!("{}", style.paint("33", &note));
     }
-    if coding.needs_compaction() {
-        compact(coding, None).await?;
-    }
-    let mut added = abortable(coding, coding.prompt(PromptInput(vec![message]))).await?;
-    if coding.overflowed() {
-        eprintln!(
-            "{}",
-            style.paint("2", "context overflow; compacting and retrying")
-        );
-        compact(coding, None).await?;
-        added.extend(abortable(coding, coding.agent().continue_run()).await?);
-    }
-    Ok(added)
+    abortable(coding, coding.prompt(PromptInput(vec![message]))).await
 }
 
 async fn abortable(
@@ -451,13 +440,14 @@ async fn abortable(
 async fn compact(coding: &CodingSession, focus: Option<&str>) -> Result<()> {
     let style = Style::detect();
     eprintln!("{}", style.paint("2", "compacting…"));
-    match coding.compact(focus).await? {
-        Some((before, after)) => eprintln!(
-            "{}",
-            style.paint("2", &format!("compacted: ~{before} → ~{after} tokens"))
-        ),
-        None => eprintln!("{}", style.paint("2", "nothing to compact yet")),
-    }
+    let Some((before, after)) = coding.compact(focus).await? else {
+        eprintln!("{}", style.paint("2", "nothing to compact yet"));
+        return Ok(());
+    };
+    eprintln!(
+        "{}",
+        style.paint("2", &format!("compacted: ~{before} → ~{after} tokens"))
+    );
     Ok(())
 }
 
@@ -682,6 +672,26 @@ impl Printer {
         let mut stdout = std::io::stdout();
         let mut stderr = std::io::stderr();
         match event {
+            AgentEvent::ContextCompacted {
+                compaction,
+                trigger,
+            } => {
+                let notice = format!(
+                    "compacted: ~{} → ~{} tokens",
+                    compaction.tokens_before, compaction.tokens_after
+                );
+                let _ = writeln!(stderr, "{}", self.style.paint("2", &notice));
+                if *trigger == zp_agent::CompactionTrigger::ProviderError {
+                    let _ = writeln!(
+                        stderr,
+                        "{}",
+                        self.style.paint("2", "retrying after context overflow")
+                    );
+                }
+            }
+            AgentEvent::ContextCompactionFailed { error } => {
+                let _ = writeln!(stderr, "{}", self.style.paint("33", error));
+            }
             AgentEvent::MessageUpdate { event } => match event {
                 AssistantMessageEvent::ThinkingStart { .. } => {
                     let _ = write!(stderr, "{}", self.style.paint("2;3", "thinking: "));

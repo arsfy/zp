@@ -818,15 +818,6 @@ impl ConversationView {
 
     /// Summarizes older messages; then runs `then` (a prompt or a retry) if given.
     pub(crate) fn compact(&mut self, focus: Option<String>, cx: &mut Context<Self>) {
-        self.compact_then(focus, None, cx);
-    }
-
-    pub(super) fn compact_then(
-        &mut self,
-        focus: Option<String>,
-        then: Option<super::Followup>,
-        cx: &mut Context<Self>,
-    ) {
         let Some(coding) = self.coding.clone() else {
             return;
         };
@@ -863,13 +854,7 @@ impl ConversationView {
                 }
                 cx.emit(ConversationEvent::StatusChanged);
                 cx.emit(ConversationEvent::FilesChanged);
-                if let Some(then) = then
-                    && this.run_error.is_none()
-                {
-                    this.run_followup(then, cx);
-                } else {
-                    this.stop_status_updates(cx);
-                }
+                this.stop_status_updates(cx);
                 cx.notify();
             });
         }));
