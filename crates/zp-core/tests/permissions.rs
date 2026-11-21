@@ -282,6 +282,7 @@ async fn auto_review_and_destructive_commands() {
     // The agent and the review model share the scripted provider, in call order.
     faux.push(call("bash", json!({"command": "ls"})));
     faux.push(call("bash", json!({"command": "printf reviewed"})));
+    faux.push(FauxResponse::text("It prints text safely."));
     faux.push(FauxResponse::text(
         r#"{"decision": "allow", "reason": "prints text"}"#,
     ));
@@ -344,7 +345,8 @@ async fn auto_review_and_destructive_commands() {
         "rules that ask need no explanation"
     );
     // The review saw the user's request and the command.
-    let review = &faux.requests()[2];
+    let model_requests = faux.requests();
+    let review = &model_requests[2];
     let text: String = match &review.messages[0] {
         zp_ai::Message::User(user) => user
             .content
@@ -354,6 +356,15 @@ async fn auto_review_and_destructive_commands() {
         _ => panic!("expected the review request"),
     };
     assert!(text.contains("clean up") && text.contains("Shell command:\nprintf reviewed"));
+    let retry = &model_requests[3];
+    assert_eq!(retry.messages, review.messages);
+    assert!(
+        retry
+            .system_prompt
+            .as_deref()
+            .unwrap()
+            .contains("Finish the review now")
+    );
 
     // Switching to full auto lets anything run.
     coding
