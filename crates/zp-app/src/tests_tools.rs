@@ -3,7 +3,7 @@
 
 use gpui::{Entity, Modifiers, TestAppContext, VisualTestContext, WindowHandle};
 use serde_json::json;
-use zp_ai::{FauxProvider, FauxResponse, UserContent};
+use zp_ai::{FauxBlock, FauxProvider, FauxResponse, UserContent};
 use zp_core::permissions::PermissionMode;
 
 use crate::conversation::ConversationView;
@@ -193,13 +193,15 @@ fn a_subagent_card_stays_open_while_it_runs_and_a_cancelled_one_does_not_count_a
 ) {
     use zp_core::subagents::{Approval, Report, Status, SubagentSettings};
 
-    let faux = FauxProvider::default().with_chunk_delay(std::time::Duration::from_millis(50));
+    let faux = FauxProvider::default();
     faux.push(FauxResponse::tool_call(
         "subagent",
         json!({"task": "Find where add() is tested"}),
     ));
-    // The child (on the main model) streams slowly enough to be cancelled.
-    faux.push(FauxResponse::text("word ".repeat(200)));
+    faux.push(FauxResponse::blocks(vec![
+        FauxBlock::Text("Looking for tests of add()".into()),
+        FauxBlock::WaitForCancellation,
+    ]));
     faux.push(FauxResponse::text("Done"));
     let _data = setup_models(cx, &[&faux], false);
     cx.update(|cx| {

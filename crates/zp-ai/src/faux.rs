@@ -26,6 +26,8 @@ pub enum FauxBlock {
         /// Arguments object.
         arguments: Value,
     },
+    /// Holds the response open until the request is cancelled.
+    WaitForCancellation,
 }
 
 /// A scripted response.
@@ -300,6 +302,10 @@ impl Provider for FauxProvider {
                                 arguments,
                             },
                         });
+                    }
+                    FauxBlock::WaitForCancellation => {
+                        cancel.cancelled().await;
+                        return sink.fail(StopReason::Aborted, "Request was aborted");
                     }
                 }
             }
