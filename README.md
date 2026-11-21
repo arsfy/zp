@@ -3,13 +3,12 @@
 <a href="https://github.com/arsfy/zp/releases/latest">
     <img alt="Release" src="https://img.shields.io/github/v/release/arsfy/zp?style=flat-square">
 </a>
-<a href="https://github.com/arsfy/zp/actions/workflows/release.yml">
-    <img alt="Build" src="https://img.shields.io/github/actions/workflow/status/arsfy/zp/release.yml?branch=main&style=flat-square">
-</a>
 <a href="https://github.com/arsfy/zp/actions/workflows/ci.yml">
     <img alt="CI" src="https://img.shields.io/github/actions/workflow/status/arsfy/zp/ci.yml?branch=main&amp;style=flat-square&amp;label=CI">
 </a>
-<img alt="License" src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue?style=flat-square">
+<a href="#">
+    <img alt="License" src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue?style=flat-square">
+</a>
 
 > Note: This is an early-stage project. It may contain various issues and could introduce breaking changes in the future.
 
