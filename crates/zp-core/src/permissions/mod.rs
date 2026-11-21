@@ -674,12 +674,12 @@ mod tests {
 
     #[test]
     fn temporary_directories_are_scratch_space_like_the_project() {
-        let project = tempfile::tempdir().unwrap();
-        let scratch = tempfile::tempdir().unwrap();
-        let elsewhere = tempfile::tempdir().unwrap();
-        let root = project.path().canonicalize().unwrap();
-        let temp = scratch.path().canonicalize().unwrap();
-        std::fs::create_dir(temp.join("build")).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().canonicalize().unwrap();
+        let root = base.join("project");
+        let temp = base.join("scratch");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::create_dir_all(temp.join("build")).unwrap();
         let none = Grants::default();
         let mut policy = policy(PermissionMode::AutoEdit, &root);
         policy.temp_directories = vec![temp.clone()];
@@ -692,20 +692,24 @@ mod tests {
             policy.evaluate("read", &json!({"path": temp.join("build")}), &none),
             Evaluation::Allow
         );
-        let outside = elsewhere.path().canonicalize().unwrap().join("x.txt");
+        let outside = base.join("x.txt");
         assert!(matches!(
             policy.evaluate("write", &write(&outside), &none),
             Evaluation::Ask { .. }
         ));
-        let rm = |target: &Path| json!({"command": format!("rm -rf {}", target.display())});
+        // Use project-relative Bash paths so the Windows check can resolve them too.
         assert_eq!(
-            policy.evaluate("bash", &rm(&temp.join("build")), &none),
+            policy.evaluate(
+                "bash",
+                &json!({"command": "rm -rf ../scratch/build"}),
+                &none,
+            ),
             Evaluation::Allow,
             "removing inside a temporary directory counts as an edit"
         );
         assert!(
             matches!(
-                policy.evaluate("bash", &rm(&temp), &none),
+                policy.evaluate("bash", &json!({"command": "rm -rf ../scratch"}), &none),
                 Evaluation::Ask { .. }
             ),
             "never the directory itself"
