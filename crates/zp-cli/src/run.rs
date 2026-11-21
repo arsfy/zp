@@ -371,7 +371,7 @@ fn print_usage(coding: &CodingSession, style: Style) {
         .map_or(0, |model| model.context_window);
     let cache = coding
         .last_cache_read_rate()
-        .map_or_else(String::new, |rate| format!(" · cache {:.0}%", rate * 100.0));
+        .map_or_else(String::new, |rate| format!(" · cache {:.1}%", rate * 100.0));
     let context = if window > 0 && usage.last_context_tokens > 0 {
         format!(
             " · context {:.0}%",

@@ -777,7 +777,7 @@ impl ProjectWindow {
                 format_tokens(input + usage.output)
             ));
             if let Some(rate) = status.cache_read_rate {
-                right.push(format!("cache {:.0}%", rate * 100.0));
+                right.push(format!("cache {:.1}%", rate * 100.0));
             }
             if let Some(speed) = status.tokens_per_second {
                 right.push(format!("{estimate}{speed:.0} tok/s"));
