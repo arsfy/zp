@@ -3,6 +3,7 @@
 //! and applied to the running app at once.
 
 mod about;
+mod jev;
 mod keybindings;
 mod mcp;
 mod models;
@@ -16,7 +17,7 @@ use gpui::{
 };
 use gpui_elements::editable_text::{EditableTextState, StringStorage, text_area, text_input};
 use zp_ai::{CacheRetention, ThinkingLevel};
-use zp_core::permissions::PermissionMode;
+use zp_core::permissions::{PermissionMode, ReviewBackend};
 use zp_core::settings::{BlockDisplay, ThemeChoice, TranscriptSettings};
 
 use crate::review_model_picker::{ReviewModelEvent, ReviewModelPicker};
@@ -152,6 +153,7 @@ pub struct SettingsWindow {
     // Permissions
     review_model_picker: Option<Entity<ReviewModelPicker>>,
     review_model_subscription: Option<Subscription>,
+    jev_form: Option<jev::JevForm>,
     allow_commands: Entity<EditableTextState>,
     directories: Entity<EditableTextState>,
     subagent_form: subagents::SubagentForm,
@@ -257,6 +259,7 @@ impl SettingsWindow {
             dialog_subscription: None,
             review_model_picker: None,
             review_model_subscription: None,
+            jev_form: None,
             allow_commands,
             directories,
             subagent_form,
@@ -280,6 +283,7 @@ impl SettingsWindow {
             self.dialog_subscription = None;
             self.review_model_picker = None;
             self.review_model_subscription = None;
+            self.jev_form = None;
             self.stop_recording();
         }
         cx.notify();
@@ -329,20 +333,31 @@ impl SettingsWindow {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if mode == PermissionMode::AutoReview
-            && !AppSettings::get(cx)
-                .permissions
-                .review_model
-                .as_deref()
-                .is_some_and(|spec| {
-                    let models = &cx.global::<AppModels>().models;
-                    models
-                        .find(spec)
-                        .is_some_and(|model| models.resolve_auth(&model.provider).is_some())
-                })
-        {
-            self.open_review_model_picker(true, window, cx);
-            return;
+        if mode == PermissionMode::AutoReview {
+            let permissions = &AppSettings::get(cx).permissions;
+            let models = &cx.global::<AppModels>().models;
+            match permissions.review_backend.unwrap_or_default() {
+                ReviewBackend::Llm
+                    if !permissions.review_model.as_deref().is_some_and(|spec| {
+                        models
+                            .find(spec)
+                            .is_some_and(|model| models.resolve_auth(&model.provider).is_some())
+                    }) =>
+                {
+                    self.open_review_model_picker(true, window, cx);
+                    return;
+                }
+                ReviewBackend::Jev
+                    if permissions
+                        .review_jev
+                        .as_ref()
+                        .is_some_and(|config| config.endpoint().is_err()) =>
+                {
+                    self.show_jev_configuration(jev::OnJevSave::EnableAutoReview, cx);
+                    return;
+                }
+                _ => {}
+            }
         }
         let result = AppSettings::update(cx, |s| s.permissions.mode = Some(mode));
         self.report(result, cx);
@@ -634,6 +649,10 @@ impl SettingsWindow {
 
     fn render_permissions(&self, cx: &mut Context<Self>) -> AnyElement {
         let current = AppSettings::get(cx).permissions.mode.unwrap_or_default();
+        let backend = AppSettings::get(cx)
+            .permissions
+            .review_backend
+            .unwrap_or_default();
         let review_thinking = AppSettings::get(cx)
             .permissions
             .review_thinking
@@ -660,13 +679,16 @@ impl SettingsWindow {
                 "Model used to review tool calls.",
                 cx,
             ))
-            .child(div().flex().child(
+            .child(self.render_review_backend(backend, cx))
+            .children(self.render_jev_configuration(cx))
+            .when(backend == ReviewBackend::Llm, |body| body.child(div().flex().child(
                 button(
                     "review-model-button",
                     format!("{} \u{25be}", AppSettings::get(cx).permissions.review_model.as_deref().map(crate::ui::model_display_name).unwrap_or("Choose a model")),
                     ButtonKind::Normal,
                     cx,
                 )
+                .debug_selector(|| "review-model-button".into())
                 .max_w_full()
                 .truncate()
                 .on_click(cx.listener(|this, _, window, cx| this.open_review_model_picker(false, window, cx))),
@@ -681,7 +703,7 @@ impl SettingsWindow {
                 levels.iter().map(|level| (level.as_str().to_owned(), *level == review_thinking)),
                 cx,
                 move |this, index, cx| this.set_review_thinking(levels[index], cx),
-            )))
+            ))))
             .child(section(
                 "Allowed commands",
                 "Command prefixes that run without asking, one per line (e.g. `cargo test`, `git status`). Destructive commands always ask.",
@@ -1037,6 +1059,7 @@ fn segmented(
             let on_select = on_select.clone();
             div()
                 .id((id, index))
+                .debug_selector(move || format!("{id}-{index}"))
                 .px_3()
                 .py_1()
                 .rounded(px(4.))

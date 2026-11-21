@@ -6,6 +6,7 @@
 //! GUI's approval card, a terminal prompt), and in auto-review mode first to a review
 //! model.
 
+pub mod jev;
 pub mod review;
 pub mod shell;
 
@@ -244,9 +245,20 @@ pub struct PermissionPolicy {
     pub review_model: Option<String>,
     /// How much the review model reasons; clamped to what the model supports.
     pub review_thinking: zp_ai::ThinkingLevel,
+    pub review_backend: ReviewBackend,
+    pub review_jev: jev::JevSettings,
     /// Temporary directories (canonical) the tools may use like the project: file tools
     /// work there without asking, and removals there count as edits.
     pub temp_directories: Vec<PathBuf>,
+}
+
+/// Which service decides calls that reach Auto-review.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ReviewBackend {
+    #[default]
+    Llm,
+    Jev,
 }
 
 /// Grants made with "approve for session".
@@ -331,6 +343,18 @@ pub fn tool_paths(tool: &str, args: &Value, cwd: &Path) -> Vec<PathBuf> {
 }
 
 impl PermissionPolicy {
+    /// Whether the app has a configured reviewer for this policy.
+    pub fn review_is_configured(&self, models: &Models) -> bool {
+        match self.review_backend {
+            ReviewBackend::Llm => self
+                .review_model
+                .as_deref()
+                .and_then(|spec| models.find(spec))
+                .is_some_and(|model| models.resolve_auth(&model.provider).is_some()),
+            ReviewBackend::Jev => self.review_jev.endpoint().is_ok(),
+        }
+    }
+
     /// Whether `path` (canonical) is inside the project or an allowed directory.
     pub fn in_scope(&self, path: &Path, grants: &Grants) -> bool {
         path.starts_with(&self.root)
@@ -515,32 +539,42 @@ impl PermissionGate {
             Evaluation::Allow => return ToolCallDecision::Allow,
             Evaluation::Ask { reasons, grants } => (reasons, grants, None),
             Evaluation::Review { grants } => {
-                let model = policy
-                    .review_model
-                    .as_deref()
-                    .and_then(|spec| self.models.find(spec))
-                    .or_else(|| {
-                        agent_model.map(|model| crate::title::title_model(&self.models, model))
-                    });
                 let intent = last_user_text(messages);
                 let _reviewing = Reviewing::start(self.approver.as_ref(), &call.id);
-                let verdict = match model {
-                    Some(model) => {
-                        let review = review::review_tool_call(
+                let review = async {
+                    if policy.review_backend == ReviewBackend::Jev {
+                        return jev::review_tool_call(
                             &self.models,
-                            &model,
                             &policy,
-                            &current_grants,
                             intent.as_deref(),
                             &call.name,
                             args,
-                        );
-                        tokio::select! {
-                            verdict = review => verdict,
-                            () = cancel.cancelled() => return aborted(),
-                        }
+                        )
+                        .await;
                     }
-                    None => Err(anyhow::anyhow!("no review model is available")),
+                    let model = policy
+                        .review_model
+                        .as_deref()
+                        .and_then(|spec| self.models.find(spec))
+                        .or_else(|| {
+                            agent_model.map(|model| crate::title::title_model(&self.models, model))
+                        })
+                        .ok_or_else(|| anyhow::anyhow!("no review model is available"))?;
+                    review::review_tool_call(
+                        &self.models,
+                        &model,
+                        &policy,
+                        &current_grants,
+                        intent.as_deref(),
+                        &call.name,
+                        args,
+                    )
+                    .await
+                };
+                let verdict = tokio::select! {
+                    biased;
+                    () = cancel.cancelled() => return aborted(),
+                    verdict = review => verdict,
                 };
                 match verdict {
                     Ok(review::Verdict::Allow(_)) => return ToolCallDecision::Allow,

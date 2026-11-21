@@ -139,13 +139,9 @@ pub fn project_policy(root: &Path, cx: &App) -> PermissionPolicy {
         policy.review_model = Some(model);
     }
     if policy.mode == PermissionMode::AutoReview
-        && !policy.review_model.as_deref().is_some_and(|spec| {
-            cx.try_global::<AppModels>().is_some_and(|app| {
-                app.models
-                    .find(spec)
-                    .is_some_and(|model| app.models.resolve_auth(&model.provider).is_some())
-            })
-        })
+        && !cx
+            .try_global::<AppModels>()
+            .is_some_and(|app| policy.review_is_configured(&app.models))
     {
         policy.mode = PermissionMode::Ask;
     }

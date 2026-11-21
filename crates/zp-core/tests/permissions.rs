@@ -445,6 +445,139 @@ async fn review_model_reads_project_files_before_deciding() {
     );
 }
 
+#[tokio::test]
+async fn jev_reviews_with_system_one_and_escalates_uncertain_or_failed_calls() {
+    use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt as _, BufReader};
+    use tokio::net::TcpListener;
+    use tokio_util::sync::CancellationToken;
+    use zp_agent::ToolCallDecision;
+    use zp_ai::ToolCall;
+    use zp_core::credentials::Credentials;
+    use zp_core::permissions::ReviewBackend;
+    use zp_core::permissions::jev::{JevSettings, credential_id};
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let jev = JevSettings {
+        base_url: format!("http://{}/gateway/", listener.local_addr().unwrap()),
+        model: "test/jev".into(),
+    };
+    let credentials = Arc::new(Credentials::in_memory());
+    credentials
+        .set(&credential_id(&jev.endpoint().unwrap()), "jev-fixture")
+        .unwrap();
+    let models = Models::new().with_credentials(credentials);
+    let server = tokio::spawn(async move {
+        let decisions = |risk, scope| {
+            json!({"answers": {
+                "low_risk": {"type": "noul", "noul": risk},
+                "in_scope": {"type": "noul", "noul": scope},
+            }})
+        };
+        for (status, response) in [
+            ("200 OK", decisions(0.90, 0.99)),
+            ("200 OK", decisions(0.99, 0.80)),
+            ("200 OK", decisions(1.5, 0.99)),
+            ("503 Service Unavailable", json!({})),
+        ] {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut stream = BufReader::new(stream);
+            let mut line = String::new();
+            stream.read_line(&mut line).await.unwrap();
+            assert_eq!(line, "POST /gateway/v1/systemone HTTP/1.1\r\n");
+            let mut length = None;
+            let mut authenticated = false;
+            loop {
+                line.clear();
+                assert_ne!(stream.read_line(&mut line).await.unwrap(), 0);
+                if line == "\r\n" {
+                    break;
+                }
+                let (name, value) = line.trim_end().split_once(':').unwrap();
+                if name.eq_ignore_ascii_case("content-length") {
+                    length = Some(value.trim().parse::<usize>().unwrap());
+                }
+                if name.eq_ignore_ascii_case("authorization") {
+                    authenticated = value.trim() == "Bearer jev-fixture";
+                }
+            }
+            assert!(authenticated);
+            let mut body = vec![0; length.unwrap()];
+            stream.read_exact(&mut body).await.unwrap();
+            let request: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(request["model"], "test/jev");
+            assert_eq!(request["state"]["task"], "Run the tests");
+            assert_eq!(
+                request["state"]["tool_call"],
+                json!({"name": "bash", "arguments": {"command": "cargo test"}})
+            );
+            assert_eq!(request["questions"]["low_risk"]["type"], "noul");
+            assert_eq!(request["questions"]["in_scope"]["type"], "noul");
+            let response = response.to_string();
+            let wire = format!(
+                "HTTP/1.1 {status}\r\nconnection: close\r\ncontent-length: {}\r\n\r\n{response}",
+                response.len()
+            );
+            stream.get_mut().write_all(wire.as_bytes()).await.unwrap();
+        }
+    });
+
+    let dir = tempfile::tempdir().unwrap();
+    let approver = Arc::new(Scripted::default());
+    approver
+        .answers
+        .lock()
+        .unwrap()
+        .extend((0..4).map(|_| Decision::Deny(None)));
+    let gate = PermissionGate::new(
+        PermissionPolicy {
+            mode: PermissionMode::AutoReview,
+            root: dir.path().canonicalize().unwrap(),
+            review_backend: ReviewBackend::Jev,
+            review_jev: jev,
+            ..PermissionPolicy::default()
+        },
+        approver.clone(),
+        models,
+    );
+    let messages = [AgentMessage::user("Run the tests")];
+    for (command, expected_allow) in [
+        ("git push", false),
+        ("cargo test", true),
+        ("cargo test", false),
+        ("cargo test", false),
+        ("cargo test", false),
+    ] {
+        let call = ToolCall {
+            id: "test".into(),
+            name: "bash".into(),
+            arguments: json!({"command": command}),
+        };
+        let decision = gate
+            .check(
+                &call,
+                &call.arguments,
+                None,
+                &messages,
+                &CancellationToken::new(),
+            )
+            .await;
+        assert_eq!(matches!(decision, ToolCallDecision::Allow), expected_allow);
+    }
+    server.await.unwrap();
+    let requests = approver.requests.lock().unwrap();
+    assert!(matches!(
+        &requests[0].reasons[..],
+        [AskReason::Dangerous(_)]
+    ));
+    for (request, reason) in requests[1..].iter().zip([
+        "in scope 80%",
+        "invalid Jev decision probabilities",
+        "HTTP 503",
+    ]) {
+        assert!(matches!(&request.reasons[..], [AskReason::Review(text)] if text.contains(reason)));
+    }
+}
+
 /// Answers every question with its first option.
 struct FirstOption;
 

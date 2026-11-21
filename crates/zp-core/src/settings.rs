@@ -8,7 +8,8 @@ use anyhow::Context as _;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
-use crate::permissions::{PermissionMode, PermissionPolicy};
+use crate::permissions::jev::JevSettings;
+use crate::permissions::{PermissionMode, PermissionPolicy, ReviewBackend};
 
 /// Permission settings.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -23,6 +24,12 @@ pub struct PermissionSettings {
     /// How much the review model reasons (default `off`); clamped to what it supports.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub review_thinking: Option<zp_ai::ThinkingLevel>,
+    /// Personal choice of reviewer (defaults to LLM).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub review_backend: Option<ReviewBackend>,
+    /// Personal endpoint and model for Jev.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub review_jev: Option<JevSettings>,
     /// Command prefixes that run without asking, e.g. `cargo test`, `git status`.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub allow_commands: Vec<String>,
@@ -291,6 +298,9 @@ impl ProjectSettings {
                 .and_then(|p| p.review_thinking)
                 .or(global.review_thinking)
                 .unwrap_or_default(),
+            // The review service receives the proposed call, so only user settings select it.
+            review_backend: global.review_backend.unwrap_or_default(),
+            review_jev: global.review_jev.clone().unwrap_or_default(),
             temp_directories: if std::iter::once(global)
                 .chain(project)
                 .any(|settings| settings.temp_directories == Some(false))

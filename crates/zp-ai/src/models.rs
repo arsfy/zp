@@ -115,6 +115,11 @@ impl Models {
         self
     }
 
+    /// Reads a stored API key, including keys for services outside the model catalog.
+    pub fn stored_api_key(&self, service: &str) -> Option<String> {
+        self.credentials.api_key(service)
+    }
+
     /// Registers a provider, replacing one with the same id.
     pub fn set_provider(&mut self, provider: Arc<dyn Provider>) {
         self.register(provider);

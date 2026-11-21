@@ -284,19 +284,24 @@ impl ConversationView {
     ) {
         if mode == PermissionMode::AutoReview {
             let policy = crate::approvals::project_policy(&self.root, cx);
-            let current = policy.review_model.clone();
-            let models = &cx.global::<AppModels>().models;
-            if current.as_deref().is_some_and(|spec| {
-                models
-                    .find(spec)
-                    .is_some_and(|model| models.resolve_auth(&model.provider).is_some())
-            }) {
+            if policy.review_is_configured(&cx.global::<AppModels>().models) {
                 self.review_model_picker = None;
                 self.review_model_subscription = None;
                 self.set_permission_policy(policy, cx);
                 self.apply_permission_mode(mode, window, cx);
                 return;
             }
+            if policy.review_backend == zp_core::permissions::ReviewBackend::Jev {
+                if let Some(settings) =
+                    crate::settings::SettingsWindow::open_at(crate::settings::Page::Permissions, cx)
+                {
+                    settings
+                        .update(cx, |this, _, cx| this.open_jev_configuration(cx))
+                        .ok();
+                }
+                return;
+            }
+            let current = policy.review_model.clone();
             let picker = cx.new(|cx| ReviewModelPicker::new(current, window, cx));
             self.review_model_subscription = Some(cx.subscribe_in(
                 &picker,

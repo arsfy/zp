@@ -68,7 +68,7 @@ pub enum Verdict {
 }
 
 impl Verdict {
-    fn ask(reason: impl Into<String>) -> Self {
+    pub(super) fn ask(reason: impl Into<String>) -> Self {
         Self::Ask {
             reason: reason.into(),
             summary: None,
