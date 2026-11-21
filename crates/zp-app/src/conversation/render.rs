@@ -2649,9 +2649,10 @@ mod tests {
 
     use chrono::{Local, TimeZone as _};
     use gpui::{Modifiers, MouseButton, TestAppContext, VisualTestContext};
-    use zp_agent::AgentEvent;
+    use zp_agent::{AgentEvent, AgentMessage, AgentToolResult};
     use zp_ai::{
         AssistantContent, AssistantMessage, AssistantMessageEvent, FauxProvider, FauxResponse,
+        StopReason, ToolCall,
     };
 
     use crate::tests::project_dir;
@@ -2684,27 +2685,49 @@ mod tests {
     #[gpui::test]
     fn tool_cards_slide_open_and_shut(cx: &mut TestAppContext) {
         let faux = FauxProvider::default();
-        faux.push(FauxResponse::tool_call(
-            "bash",
-            serde_json::json!({"command": "printf 'one\\ntwo\\nthree\\nfour\\n'"}),
-        ));
-        faux.push(FauxResponse::text("Done"));
         let _data = setup_models(cx, &[&faux], false);
         let (_dir, project) = project_dir();
         let window = open(cx, &project);
         let conversation = active(window, cx);
-        send(window, "Run it", cx);
-        idle(&conversation, 3, cx);
-        let call = conversation.read_with(cx, |view, _| {
-            let call = view.transcript().assistant(1).unwrap().tool_calls().next();
-            call.unwrap().clone()
+        let call = ToolCall {
+            id: "command".into(),
+            name: "bash".into(),
+            arguments: serde_json::json!({"command": "printf 'one\\ntwo\\nthree\\nfour\\n'"}),
+        };
+        conversation.update(cx, |view, cx| {
+            let mut message = AssistantMessage::empty("faux", "faux", "faux-1");
+            message
+                .content
+                .push(AssistantContent::ToolCall(call.clone()));
+            message.stop_reason = StopReason::ToolUse;
+            let events = [
+                AgentEvent::MessageEnd {
+                    message: AgentMessage::user("Run it"),
+                },
+                AgentEvent::MessageEnd {
+                    message: message.into(),
+                },
+                AgentEvent::ToolExecutionEnd {
+                    tool_call_id: call.id.clone(),
+                    tool_name: call.name.clone(),
+                    result: AgentToolResult::text("one\ntwo\nthree\nfour"),
+                    is_error: false,
+                    duration_ms: Some(1),
+                },
+            ];
+            let now = Instant::now();
+            view.apply_events(
+                events
+                    .into_iter()
+                    .map(|event| ReceivedEvent::new(now, event))
+                    .collect(),
+                cx,
+            );
         });
-        let selector = format!("disclosure-tool-{}", call.id);
-        let selector: &'static str = Box::leak(selector.into_boxed_str());
         let height = |cx: &mut TestAppContext| {
             cx.run_until_parked();
             VisualTestContext::from_window(window.into(), cx)
-                .debug_bounds(selector)
+                .debug_bounds("disclosure-tool-command")
                 .map(|bounds| f32::from(bounds.size.height))
         };
         // The frame a moving block asked for, drawn at the clock's current time.
@@ -2723,10 +2746,7 @@ mod tests {
             })
         };
 
-        // Close the card at once, then open it with motion.
-        if !toggle(cx) {
-            toggle(cx);
-        }
+        // Draw the closed card before starting its opening transition.
         assert_eq!(height(cx), None);
         cx.update(|cx| cx.set_reduce_motion(false));
         assert!(!toggle(cx));
