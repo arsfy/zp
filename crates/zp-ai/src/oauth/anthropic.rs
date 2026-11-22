@@ -119,7 +119,8 @@ async fn token_request(
     let (Some(access), Some(refresh), Some(expires_in)) = (
         str_field(&json, "access_token"),
         str_field(&json, "refresh_token"),
-        number_field(&json, "expires_in"),
+        // A zero lifetime would refresh before every request, like Kimi and ChatGPT reject it.
+        number_field(&json, "expires_in").filter(|s| *s > 0.0),
     ) else {
         return Err(format!("{what} returned an incomplete response"));
     };

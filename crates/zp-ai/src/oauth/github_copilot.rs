@@ -215,12 +215,13 @@ async fn copilot_token(
     ) else {
         return Err("Invalid Copilot token response".into());
     };
-    Ok(OAuthCredential {
-        access: token.to_owned(),
-        refresh: github_token.to_owned(),
-        expires: (expires_at * 1000.0) as i64 - EXPIRY_MARGIN_MS,
-        extra: Default::default(),
-    })
+    // Float to integer `as` saturates; `expiring_at` subtracts the margin without overflow.
+    Ok(OAuthCredential::expiring_at(
+        token,
+        github_token,
+        (expires_at * 1000.0) as i64,
+        EXPIRY_MARGIN_MS,
+    ))
 }
 
 #[derive(Default)]

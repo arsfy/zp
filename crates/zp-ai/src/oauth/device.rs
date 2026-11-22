@@ -10,6 +10,16 @@ const MINIMUM_INTERVAL: Duration = Duration::from_secs(1);
 const DEFAULT_INTERVAL_SECONDS: f64 = 5.0;
 /// RFC 8628 §3.5: `slow_down` adds 5 seconds.
 const SLOW_DOWN_INCREMENT: Duration = Duration::from_secs(5);
+/// Longest wait between polls honored; a server asking for more gets this.
+const MAXIMUM_INTERVAL: Duration = Duration::from_secs(120);
+/// Longest device code lifetime honored (codes usually last 15 minutes).
+const MAXIMUM_LIFETIME: Duration = Duration::from_secs(60 * 60);
+
+/// A number of seconds the server sent, kept within `min..=max`: an absurd value (say
+/// `1e300`) must neither panic nor make ZP wait for ages.
+fn server_duration(seconds: f64, min: Duration, max: Duration) -> Duration {
+    Duration::try_from_secs_f64(seconds).map_or(max, |duration| duration.clamp(min, max))
+}
 
 /// The outcome of one poll.
 pub(crate) enum Poll<T> {
@@ -33,10 +43,13 @@ where
     F: FnMut() -> Fut,
     Fut: Future<Output = Result<Poll<T>, String>>,
 {
-    let deadline = expires_in_seconds.map(|s| Instant::now() + Duration::from_secs_f64(s));
-    let mut interval =
-        Duration::from_secs_f64(interval_seconds.unwrap_or(DEFAULT_INTERVAL_SECONDS))
-            .max(MINIMUM_INTERVAL);
+    let deadline = expires_in_seconds
+        .map(|s| Instant::now() + server_duration(s, Duration::ZERO, MAXIMUM_LIFETIME));
+    let mut interval = server_duration(
+        interval_seconds.unwrap_or(DEFAULT_INTERVAL_SECONDS),
+        MINIMUM_INTERVAL,
+        MAXIMUM_INTERVAL,
+    );
     let mut slowed = false;
     let sleep = |duration: Duration| async move {
         tokio::select! {
@@ -62,8 +75,8 @@ where
             Poll::SlowDown(seconds) => {
                 slowed = true;
                 interval = match seconds.filter(|s| s.is_finite() && *s > 0.0) {
-                    Some(seconds) => Duration::from_secs_f64(seconds).max(MINIMUM_INTERVAL),
-                    None => interval + SLOW_DOWN_INCREMENT,
+                    Some(seconds) => server_duration(seconds, MINIMUM_INTERVAL, MAXIMUM_INTERVAL),
+                    None => (interval + SLOW_DOWN_INCREMENT).min(MAXIMUM_INTERVAL),
                 };
             }
             Poll::Pending => {}
@@ -125,6 +138,40 @@ mod tests {
         assert_eq!(value, 3);
         // 1 s after the first poll, then 6 s after slow_down.
         assert!(started.elapsed() >= Duration::from_secs(7));
+    }
+
+    /// A broken or hostile authorization server sends absurd numbers: polling must neither
+    /// panic nor wait for ages.
+    #[tokio::test(start_paused = true)]
+    async fn absurd_server_numbers_are_kept_in_range() {
+        let (interaction, _input) =
+            LoginInteraction::new(CancellationToken::new(), |_| {}, LoginOptions::default());
+        let mut calls = 0;
+        let started = tokio::time::Instant::now();
+        let value = poll(&interaction, Some(1e300), Some(1e300), false, || {
+            calls += 1;
+            let result = match calls {
+                1 => Poll::SlowDown(Some(1e300)),
+                2 => Poll::SlowDown(None),
+                _ => Poll::Complete(calls),
+            };
+            async move { Ok(result) }
+        })
+        .await
+        .unwrap();
+        assert_eq!(value, 3);
+        assert!(started.elapsed() <= MAXIMUM_INTERVAL * 2);
+
+        // Lifetimes are capped the same way (the deadline uses the real clock, so this is
+        // checked on the conversion).
+        let lifetime = |seconds| server_duration(seconds, Duration::ZERO, MAXIMUM_LIFETIME);
+        assert_eq!(lifetime(1e300), MAXIMUM_LIFETIME);
+        assert_eq!(lifetime(f64::MAX), MAXIMUM_LIFETIME);
+        assert_eq!(lifetime(900.0), Duration::from_secs(900));
+        assert_eq!(
+            server_duration(0.2, MINIMUM_INTERVAL, MAXIMUM_INTERVAL),
+            MINIMUM_INTERVAL
+        );
     }
 
     #[tokio::test(start_paused = true)]

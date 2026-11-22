@@ -30,17 +30,41 @@ pub struct OAuthCredential {
 }
 
 impl OAuthCredential {
-    /// A credential expiring `expires_in` seconds from now, minus `margin_ms`.
+    /// A credential expiring `expires_in` seconds from now, minus `margin_ms`. The lifetime
+    /// comes from the server, so it is kept between 0 and a year: a huge value must not
+    /// overflow (and wrap into "always expired").
     pub fn new(
         access: impl Into<String>,
         refresh: impl Into<String>,
         expires_in: f64,
         margin_ms: i64,
     ) -> Self {
+        const MAX_LIFETIME_SECONDS: f64 = 365.0 * 24.0 * 3600.0;
+        let lifetime_ms = if expires_in.is_nan() {
+            0
+        } else {
+            // Float to integer `as` saturates; the clamp keeps it meaningful.
+            (expires_in.clamp(0.0, MAX_LIFETIME_SECONDS) * 1000.0) as i64
+        };
+        Self::expiring_at(
+            access,
+            refresh,
+            now_ms().saturating_add(lifetime_ms),
+            margin_ms,
+        )
+    }
+
+    /// A credential expiring at `expires_ms` (Unix milliseconds), minus `margin_ms`.
+    pub fn expiring_at(
+        access: impl Into<String>,
+        refresh: impl Into<String>,
+        expires_ms: i64,
+        margin_ms: i64,
+    ) -> Self {
         Self {
             access: access.into(),
             refresh: refresh.into(),
-            expires: now_ms() + (expires_in * 1000.0) as i64 - margin_ms,
+            expires: expires_ms.saturating_sub(margin_ms),
             extra: Map::new(),
         }
     }
@@ -280,6 +304,26 @@ impl RequestAuth {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Lifetimes come from token endpoints: absurd values must not overflow into a credential
+    /// that is always expired (refreshing before every request) or panic in debug builds.
+    #[test]
+    fn absurd_lifetimes_neither_overflow_nor_expire_at_once() {
+        let year_ms = 365 * 24 * 3600 * 1000;
+        let huge = OAuthCredential::new("a", "r", 1e300, 5 * 60 * 1000);
+        assert!(!huge.is_expired());
+        assert!(huge.expires <= now_ms() + year_ms);
+        let infinite = OAuthCredential::new("a", "r", f64::INFINITY, 0);
+        assert!(!infinite.is_expired());
+        assert!(OAuthCredential::new("a", "r", -5.0, 0).is_expired());
+        assert!(OAuthCredential::new("a", "r", f64::NAN, 0).is_expired());
+        // Absolute times (Copilot's `expires_at`) at either extreme.
+        assert_eq!(
+            OAuthCredential::expiring_at("a", "r", i64::MIN, 1000).expires,
+            i64::MIN
+        );
+        assert!(!OAuthCredential::expiring_at("a", "r", i64::MAX, 1000).is_expired());
+    }
 
     #[test]
     fn credentials_round_trip_through_their_encoding() {
