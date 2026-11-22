@@ -467,11 +467,17 @@ mod tests {
     /// Failing to connect means nothing was sent, so it is retried.
     #[tokio::test]
     async fn connection_failures_are_retried() {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let url = format!("http://{}/v1", listener.local_addr().unwrap());
-        drop(listener);
+        // Reserve the port without listening so another test cannot claim it.
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let url = format!("http://{}/v1", socket.local_addr().unwrap());
         let attempts = AtomicUsize::new(0);
-        let client = quick_client();
+        // A read timeout can fire while Windows is still trying to connect.
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .connect_timeout(Duration::from_millis(200))
+            .build()
+            .unwrap();
         let started = std::time::Instant::now();
         let result = send(
             || {
@@ -483,7 +489,8 @@ mod tests {
         )
         .await;
         assert!(
-            matches!(result, Err(HttpError::Failed(message)) if message.starts_with("request failed"))
+            matches!(&result, Err(HttpError::Failed(message)) if message.starts_with("request failed")),
+            "expected a connection failure, got {result:?}"
         );
         assert_eq!(attempts.load(Ordering::SeqCst), 2);
         assert!(started.elapsed() >= Duration::from_secs(1), "backed off");
