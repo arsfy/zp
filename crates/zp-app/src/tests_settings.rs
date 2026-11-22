@@ -420,22 +420,24 @@ fn api_keys_and_custom_providers(cx: &mut TestAppContext) {
     assert!(saved(&data).providers.is_empty());
 }
 
-#[gpui::test]
-fn custom_provider_form_tests_the_model_list(cx: &mut TestAppContext) {
+/// A tiny endpoint on `runtime` that lists two models when called with key `sk-good`:
+/// its base URL and the number of requests it received.
+fn serve_model_list(
+    runtime: &tokio::runtime::Runtime,
+) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
-    let faux = FauxProvider::default();
-    let data = setup_models(cx, &[&faux], false);
-    // A tiny endpoint that lists two models when called with the right key.
-    let runtime = tokio::runtime::Runtime::new().unwrap();
     let listener = runtime
         .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
         .unwrap();
     let base_url = format!("http://{}/v1", listener.local_addr().unwrap());
+    let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counter = requests.clone();
     runtime.spawn(async move {
         loop {
             let Ok((mut socket, _)) = listener.accept().await else {
                 return;
             };
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let mut buffer = [0u8; 4096];
             let read = socket.read(&mut buffer).await.unwrap_or(0);
             let request = String::from_utf8_lossy(&buffer[..read]).to_ascii_lowercase();
@@ -460,34 +462,53 @@ fn custom_provider_form_tests_the_model_list(cx: &mut TestAppContext) {
             let _ = socket.write_all(reply.as_bytes()).await;
         }
     });
+    (base_url, requests)
+}
+
+/// Types `key` and `url` into the open provider form, clicks Test and waits for the result.
+fn test_endpoint(
+    window: WindowHandle<SettingsWindow>,
+    key: &str,
+    url: &str,
+    cx: &mut TestAppContext,
+) -> crate::settings::EndpointTest {
+    window
+        .update(cx, |view, _, cx| {
+            let form = view.provider_form().unwrap();
+            for (field, text) in [(&form.base_url, url), (&form.key, key)] {
+                field.update(cx, |input, cx| input.emplace(text, cx));
+            }
+            view.test_provider_form(cx);
+        })
+        .unwrap();
+    let result = |cx: &mut TestAppContext| {
+        window
+            .update(cx, |view, _, _| {
+                view.provider_form().unwrap().endpoint_test().cloned()
+            })
+            .unwrap()
+    };
+    wait_until(cx, |cx| {
+        !matches!(result(cx), Some(crate::settings::EndpointTest::Running))
+    });
+    result(cx).unwrap()
+}
+
+#[gpui::test]
+fn custom_provider_form_tests_the_model_list(cx: &mut TestAppContext) {
+    use crate::settings::EndpointTest;
+    let faux = FauxProvider::default();
+    let data = setup_models(cx, &[&faux], false);
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let (base_url, _) = serve_model_list(&runtime);
 
     let window = settings_window(Page::Providers, cx);
-    let test = |key: &str, url: &str, cx: &mut TestAppContext| {
-        window
-            .update(cx, |view, window, cx| {
-                if view.provider_form().is_none() {
-                    view.open_provider_form(None, window, cx);
-                }
-                let form = view.provider_form().unwrap();
-                for (field, text) in [(&form.base_url, url), (&form.key, key)] {
-                    field.update(cx, |input, cx| input.emplace(text, cx));
-                }
-                view.test_provider_form(cx);
-            })
-            .unwrap();
-        let result = |cx: &mut TestAppContext| {
-            window
-                .update(cx, |view, _, _| {
-                    view.provider_form().unwrap().endpoint_test().cloned()
-                })
-                .unwrap()
-        };
-        wait_until(cx, |cx| {
-            !matches!(result(cx), Some(crate::settings::EndpointTest::Running))
-        });
-        result(cx).unwrap()
-    };
-    use crate::settings::EndpointTest;
+    window
+        .update(cx, |view, window, cx| {
+            view.open_provider_form(None, window, cx)
+        })
+        .unwrap();
+    let test = |key: &str, url: &str, cx: &mut TestAppContext| test_endpoint(window, key, url, cx);
 
     match test("", "localhost:1", cx) {
         EndpointTest::Failed(error) => assert!(error.contains("base URL"), "{error}"),
@@ -512,6 +533,151 @@ fn custom_provider_form_tests_the_model_list(cx: &mut TestAppContext) {
             .is_none()
     );
     drop(runtime);
+}
+
+/// Saves custom provider `id` at `base_url` with key `key` (without the form).
+fn add_custom_provider(id: &str, base_url: &str, key: &str, cx: &mut TestAppContext) {
+    let def = zp_core::settings::CustomProvider {
+        id: id.to_owned(),
+        name: id.to_owned(),
+        base_url: base_url.to_owned(),
+        ..Default::default()
+    };
+    cx.update(|cx| {
+        AppSettings::update(cx, |settings| settings.providers.push(def.clone())).unwrap();
+        let app = cx.global::<AppModels>();
+        app.models
+            .register(zp_core::providers::custom_provider(&def).unwrap());
+        app.credentials.set(id, key).unwrap();
+    });
+}
+
+/// Testing an edited provider sends its stored key only to the base URL it was saved for.
+#[gpui::test]
+fn editing_a_custom_provider_tests_a_changed_base_url_only_with_a_typed_key(
+    cx: &mut TestAppContext,
+) {
+    use crate::settings::EndpointTest;
+    use std::sync::atomic::Ordering;
+    let faux = FauxProvider::default();
+    let _data = setup_models(cx, &[&faux], false);
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let (base_url, requests) = serve_model_list(&runtime);
+    add_custom_provider("acme", &base_url, "sk-good", cx);
+
+    let window = settings_window(Page::Providers, cx);
+    window
+        .update(cx, |view, window, cx| {
+            view.open_provider_form(Some("acme"), window, cx)
+        })
+        .unwrap();
+    // The saved base URL (give or take a trailing `/`) gets the stored key.
+    let listed = test_endpoint(window, "", &format!(" {base_url}/ "), cx);
+    assert!(matches!(listed, EndpointTest::Listed(_)), "{listed:?}");
+    assert_eq!(requests.load(Ordering::SeqCst), 1);
+
+    // Another base URL does not, and nothing is sent.
+    let changed = base_url.replace("127.0.0.1", "localhost");
+    match test_endpoint(window, "", &changed, cx) {
+        EndpointTest::Failed(error) => assert!(error.contains("Enter the API key"), "{error}"),
+        other => panic!("expected the key to be asked for, got {other:?}"),
+    }
+    assert_eq!(requests.load(Ordering::SeqCst), 1);
+
+    // A typed key works there.
+    let listed = test_endpoint(window, "sk-good", &changed, cx);
+    assert!(matches!(listed, EndpointTest::Listed(_)), "{listed:?}");
+    assert_eq!(requests.load(Ordering::SeqCst), 2);
+    drop(runtime);
+}
+
+/// The form warns (without blocking) about secrets in the plain-text headers and about a
+/// key sent over plain http:// to a remote host.
+#[gpui::test]
+fn custom_provider_form_warns_about_secrets_in_plain_text(cx: &mut TestAppContext) {
+    let faux = FauxProvider::default();
+    let _data = setup_models(cx, &[&faux], false);
+    let window = settings_window(Page::Providers, cx);
+    let fill = |fields: &[(&str, &str)], cx: &mut TestAppContext| {
+        window
+            .update(cx, |view, _, cx| {
+                let form = view.provider_form().unwrap();
+                for (name, text) in fields {
+                    let field = match *name {
+                        "base_url" => &form.base_url,
+                        "key" => &form.key,
+                        "headers" => &form.headers,
+                        other => panic!("no field {other}"),
+                    };
+                    field.update(cx, |input, cx| input.emplace(text, cx));
+                }
+            })
+            .unwrap();
+        cx.run_until_parked();
+        let shown = |selector| {
+            VisualTestContext::from_window(window.into(), cx)
+                .debug_bounds(selector)
+                .is_some()
+        };
+        let shown = (
+            shown("provider-headers-hint"),
+            shown("provider-headers-warning"),
+            shown("provider-http-warning"),
+        );
+        let warnings = window
+            .update(cx, |view, _, cx| {
+                let form = view.provider_form().unwrap();
+                (form.secret_headers_warning(cx), form.plain_http_warning(cx))
+            })
+            .unwrap();
+        (warnings, shown)
+    };
+    window
+        .update(cx, |view, window, cx| {
+            view.open_provider_form(None, window, cx)
+        })
+        .unwrap();
+
+    let ((headers, http), shown) = fill(
+        &[
+            ("base_url", "http://llm.example.com/v1"),
+            ("headers", "X-Team: zp"),
+        ],
+        cx,
+    );
+    assert_eq!((headers, http), (None, None), "no secret header, no key");
+    assert_eq!(shown, (true, false, false), "the hint only");
+
+    let ((headers, http), shown) = fill(
+        &[
+            ("key", "sk-typed"),
+            ("headers", "X-Team: zp\nAuthorization: Bearer sk-1"),
+        ],
+        cx,
+    );
+    let headers = headers.expect("a secret header");
+    assert!(headers.contains("`Authorization`"), "{headers}");
+    assert!(!headers.contains("X-Team"), "{headers}");
+    assert!(
+        http.expect("a typed key over http")
+            .contains("llm.example.com")
+    );
+    assert_eq!(shown, (false, true, true));
+
+    let ((_, http), shown) = fill(&[("base_url", "http://localhost:11434/v1")], cx);
+    assert_eq!(http, None, "a local server");
+    assert!(!shown.2);
+
+    // A stored key counts too.
+    add_custom_provider("acme", "http://localhost:11434/v1", "sk-stored", cx);
+    window
+        .update(cx, |view, window, cx| {
+            view.open_provider_form(Some("acme"), window, cx)
+        })
+        .unwrap();
+    let ((_, http), shown) = fill(&[("base_url", "http://llm.example.com/v1")], cx);
+    assert!(http.is_some(), "a stored key over http");
+    assert!(shown.2);
 }
 
 /// A keychain that refuses to store keys until told otherwise (like a denied macOS
@@ -1128,4 +1294,129 @@ fn subagent_limits_apply_as_typed_and_profiles_keep_their_model_when_edited(
         id.read_with(cx, |id, _| id.as_str().is_empty()),
         "the form is cleared"
     );
+}
+
+/// A hand-edited settings file with a mistake is reported, not replaced with the settings
+/// in memory (which would drop the user's edits).
+#[gpui::test]
+fn an_invalid_settings_file_is_not_overwritten(cx: &mut TestAppContext) {
+    let faux = FauxProvider::default();
+    let data = setup_models(cx, &[&faux], false);
+    let path = zp_core::paths::settings_file(data.path());
+    let window = settings_window(Page::General, cx);
+    let invalid = "{ \"notifications\": true, oops }";
+    std::fs::write(&path, invalid).unwrap();
+    let before = cx.update(|cx| AppSettings::get(cx).clone());
+    window
+        .update(cx, |view, _, cx| view.set_notifications(false, cx))
+        .unwrap();
+    let notice = window
+        .update(cx, |view, _, _| view.notice().cloned())
+        .unwrap();
+    let (text, is_error) = notice.expect("the failure is reported");
+    assert!(
+        is_error && text.contains("settings.json") && text.contains("Fix it first"),
+        "{text}"
+    );
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), invalid);
+    assert_eq!(cx.update(|cx| AppSettings::get(cx).clone()), before);
+
+    // Without a file, changes are saved as usual.
+    std::fs::remove_file(&path).unwrap();
+    window
+        .update(cx, |view, _, cx| view.set_notifications(false, cx))
+        .unwrap();
+    assert_eq!(saved(&data).notifications, Some(false));
+    assert_eq!(
+        cx.update(|cx| AppSettings::get(cx).notifications),
+        Some(false)
+    );
+}
+
+/// A change that cannot be saved is not applied either, so the app never runs with
+/// settings the file does not have.
+#[cfg(unix)]
+#[gpui::test]
+fn settings_that_cannot_be_saved_are_not_applied(cx: &mut TestAppContext) {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let faux = FauxProvider::default();
+    let data = setup_models(cx, &[&faux], false);
+    let set_mode = |mode| {
+        std::fs::set_permissions(data.path(), std::fs::Permissions::from_mode(mode)).unwrap();
+    };
+    set_mode(0o555);
+    if std::fs::write(data.path().join("probe"), "").is_ok() {
+        // Running as root: permissions do not stop writes.
+        set_mode(0o755);
+        return;
+    }
+    let result = cx.update(|cx| AppSettings::update(cx, |s| s.notifications = Some(false)));
+    set_mode(0o755);
+    assert!(result.is_err());
+    assert_eq!(cx.update(|cx| AppSettings::get(cx).notifications), None);
+    assert_eq!(saved(&data).notifications, None);
+}
+
+/// A keychain whose reads can be denied, counting them.
+#[derive(Default)]
+struct DeniedReads {
+    deny: std::sync::atomic::AtomicBool,
+    reads: std::sync::atomic::AtomicUsize,
+    inner: zp_core::credentials::MemoryBackend,
+}
+
+impl zp_core::credentials::SecretBackend for DeniedReads {
+    fn get(&self, provider: &str) -> anyhow::Result<Option<String>> {
+        self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        anyhow::ensure!(
+            !self.deny.load(std::sync::atomic::Ordering::SeqCst),
+            "keychain access denied"
+        );
+        self.inner.get(provider)
+    }
+    fn set(&self, provider: &str, secret: &str) -> anyhow::Result<()> {
+        self.inner.set(provider, secret)
+    }
+    fn delete(&self, provider: &str) -> anyhow::Result<()> {
+        self.inner.delete(provider)
+    }
+}
+
+/// A keychain read that failed is not retried on its own, only when the user opens the
+/// Providers page.
+#[gpui::test]
+fn opening_the_providers_page_retries_failed_keychain_reads(cx: &mut TestAppContext) {
+    use zp_ai::CredentialStore as _;
+    use zp_core::credentials::Credentials;
+
+    let faux = FauxProvider::default();
+    let data = setup_models(cx, &[&faux], false);
+    let keychain = Arc::new(DeniedReads::default());
+    let index = data.path().join("credentials.json");
+    Credentials::new(keychain.clone(), Some(index.clone()))
+        .set("deepseek", "sk-1")
+        .unwrap();
+    let credentials = Arc::new(Credentials::new(keychain.clone(), Some(index)));
+    cx.update(|cx| {
+        let app = cx.global_mut::<AppModels>();
+        app.models = app.models.clone().with_credentials(credentials.clone());
+        app.credentials = credentials.clone();
+    });
+    keychain
+        .deny
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(credentials.api_key("deepseek"), None);
+    keychain
+        .deny
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(credentials.api_key("deepseek"), None);
+
+    let window = settings_window(Page::General, cx);
+    assert_eq!(credentials.api_key("deepseek"), None);
+    assert_eq!(keychain.reads.load(std::sync::atomic::Ordering::SeqCst), 1);
+    window
+        .update(cx, |view, _, cx| view.set_page(Page::Providers, cx))
+        .unwrap();
+    assert_eq!(credentials.api_key("deepseek").as_deref(), Some("sk-1"));
 }

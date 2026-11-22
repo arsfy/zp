@@ -90,6 +90,55 @@ impl ProviderForm {
         self.error.as_deref()
     }
 
+    /// Whether the provider being edited already has a key (stored in the keychain).
+    fn has_saved_key(&self, cx: &App) -> bool {
+        self.editing.as_ref().is_some_and(|id| {
+            cx.global::<AppModels>()
+                .models
+                .resolve_auth(id)
+                .is_some_and(|auth| auth.api_key.is_some())
+        })
+    }
+
+    /// Whether the form's base URL is the saved one of the provider being edited (ignoring
+    /// surrounding spaces and a trailing `/`).
+    fn base_url_unchanged(&self, cx: &App) -> bool {
+        let normalize = |url: &str| url.trim().trim_end_matches('/').to_owned();
+        let typed = normalize(self.base_url.read(cx).as_str());
+        self.editing.as_ref().is_some_and(|id| {
+            AppSettings::get(cx)
+                .providers
+                .iter()
+                .any(|p| &p.id == id && normalize(&p.base_url) == typed)
+        })
+    }
+
+    /// A warning about the headers: those that look like secrets end up in plain text in
+    /// settings.json.
+    pub fn secret_headers_warning(&self, cx: &App) -> Option<String> {
+        let headers = self.headers.read(cx).as_str();
+        let secret: Vec<String> = headers
+            .lines()
+            .filter_map(|line| line.split_once(':'))
+            .map(|(name, _)| name.trim())
+            .filter(|name| zp_core::providers::looks_like_secret_header(name))
+            .map(|name| format!("`{name}`"))
+            .collect();
+        (!secret.is_empty()).then(|| {
+            format!(
+                "{} look{} like a secret: headers are stored in plain text in settings.json; put secrets in the API key field.",
+                secret.join(", "),
+                if secret.len() == 1 { "s" } else { "" }
+            )
+        })
+    }
+
+    /// A warning about the base URL: a key typed or stored would be sent unencrypted.
+    pub fn plain_http_warning(&self, cx: &App) -> Option<String> {
+        let has_key = !self.key.read(cx).as_str().trim().is_empty() || self.has_saved_key(cx);
+        zp_core::providers::plain_http_key_warning(self.base_url.read(cx).as_str(), has_key)
+    }
+
     /// The provider described by the form.
     fn definition(&self, cx: &App) -> anyhow::Result<CustomProvider> {
         let text = |input: &Entity<EditableTextState>| input.read(cx).as_str().trim().to_owned();
@@ -547,7 +596,8 @@ impl SettingsWindow {
     }
 
     /// Lists the models of the form's endpoint the way a model list refresh would, with the
-    /// key typed in the form (or, when editing, the stored one), without saving anything.
+    /// key typed in the form (or, when editing with the saved base URL, the stored one),
+    /// without saving anything.
     pub fn test_provider_form(&mut self, cx: &mut Context<Self>) {
         let Some(ProviderDialog::Custom(form)) = &mut self.dialog else {
             return;
@@ -573,6 +623,15 @@ impl SettingsWindow {
             }
         };
         let typed_key = form.key.read(cx).as_str().trim().to_owned();
+        // The stored key only goes to the endpoint it was saved for.
+        if typed_key.is_empty() && form.has_saved_key(cx) && !form.base_url_unchanged(cx) {
+            form.test = Some(EndpointTest::Failed(
+                "Enter the API key to test a changed base URL".into(),
+            ));
+            form._test_task = None;
+            cx.notify();
+            return;
+        }
         let models = cx.global::<AppModels>().models.clone();
         let listing = gpui_tokio::Tokio::spawn(cx, async move {
             let cancel = CancellationToken::new();
@@ -1468,6 +1527,38 @@ impl SettingsWindow {
                 .child(label(name))
                 .child(div().flex_1().min_w_0().overflow_x_hidden().child(field))
         };
+        // A field with a line of text below it.
+        let noted = |field: AnyElement, note: Option<(String, gpui::Rgba, &'static str)>| {
+            div()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .child(field)
+                .when_some(note, |this, (text, color, selector)| {
+                    this.child(
+                        div()
+                            .debug_selector(move || selector.into())
+                            .text_size(px(12.))
+                            .text_color(color)
+                            .whitespace_normal()
+                            .child(text),
+                    )
+                })
+                .into_any_element()
+        };
+        let http_warning = form
+            .plain_http_warning(cx)
+            .map(|text| (text, colors.warning, "provider-http-warning"));
+        let headers_note = Some(form.secret_headers_warning(cx).map_or_else(
+            || {
+                (
+                    "Stored in settings.json; put secrets in the API key field.".to_owned(),
+                    colors.text_muted,
+                    "provider-headers-hint",
+                )
+            },
+            |text| (text, colors.warning, "provider-headers-warning"),
+        ));
         let anthropic = form.anthropic;
         let editing = form.editing.clone();
         div()
@@ -1493,7 +1584,10 @@ impl SettingsWindow {
             .child(row("Name", super::text_field(&form.name, "Shown in menus", cx).into_any_element()))
             .child(row(
                 "Base URL",
-                super::text_field(&form.base_url, "http://localhost:11434/v1", cx).into_any_element(),
+                noted(
+                    super::text_field(&form.base_url, "http://localhost:11434/v1", cx).into_any_element(),
+                    http_warning,
+                ),
             ))
             .child(row(
                 "API",
@@ -1522,7 +1616,10 @@ impl SettingsWindow {
             ))
             .child(row(
                 "Headers",
-                super::text_block(&form.headers, "X-Team: platform", cx).into_any_element(),
+                noted(
+                    super::text_block(&form.headers, "X-Team: platform", cx).into_any_element(),
+                    headers_note,
+                ),
             ))
             .child(row(
                 "Models",

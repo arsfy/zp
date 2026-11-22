@@ -16,6 +16,7 @@ use gpui::{
 };
 
 use crate::theme::ActiveTheme;
+use crate::ui::openable_url;
 
 pub type TextId = (usize, usize, usize);
 
@@ -488,8 +489,14 @@ impl SelectableText {
         }
     }
 
+    /// Link targets for ranges of the text. Only [`openable_url`] targets open on click or
+    /// show the hand cursor; markdown comes from model output, so other schemes (like
+    /// `javascript:` or `vscode:`) stay plain text.
     pub fn links(mut self, links: Vec<(Range<usize>, String)>) -> Self {
-        self.links = links;
+        self.links = links
+            .into_iter()
+            .filter(|(_, url)| openable_url(url))
+            .collect();
         self
     }
 

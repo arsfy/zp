@@ -37,24 +37,32 @@ pub fn image_mime(path: &Path) -> Option<&'static str> {
 }
 
 impl ImageAttachment {
+    /// An image of at most [`MAX_IMAGE_BYTES`]; larger ones are rejected because providers
+    /// refuse them (and the message would fail on every retry).
+    pub fn new(
+        name: impl Into<String>,
+        mime_type: impl Into<String>,
+        data: Vec<u8>,
+    ) -> anyhow::Result<Self> {
+        let name = name.into();
+        anyhow::ensure!(data.len() <= MAX_IMAGE_BYTES, "{name} is larger than 5 MB");
+        Ok(Self {
+            name,
+            mime_type: mime_type.into(),
+            data,
+        })
+    }
+
     /// Reads an image file.
     pub fn from_file(path: &Path) -> anyhow::Result<Self> {
         let mime = image_mime(path).ok_or_else(|| {
             anyhow::anyhow!("{} is not a PNG, JPEG, GIF or WebP image", path.display())
         })?;
         let data = std::fs::read(path)?;
-        anyhow::ensure!(
-            data.len() <= MAX_IMAGE_BYTES,
-            "{} is larger than 5 MB",
-            path.display()
-        );
-        Ok(Self {
-            name: path
-                .file_name()
-                .map_or_else(|| "image".to_owned(), |n| n.to_string_lossy().into_owned()),
-            mime_type: mime.to_owned(),
-            data,
-        })
+        let name = path
+            .file_name()
+            .map_or_else(|| "image".to_owned(), |n| n.to_string_lossy().into_owned());
+        Self::new(name, mime, data)
     }
 
     fn content(&self) -> UserContent {
@@ -433,6 +441,15 @@ mod tests {
         assert_eq!(shown("src/u"), ["src/ui/", "src/ui/view.rs"]);
         assert_eq!(shown("sr/")[0], "src/", "no such folder: a fuzzy match");
         assert_eq!(shown("main")[..2], ["src/main.rs", "scripts/main.sh"]);
+    }
+
+    #[test]
+    fn image_attachments_are_limited_to_5_mb() {
+        let image = ImageAttachment::new("a.png", "image/png", vec![0; MAX_IMAGE_BYTES]).unwrap();
+        assert_eq!(image.data.len(), MAX_IMAGE_BYTES);
+        let error = ImageAttachment::new("Pasted image", "image/png", vec![0; MAX_IMAGE_BYTES + 1])
+            .unwrap_err();
+        assert_eq!(error.to_string(), "Pasted image is larger than 5 MB");
     }
 
     #[test]

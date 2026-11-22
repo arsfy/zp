@@ -365,6 +365,18 @@ pub fn expand_tabs(text: &str, width: usize) -> std::borrow::Cow<'_, str> {
     expanded.into()
 }
 
+/// Whether a link from untrusted text (terminal output, model markdown) may be opened:
+/// only web, mail and file URLs, never command schemes like `javascript:` or `vscode:`.
+pub fn openable_url(url: &str) -> bool {
+    url.split_once(':').is_some_and(|(scheme, rest)| {
+        matches!(
+            scheme.to_ascii_lowercase().as_str(),
+            "http" | "https" | "ftp" | "file" | "mailto"
+        ) && !rest.is_empty()
+            && !url.chars().any(char::is_control)
+    })
+}
+
 /// `1234` → `1.2k`, `2500000` → `2.5M`.
 pub fn format_tokens(tokens: u64) -> String {
     match tokens {
@@ -396,6 +408,32 @@ mod tests {
         } else {
             assert_eq!(shortcut_label("secondary-shift-n"), "Ctrl+Shift+N");
             assert_eq!(shortcut_label("secondary-alt-b"), "Ctrl+Alt+B");
+        }
+    }
+
+    #[test]
+    fn openable_urls_allow_web_mail_and_file_only() {
+        for url in [
+            "https://example.com",
+            "HTTP://example.com",
+            "ftp://example.com/f",
+            "file:///tmp/a.txt",
+            "mailto:a@example.com",
+        ] {
+            assert!(openable_url(url), "{url}");
+        }
+        for url in [
+            "javascript:alert(1)",
+            "JavaScript:alert(1)",
+            "data:text/html,<script>alert(1)</script>",
+            "vscode://file/etc/passwd",
+            "x-apple.systempreferences:com.apple.preference",
+            "https:",
+            "https://example.com/\nnext",
+            "/relative/path",
+            "",
+        ] {
+            assert!(!openable_url(url), "{url}");
         }
     }
 

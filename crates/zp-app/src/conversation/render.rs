@@ -2911,6 +2911,31 @@ mod tests {
         );
     }
 
+    #[gpui::test]
+    fn markdown_links_open_only_allowed_schemes_on_click(cx: &mut TestAppContext) {
+        let faux = FauxProvider::default();
+        faux.push(FauxResponse::text(
+            "[bad](javascript:alert(1)) and [good](https://example.com/docs)",
+        ));
+        let _data = setup_models(cx, &[&faux], false);
+        let (_dir, project) = project_dir();
+        let window = open(cx, &project);
+        let conversation = active(window, cx);
+        send(window, "Links please", cx);
+        idle(&conversation, 2, cx);
+        cx.run_until_parked();
+        let selection = conversation.read_with(cx, |view, _| view.text_selection.clone());
+        let reply = "bad and good";
+        let mut visual = VisualTestContext::from_window(window.into(), cx);
+        let bad = selection.point_for_text(reply, 1).unwrap();
+        visual.simulate_click(bad, Modifiers::none());
+        assert!(cx.opened_url().is_none());
+        let mut visual = VisualTestContext::from_window(window.into(), cx);
+        let good = selection.point_for_text(reply, 10).unwrap();
+        visual.simulate_click(good, Modifiers::none());
+        assert_eq!(cx.opened_url().as_deref(), Some("https://example.com/docs"));
+    }
+
     #[test]
     fn api_errors_have_soft_breaks_in_long_runs_and_keep_existing_newlines() {
         let error = "HTTP 400 Bad Request\n请求 ID: 012345abcdef012345abcdef0";

@@ -6,6 +6,8 @@ use alacritty_terminal::index::{Boundary, Direction, Point};
 use alacritty_terminal::term::Term;
 use alacritty_terminal::term::search::{Match, RegexIter, RegexSearch};
 
+use crate::ui::openable_url;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct Link {
     pub range: Match,
@@ -23,16 +25,6 @@ impl Default for Detector {
     }
 }
 
-fn openable(url: &str) -> bool {
-    url.split_once(':').is_some_and(|(scheme, rest)| {
-        matches!(
-            scheme.to_ascii_lowercase().as_str(),
-            "http" | "https" | "ftp" | "file" | "mailto"
-        ) && !rest.is_empty()
-            && !url.chars().any(char::is_control)
-    })
-}
-
 impl Detector {
     pub fn at<T: EventListener>(&mut self, term: &Term<T>, point: Point) -> Option<Link> {
         if point.line < term.topmost_line() || point.line > term.bottommost_line() {
@@ -40,7 +32,7 @@ impl Detector {
         }
         if let Some(hyperlink) = term.grid()[point]
             .hyperlink()
-            .filter(|link| openable(link.uri()))
+            .filter(|link| openable_url(link.uri()))
         {
             let (mut start, mut end) = (point, point);
             let first = Point::new(term.topmost_line(), Default::default());
@@ -97,7 +89,7 @@ impl Detector {
             if url.to_ascii_lowercase().starts_with("www.") {
                 url.insert_str(0, "https://");
             }
-            return (end >= point && openable(&url)).then_some(Link {
+            return (end >= point && openable_url(&url)).then_some(Link {
                 range: start..=end,
                 url,
             });

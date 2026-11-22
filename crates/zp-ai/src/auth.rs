@@ -161,6 +161,12 @@ pub trait CredentialStore: Send + Sync {
         Err("this credential store is read-only".into())
     }
 
+    /// The stored credential of `provider` read again, bypassing caches: another process
+    /// may have changed it (refreshed OAuth tokens, for one).
+    fn reload(&self, provider: &str) -> Option<Credential> {
+        self.credential(provider)
+    }
+
     /// The stored API key of `provider` (not OAuth tokens).
     fn api_key(&self, provider: &str) -> Option<String> {
         match self.credential(provider)? {

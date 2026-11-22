@@ -244,6 +244,18 @@ fn file_references_and_images(cx: &mut TestAppContext) {
         v.attachments().iter().map(|a| a.name.clone()).collect()
     });
     assert_eq!(names, ["shot.png", "Pasted image"]);
+    // A pasted image over the limit is refused with a note.
+    cx.write_to_clipboard(ClipboardItem::new_image(&Image::from_bytes(
+        ImageFormat::Png,
+        vec![0; zp_core::attachments::MAX_IMAGE_BYTES + 1],
+    )));
+    cx.simulate_keystrokes(window.into(), "secondary-v");
+    cx.run_until_parked();
+    assert_eq!(conversation.read_with(cx, |v, _| v.attachments().len()), 2);
+    assert_eq!(
+        conversation.read_with(cx, |v, _| v.info_text()),
+        Some("Pasted image is larger than 5 MB".into())
+    );
     // Plain text still pastes into the field.
     cx.write_to_clipboard(ClipboardItem::new_string("what is this?".into()));
     cx.simulate_keystrokes(window.into(), "secondary-v");

@@ -27,7 +27,7 @@ use alacritty_terminal::index::{Column, Line, Point as GridPoint, Side};
 use alacritty_terminal::selection::{Selection, SelectionType};
 use alacritty_terminal::sync::FairMutex;
 use alacritty_terminal::term::cell::Flags;
-use alacritty_terminal::term::{Config, Term, TermMode};
+use alacritty_terminal::term::{ClipboardType, Config, Osc52, Term, TermMode};
 use alacritty_terminal::tty;
 use alacritty_terminal::vte::ansi::{Color, CursorShape, NamedColor, Rgb};
 use futures::StreamExt as _;
@@ -49,6 +49,14 @@ use crate::theme::ActiveTheme;
 const SCROLLBACK: usize = 10_000;
 /// Line height relative to the font size.
 const LINE_HEIGHT: f32 = 1.3;
+/// Largest text a program may put on the clipboard through OSC 52.
+const OSC52_MAX_BYTES: usize = 1 << 20;
+
+/// Whether a program's OSC 52 copy reaches the system clipboard: only the clipboard
+/// target (the primary selection would overwrite it too) and only reasonable sizes.
+fn accepts_clipboard_store(target: ClipboardType, text: &str) -> bool {
+    matches!(target, ClipboardType::Clipboard) && text.len() <= OSC52_MAX_BYTES
+}
 
 /// Forwards terminal events to the view.
 #[derive(Clone)]
@@ -150,6 +158,8 @@ impl Shell {
         };
         let config = Config {
             scrolling_history: SCROLLBACK,
+            // Programs may copy, but never read the clipboard back.
+            osc52: Osc52::OnlyCopy,
             ..Config::default()
         };
         let term = Arc::new(FairMutex::new(Term::new(config, &grid, listener.clone())));
@@ -344,8 +354,10 @@ impl TerminalView {
                 cx.emit(TerminalEvent::TitleChanged);
                 cx.notify();
             }
-            TermEvent::ClipboardStore(_, text) => {
-                cx.write_to_clipboard(ClipboardItem::new_string(text))
+            TermEvent::ClipboardStore(target, text) => {
+                if accepts_clipboard_store(target, &text) {
+                    cx.write_to_clipboard(ClipboardItem::new_string(text))
+                }
             }
             TermEvent::ClipboardLoad(_, format) => {
                 let text = cx

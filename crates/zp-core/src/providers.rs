@@ -42,6 +42,36 @@ pub fn validate_custom_provider(def: &CustomProvider, existing: &[String]) -> an
     Ok(())
 }
 
+/// Whether header `name` usually carries a secret (custom provider headers are stored in
+/// plain text in settings.json, unlike the API key).
+pub fn looks_like_secret_header(name: &str) -> bool {
+    let name = name.trim().to_ascii_lowercase();
+    matches!(name.as_str(), "authorization" | "api-key" | "x-api-key")
+        || name.contains("token")
+        || name.contains("secret")
+}
+
+/// A warning when an API key would travel unencrypted: `base_url` is plain http:// to a
+/// host that is neither loopback nor on a private network, and `has_key`. Plain http://
+/// stays allowed (local servers like Ollama and LM Studio use it).
+pub fn plain_http_key_warning(base_url: &str, has_key: bool) -> Option<String> {
+    let url = reqwest::Url::parse(base_url.trim()).ok()?;
+    if !has_key || url.scheme() != "http" {
+        return None;
+    }
+    let host = url.host_str()?;
+    let local = match host.trim_matches(['[', ']']).parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V4(ip)) => ip.is_loopback() || ip.is_private(),
+        Ok(std::net::IpAddr::V6(ip)) => ip.is_loopback(),
+        Err(_) => host == "localhost" || host.ends_with(".local"),
+    };
+    (!local).then(|| {
+        format!(
+            "The API key is sent unencrypted to {host}; use https:// unless this network is trusted."
+        )
+    })
+}
+
 fn api_of(def: &CustomProvider) -> anyhow::Result<Api> {
     match def.api.as_deref().unwrap_or("openai-completions") {
         "openai-completions" => Ok(Api::OpenAiCompletions),
@@ -161,5 +191,62 @@ mod tests {
         );
         assert!(models.remove_provider("local"));
         assert!(models.provider("local").is_none());
+    }
+
+    #[test]
+    fn secret_looking_header_names() {
+        for name in [
+            "Authorization",
+            "api-key",
+            "X-API-Key",
+            "X-Auth-Token",
+            "x-client-secret",
+            " authorization ",
+        ] {
+            assert!(looks_like_secret_header(name), "{name}");
+        }
+        for name in ["X-Team", "OpenAI-Organization", "api-version", ""] {
+            assert!(!looks_like_secret_header(name), "{name}");
+        }
+    }
+
+    #[test]
+    fn plain_http_key_warnings() {
+        let warns = |url: &str| plain_http_key_warning(url, true).is_some();
+        for local in [
+            "http://localhost:11434/v1",
+            "http://127.0.0.1:1234/v1",
+            "http://127.8.0.1/v1",
+            "http://[::1]:8080/v1",
+            "http://10.1.2.3/v1",
+            "http://172.16.0.1/v1",
+            "http://172.31.255.255/v1",
+            "http://192.168.1.20:8000/v1",
+            "http://gpu-box.local/v1",
+            "http://LOCALHOST/v1",
+        ] {
+            assert!(!warns(local), "{local}");
+        }
+        for remote in [
+            "http://llm.example.com/v1",
+            "http://172.32.0.1/v1",
+            "http://8.8.8.8/v1",
+            "http://[2001:db8::1]/v1",
+            " http://gateway.corp/v1 ",
+        ] {
+            assert!(warns(remote), "{remote}");
+        }
+        let warning = plain_http_key_warning("http://llm.example.com/v1", true).unwrap();
+        assert!(warning.contains("llm.example.com"), "{warning}");
+        assert_eq!(
+            plain_http_key_warning("http://llm.example.com/v1", false),
+            None,
+            "no key"
+        );
+        assert_eq!(
+            plain_http_key_warning("https://llm.example.com/v1", true),
+            None
+        );
+        assert_eq!(plain_http_key_warning("not a url", true), None);
     }
 }

@@ -84,19 +84,25 @@ pub struct Snapshot {
 }
 
 impl Snapshot {
-    /// Lists the entries directly in `roots`.
+    /// Lists the entries directly in `roots`. A root that cannot be listed completely is
+    /// left out, so nothing in it is taken for created by the run.
     pub fn take(roots: Vec<TempRoot>) -> Self {
-        let entries = roots
-            .iter()
-            .map(|root| {
-                let names = std::fs::read_dir(&root.path)
-                    .map(|dir| {
-                        dir.filter_map(Result::ok)
-                            .map(|entry| entry.file_name())
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                (root.path.clone(), names)
+        let mut entries = HashMap::new();
+        let roots = roots
+            .into_iter()
+            .filter(|root| match entry_names(&root.path) {
+                Ok(names) => {
+                    entries.insert(root.path.clone(), names);
+                    true
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        path = %root.path.display(),
+                        %error,
+                        "not tracking a temporary directory that cannot be listed"
+                    );
+                    false
+                }
             })
             .collect();
         Self { roots, entries }
@@ -174,6 +180,13 @@ impl Snapshot {
             .is_some_and(|parent| self.roots.iter().any(|root| root.path == parent))
             && path.file_name().is_some()
     }
+}
+
+/// The names of the entries directly in `dir`; an error if any cannot be read.
+fn entry_names(dir: &Path) -> std::io::Result<HashSet<OsString>> {
+    std::fs::read_dir(dir)?
+        .map(|entry| entry.map(|entry| entry.file_name()))
+        .collect()
 }
 
 /// `$TMPDIR`, `${TMPDIR}` and `%TEMP%` written out, so paths built from them are found.
@@ -289,6 +302,31 @@ mod tests {
         assert!(!canonical.join("build-1").exists());
         assert_eq!(failed.len(), 1, "never the directory itself");
         assert!(canonical.join("before.txt").exists());
+    }
+
+    #[test]
+    fn a_directory_that_cannot_be_listed_is_not_tracked() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("not-a-dir");
+        std::fs::write(&file, "x").unwrap();
+        let missing = dir.path().canonicalize().unwrap().join("missing");
+        let snapshot = Snapshot::take(vec![
+            root(&file, "/unlistable"),
+            TempRoot {
+                aliases: vec!["/missing".to_owned()],
+                path: missing.clone(),
+            },
+        ]);
+        // Created after the snapshot, so it would count as the run's if the empty listing
+        // were trusted.
+        std::fs::create_dir(&missing).unwrap();
+        std::fs::write(missing.join("theirs"), "x").unwrap();
+
+        let mentioned = snapshot.mentioned("rm /missing/theirs /unlistable/x");
+        assert!(mentioned.is_empty(), "{mentioned:?}");
+        assert!(snapshot.created(&[missing.join("theirs")]).is_empty());
+        assert_eq!(remove(&snapshot, &[missing.join("theirs")]).len(), 1);
+        assert!(missing.join("theirs").exists());
     }
 
     #[test]

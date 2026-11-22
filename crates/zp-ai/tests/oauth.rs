@@ -302,3 +302,85 @@ async fn login_stores_the_credential() {
             .is_err()
     );
 }
+
+/// A store that caches like the keychain store: `credential` returns this process's copy,
+/// `reload` what is stored now (another process may have changed it).
+#[derive(Default)]
+struct CachingStore {
+    cached: std::sync::Mutex<Option<Credential>>,
+    stored: std::sync::Mutex<Option<Credential>>,
+}
+
+impl CredentialStore for CachingStore {
+    fn credential(&self, _provider: &str) -> Option<Credential> {
+        self.cached.lock().unwrap().clone()
+    }
+
+    fn store(&self, _provider: &str, credential: &Credential) -> Result<(), String> {
+        *self.cached.lock().unwrap() = Some(credential.clone());
+        *self.stored.lock().unwrap() = Some(credential.clone());
+        Ok(())
+    }
+
+    fn reload(&self, _provider: &str) -> Option<Credential> {
+        let stored = self.stored.lock().unwrap().clone();
+        *self.cached.lock().unwrap() = stored.clone();
+        stored
+    }
+}
+
+fn caching_setup() -> (Models, Arc<CachingStore>, Arc<FakeFlow>) {
+    let model = model("openai-responses", "openai", "http://127.0.0.1:9");
+    let store = Arc::new(CachingStore::default());
+    let flow = Arc::new(FakeFlow {
+        prefix: "tok-",
+        refreshes: AtomicUsize::new(0),
+    });
+    let mut models = Models::new()
+        .with_env(Arc::new(|_| None))
+        .with_credentials(store.clone());
+    models.set_provider(Arc::new(
+        HttpProvider::new("openai", "Mock", Vec::<String>::new(), vec![model])
+            .with_oauth(flow.clone()),
+    ));
+    (models, store, flow)
+}
+
+#[tokio::test]
+async fn tokens_refreshed_by_another_process_are_used_instead_of_refreshing() {
+    let (models, store, flow) = caching_setup();
+    *store.cached.lock().unwrap() = Some(expired("tok-old"));
+    *store.stored.lock().unwrap() = Some(Credential::OAuth(OAuthCredential::new(
+        "tok-other",
+        "rotated",
+        3600.0,
+        0,
+    )));
+    let auth = models
+        .request_auth("openai", &CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(auth.api_key.as_deref(), Some("tok-other"));
+    assert_eq!(flow.refreshes.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn a_rotated_refresh_token_from_another_process_is_refreshed() {
+    let (models, store, flow) = caching_setup();
+    *store.cached.lock().unwrap() = Some(expired("tok-old"));
+    let Credential::OAuth(mut rotated) = expired("tok-other") else {
+        unreachable!()
+    };
+    rotated.refresh = "rotated".into();
+    *store.stored.lock().unwrap() = Some(Credential::OAuth(rotated));
+    let auth = models
+        .request_auth("openai", &CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(auth.api_key.as_deref(), Some("tok-new"));
+    assert_eq!(flow.refreshes.load(Ordering::SeqCst), 1);
+    let Some(Credential::OAuth(stored)) = store.stored.lock().unwrap().clone() else {
+        panic!("still signed in")
+    };
+    assert_eq!(stored.refresh, "rotated");
+}

@@ -43,8 +43,8 @@ impl VaultBackend {
             .context("could not save the credential vault")
     }
 
-    fn load<'a>(&self, state: &'a mut State, retry: bool) -> anyhow::Result<&'a mut Secrets> {
-        if matches!(state, State::Unloaded) || (retry && matches!(state, State::Failed(_))) {
+    fn load<'a>(&self, state: &'a mut State) -> anyhow::Result<&'a mut Secrets> {
+        if matches!(state, State::Unloaded) {
             *state = match self.read() {
                 Ok(secrets) => State::Ready(secrets),
                 Err(error) => State::Failed(format!("{error:#}")),
@@ -56,32 +56,66 @@ impl VaultBackend {
             State::Unloaded => unreachable!(),
         }
     }
+
+    /// Applies `change` to the stored vault and writes it back. The vault is read again
+    /// first: another process (the CLI next to the app) may have changed it since it was
+    /// cached, and writing the cached copy would undo that.
+    fn update(&self, change: impl FnOnce(&mut Secrets)) -> anyhow::Result<()> {
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut secrets = match self.read() {
+            Ok(secrets) => secrets,
+            Err(error) => {
+                // A working cache stays usable; otherwise this read is the one that failed.
+                if !matches!(*state, State::Ready(_)) {
+                    *state = State::Failed(format!("{error:#}"));
+                }
+                return Err(error);
+            }
+        };
+        change(&mut secrets);
+        self.write(&secrets)?;
+        *state = State::Ready(secrets);
+        Ok(())
+    }
 }
 
 impl SecretBackend for VaultBackend {
     fn get(&self, provider: &str) -> anyhow::Result<Option<String>> {
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-        Ok(self.load(&mut state, false)?.get(provider).cloned())
+        Ok(self.load(&mut state)?.get(provider).cloned())
     }
 
     fn set(&self, provider: &str, secret: &str) -> anyhow::Result<()> {
-        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-        let secrets = self.load(&mut state, true)?;
-        let mut updated = secrets.clone();
-        updated.insert(provider.to_owned(), secret.to_owned());
-        self.write(&updated)?;
-        *secrets = updated;
-        Ok(())
+        self.update(|secrets| {
+            secrets.insert(provider.to_owned(), secret.to_owned());
+        })
     }
 
     fn delete(&self, provider: &str) -> anyhow::Result<()> {
+        self.update(|secrets| {
+            secrets.remove(provider);
+        })
+    }
+
+    /// Reads the stored vault again, unless reading it failed before: such a read (a
+    /// denied keychain prompt) is only retried by an edit or [`Self::retry_failed`]. A
+    /// failure here keeps the cached vault.
+    fn reload(&self, provider: &str) -> anyhow::Result<Option<String>> {
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-        let secrets = self.load(&mut state, true)?;
-        let mut updated = secrets.clone();
-        updated.remove(provider);
-        self.write(&updated)?;
-        *secrets = updated;
-        Ok(())
+        if let State::Failed(error) = &*state {
+            return Err(anyhow!("{error}"));
+        }
+        let secrets = self.read()?;
+        let secret = secrets.get(provider).cloned();
+        *state = State::Ready(secrets);
+        Ok(secret)
+    }
+
+    fn retry_failed(&self) {
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        if matches!(*state, State::Failed(_)) {
+            *state = State::Unloaded;
+        }
     }
 }
 
@@ -132,7 +166,8 @@ mod tests {
             zp_ai::Credential::decode(&vault.get("two").unwrap().unwrap()),
             oauth
         );
-        assert_eq!(storage.reads.load(Ordering::SeqCst), 1);
+        // Each save reads the stored vault first; reads come from the cache.
+        assert_eq!(storage.reads.load(Ordering::SeqCst), 2);
         assert_eq!(storage.writes.load(Ordering::SeqCst), 2);
 
         let restarted = VaultBackend::new(storage.clone());
@@ -147,8 +182,70 @@ mod tests {
                 });
             }
         });
-        assert_eq!(storage.reads.load(Ordering::SeqCst), 2);
+        assert_eq!(storage.reads.load(Ordering::SeqCst), 3);
         assert_eq!(storage.writes.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn saves_keep_credentials_another_process_stored() {
+        let storage = Arc::new(Backend::default());
+        let app = VaultBackend::new(storage.clone());
+        let cli = VaultBackend::new(storage.clone());
+        app.set("one", "sk-one").unwrap();
+        // The CLI loaded the vault before the app saved.
+        assert_eq!(cli.get("one").unwrap().as_deref(), Some("sk-one"));
+        app.set("one", "sk-one-new").unwrap();
+        app.set("two", "sk-two").unwrap();
+        cli.set("three", "sk-three").unwrap();
+        app.delete("two").unwrap();
+
+        let restarted = VaultBackend::new(storage);
+        assert_eq!(restarted.get("one").unwrap().as_deref(), Some("sk-one-new"));
+        assert_eq!(restarted.get("two").unwrap(), None);
+        assert_eq!(restarted.get("three").unwrap().as_deref(), Some("sk-three"));
+        assert_eq!(cli.get("one").unwrap().as_deref(), Some("sk-one-new"));
+    }
+
+    #[test]
+    fn reload_reads_the_stored_vault_but_not_after_a_failed_read() {
+        let storage = Arc::new(Backend::default());
+        let app = VaultBackend::new(storage.clone());
+        let cli = VaultBackend::new(storage.clone());
+        app.set("one", "old").unwrap();
+        assert_eq!(cli.get("one").unwrap().as_deref(), Some("old"));
+        app.set("one", "new").unwrap();
+        assert_eq!(cli.get("one").unwrap().as_deref(), Some("old"));
+        assert_eq!(cli.reload("one").unwrap().as_deref(), Some("new"));
+        assert_eq!(cli.get("one").unwrap().as_deref(), Some("new"));
+
+        storage.fail_read.store(true, Ordering::SeqCst);
+        let denied = VaultBackend::new(storage.clone());
+        assert!(denied.get("one").is_err());
+        let reads = storage.reads.load(Ordering::SeqCst);
+        storage.fail_read.store(false, Ordering::SeqCst);
+        assert!(denied.reload("one").is_err());
+        assert!(denied.get("one").is_err());
+        assert_eq!(storage.reads.load(Ordering::SeqCst), reads);
+    }
+
+    #[test]
+    fn retry_failed_reads_the_vault_again() {
+        let storage = Arc::new(Backend::default());
+        VaultBackend::new(storage.clone())
+            .set("one", "sk-one")
+            .unwrap();
+        storage.fail_read.store(true, Ordering::SeqCst);
+        let vault = VaultBackend::new(storage.clone());
+        assert!(vault.get("one").is_err());
+        storage.fail_read.store(false, Ordering::SeqCst);
+        assert!(vault.get("one").is_err());
+        vault.retry_failed();
+        assert_eq!(vault.get("one").unwrap().as_deref(), Some("sk-one"));
+        // A loaded vault is kept.
+        let reads = storage.reads.load(Ordering::SeqCst);
+        vault.retry_failed();
+        assert_eq!(vault.get("one").unwrap().as_deref(), Some("sk-one"));
+        assert_eq!(storage.reads.load(Ordering::SeqCst), reads);
     }
 
     #[test]

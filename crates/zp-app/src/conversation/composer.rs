@@ -723,11 +723,10 @@ impl ConversationView {
                     )))
                     .is_some()
                     {
-                        self.attachments.push(ImageAttachment {
-                            name: "Pasted image".into(),
-                            mime_type: mime,
-                            data: image.bytes.clone(),
-                        });
+                        match ImageAttachment::new("Pasted image", mime, image.bytes.clone()) {
+                            Ok(image) => self.attachments.push(image),
+                            Err(error) => self.info = Some(format!("{error:#}")),
+                        }
                     } else {
                         self.info = Some(format!("Images of type {mime} cannot be attached"));
                     }

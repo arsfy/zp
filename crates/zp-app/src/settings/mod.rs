@@ -164,6 +164,17 @@ pub struct SettingsWindow {
     _subscriptions: Vec<Subscription>,
 }
 
+/// Opening the Providers page is an explicit look at the stored keys, so keys that could
+/// not be read (a denied or failed keychain read) are read again. Reads never retry on
+/// their own, so a denied keychain prompt does not keep coming back.
+fn retry_failed_credentials(page: Page, cx: &App) {
+    if page == Page::Providers
+        && let Some(models) = cx.try_global::<AppModels>()
+    {
+        models.credentials.retry_failed();
+    }
+}
+
 fn input(text: impl Into<String>, cx: &mut App) -> Entity<EditableTextState> {
     let text = text.into();
     cx.new(|cx| EditableTextState::new(StringStorage::from(text), cx))
@@ -220,6 +231,7 @@ impl SettingsWindow {
     }
 
     fn new(page: Page, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        retry_failed_credentials(page, cx);
         let settings = AppSettings::get(cx).clone();
         let permissions = &settings.permissions;
         let model_filter = input("", cx);
@@ -276,6 +288,7 @@ impl SettingsWindow {
     }
 
     pub fn set_page(&mut self, page: Page, cx: &mut Context<Self>) {
+        retry_failed_credentials(page, cx);
         if self.page != page {
             self.page = page;
             self.notice = None;

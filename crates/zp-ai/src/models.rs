@@ -483,6 +483,19 @@ impl Models {
         if !current.is_expired() {
             return Ok(current);
         }
+        // Another process may have refreshed the tokens meanwhile, and with a rotating
+        // refresh token, refreshing the cached ones again would fail.
+        let current = match self.credentials.reload(provider) {
+            Some(Credential::OAuth(stored))
+                if !stored.is_expired() || stored.refresh != current.refresh =>
+            {
+                stored
+            }
+            _ => current,
+        };
+        if !current.is_expired() {
+            return Ok(current);
+        }
         let refreshed = flow
             .refresh(current, cancel.clone())
             .await

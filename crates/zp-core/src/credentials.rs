@@ -6,6 +6,9 @@
 //! The keychain is only queried for providers listed in a small index file
 //! (`~/.zp/credentials.json`, ids only — never secrets), so providers without a stored key
 //! cost nothing and trigger no keychain prompts. Keys are cached in memory once read.
+//!
+//! The app and the CLI may run side by side: saves start from the stored vault and index,
+//! not this process's copy, so they keep what the other process stored.
 
 mod vault;
 
@@ -24,6 +27,14 @@ pub trait SecretBackend: Send + Sync {
     fn get(&self, provider: &str) -> anyhow::Result<Option<String>>;
     fn set(&self, provider: &str, secret: &str) -> anyhow::Result<()>;
     fn delete(&self, provider: &str) -> anyhow::Result<()>;
+
+    /// Reads `provider` again, bypassing any cache (another process may have changed it).
+    fn reload(&self, provider: &str) -> anyhow::Result<Option<String>> {
+        self.get(provider)
+    }
+
+    /// Lets the next read retry a read that failed (and is cached as failed).
+    fn retry_failed(&self) {}
 }
 
 /// The platform keychain.
@@ -118,11 +129,7 @@ impl Credentials {
     /// Keys in `backend`, with the index of stored providers at `index` (in memory without
     /// one).
     pub fn new(backend: Arc<dyn SecretBackend>, index: Option<PathBuf>) -> Self {
-        let stored = index
-            .as_deref()
-            .and_then(|path| std::fs::read_to_string(path).ok())
-            .and_then(|text| serde_json::from_str::<BTreeSet<String>>(&text).ok())
-            .unwrap_or_default();
+        let stored = index.as_deref().and_then(read_index).unwrap_or_default();
         Self {
             backend,
             index,
@@ -170,7 +177,7 @@ impl Credentials {
             .cache
             .insert(provider.to_owned(), Some(secret.to_owned()));
         state.stored.insert(provider.to_owned());
-        self.save_index(&state.stored)
+        self.save_index(&mut state.stored, provider, true)
     }
 
     /// Deletes the stored key or sign-in of `provider`.
@@ -180,7 +187,16 @@ impl Credentials {
         state.cache.retain(|_, secret| secret.is_some());
         state.cache.remove(provider);
         state.stored.remove(provider);
-        self.save_index(&state.stored)
+        self.save_index(&mut state.stored, provider, false)
+    }
+
+    /// Lets the next reads retry keys that could not be read (or were missing), e.g. after
+    /// a denied keychain prompt. Failed reads are otherwise not retried, so a denied prompt
+    /// does not come back on every request; call this on an explicit user action only.
+    pub fn retry_failed(&self) {
+        let mut state = self.state.write().unwrap_or_else(PoisonError::into_inner);
+        state.cache.retain(|_, secret| secret.is_some());
+        self.backend.retry_failed();
     }
 
     /// Whether a key is stored for `provider`.
@@ -192,16 +208,50 @@ impl Credentials {
             .contains(provider)
     }
 
-    fn save_index(&self, stored: &BTreeSet<String>) -> anyhow::Result<()> {
+    /// Records in the index whether `provider` has a key (`present`), then makes `stored`
+    /// the saved index. The saved index is read again first so that providers another
+    /// process added or removed meanwhile stay that way; `stored` is only the fallback when
+    /// it cannot be read.
+    fn save_index(
+        &self,
+        stored: &mut BTreeSet<String>,
+        provider: &str,
+        present: bool,
+    ) -> anyhow::Result<()> {
         let Some(path) = &self.index else {
             return Ok(());
         };
-        if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir)?;
+        let mut index = read_index(path).unwrap_or_else(|| stored.clone());
+        if present {
+            index.insert(provider.to_owned());
+        } else {
+            index.remove(provider);
         }
-        std::fs::write(path, serde_json::to_string_pretty(stored)?)
-            .with_context(|| format!("could not write {}", path.display()))
+        crate::fs::write_atomic(path, serde_json::to_string_pretty(&index)?.as_bytes())?;
+        *stored = index;
+        Ok(())
     }
+}
+
+/// The providers listed in the index at `path` (none when it does not exist), or `None`
+/// when it cannot be read. An invalid index is moved aside so that saving does not
+/// destroy the list of keys it held.
+fn read_index(path: &Path) -> Option<BTreeSet<String>> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Some(BTreeSet::new());
+        }
+        Err(error) => {
+            tracing::warn!(path = %path.display(), %error, "could not read the credential index");
+            return None;
+        }
+    };
+    serde_json::from_str(&text)
+        .inspect_err(|error| {
+            crate::fs::move_aside_corrupt(path, error);
+        })
+        .ok()
 }
 
 impl CredentialStore for Credentials {
@@ -213,6 +263,27 @@ impl CredentialStore for Credentials {
     fn store(&self, provider: &str, credential: &Credential) -> Result<(), String> {
         self.set_credential(provider, credential)
             .map_err(|error| format!("{error:#}"))
+    }
+
+    /// Reads the stored credential from the keychain again, replacing the cached one. A
+    /// read that failed before is not retried (see [`Credentials::retry_failed`]).
+    fn reload(&self, provider: &str) -> Option<Credential> {
+        let mut state = self.state.write().unwrap_or_else(PoisonError::into_inner);
+        if !state.stored.contains(provider) || matches!(state.cache.get(provider), Some(None)) {
+            return None;
+        }
+        match self.backend.reload(provider) {
+            Ok(Some(secret)) => {
+                let credential = Credential::decode(&secret);
+                state.cache.insert(provider.to_owned(), Some(secret));
+                Some(credential)
+            }
+            Ok(None) => None,
+            Err(error) => {
+                tracing::warn!(provider, error = %format!("{error:#}"), "could not reload a credential");
+                None
+            }
+        }
     }
 }
 
@@ -380,5 +451,97 @@ mod tests {
                 if remove { None } else { Some("replacement") }
             );
         }
+    }
+
+    /// One process's credentials (the app or the CLI): its own vault cache over the shared
+    /// `keychain`, and the index in `dir`.
+    fn process(keychain: &Arc<MemoryBackend>, dir: &Path) -> Credentials {
+        Credentials::new(
+            Arc::new(vault::VaultBackend::new(keychain.clone())),
+            Some(dir.join("credentials.json")),
+        )
+    }
+
+    #[test]
+    fn saves_keep_what_another_process_stored() {
+        let dir = tempfile::tempdir().unwrap();
+        let keychain = Arc::new(MemoryBackend::default());
+        let app = process(&keychain, dir.path());
+        let cli = process(&keychain, dir.path());
+        app.set("one", "sk-one").unwrap();
+        cli.set("two", "sk-two").unwrap();
+        app.set("three", "sk-three").unwrap();
+        cli.remove("three").unwrap();
+        app.set("four", "sk-four").unwrap();
+        // A save picks up the other process's index too.
+        assert!(app.is_stored("two"));
+        assert!(!app.is_stored("three"));
+
+        let restarted = process(&keychain, dir.path());
+        assert_eq!(restarted.api_key("one").as_deref(), Some("sk-one"));
+        assert_eq!(restarted.api_key("two").as_deref(), Some("sk-two"));
+        assert!(!restarted.is_stored("three"));
+        assert_eq!(restarted.api_key("four").as_deref(), Some("sk-four"));
+    }
+
+    #[test]
+    fn reload_reads_tokens_another_process_refreshed() {
+        let dir = tempfile::tempdir().unwrap();
+        let keychain = Arc::new(MemoryBackend::default());
+        let app = process(&keychain, dir.path());
+        let old = Credential::OAuth(zp_ai::OAuthCredential::new("old", "refresh-1", 60., 0));
+        let new = Credential::OAuth(zp_ai::OAuthCredential::new("new", "refresh-2", 60., 0));
+        app.set_credential("codex", &old).unwrap();
+        let cli = process(&keychain, dir.path());
+        assert_eq!(cli.credential("codex"), Some(old));
+        app.set_credential("codex", &new).unwrap();
+        assert_eq!(cli.reload("codex"), Some(new.clone()));
+        assert_eq!(cli.credential("codex"), Some(new));
+        assert_eq!(cli.reload("missing"), None);
+    }
+
+    #[test]
+    fn retry_failed_reads_denied_keys_again_and_reload_does_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let index = dir.path().join("credentials.json");
+        let backend = Arc::new(Counting::default());
+        Credentials::new(backend.clone(), Some(index.clone()))
+            .set("one", "sk-one")
+            .unwrap();
+        let credentials = Credentials::new(backend.clone(), Some(index));
+        backend.fail_read.store(true, Ordering::SeqCst);
+        assert_eq!(credentials.api_key("one"), None);
+        backend.fail_read.store(false, Ordering::SeqCst);
+        assert_eq!(credentials.reload("one"), None);
+        assert_eq!(credentials.api_key("one"), None);
+        assert_eq!(*backend.reads.lock().unwrap(), 1);
+
+        credentials.retry_failed();
+        assert_eq!(credentials.api_key("one").as_deref(), Some("sk-one"));
+        assert_eq!(*backend.reads.lock().unwrap(), 2);
+    }
+
+    #[test]
+    fn an_invalid_index_is_moved_aside() {
+        let dir = tempfile::tempdir().unwrap();
+        let index = dir.path().join("credentials.json");
+        std::fs::write(&index, "[\"one\", truncated").unwrap();
+        let credentials = Credentials::new(Arc::new(MemoryBackend::default()), Some(index.clone()));
+        assert!(!credentials.is_stored("one"));
+        credentials.set("two", "sk-two").unwrap();
+
+        let backups: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with("credentials.json.corrupt-"))
+            .collect();
+        assert_eq!(backups.len(), 1);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join(&backups[0])).unwrap(),
+            "[\"one\", truncated"
+        );
+        let saved: BTreeSet<String> =
+            serde_json::from_str(&std::fs::read_to_string(&index).unwrap()).unwrap();
+        assert_eq!(saved, BTreeSet::from(["two".to_owned()]));
     }
 }

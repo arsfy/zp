@@ -123,6 +123,18 @@ fn osc8_links_use_the_target_and_reject_command_schemes() {
 }
 
 #[test]
+fn osc52_copies_only_the_clipboard_target_within_the_size_limit() {
+    assert!(accepts_clipboard_store(ClipboardType::Clipboard, "copied"));
+    assert!(!accepts_clipboard_store(ClipboardType::Selection, "copied"));
+    let limit = "x".repeat(OSC52_MAX_BYTES);
+    assert!(accepts_clipboard_store(ClipboardType::Clipboard, &limit));
+    assert!(!accepts_clipboard_store(
+        ClipboardType::Clipboard,
+        &format!("{limit}x")
+    ));
+}
+
+#[test]
 fn search_is_literal_unicode_aware_and_covers_history() {
     let term = grid(
         "first Match\r\nsecond match\r\nthird MATCH\r\n\u{4f60}\u{597d} cargo.test\r\nlast\r\n",
