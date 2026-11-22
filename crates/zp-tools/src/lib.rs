@@ -17,6 +17,7 @@ mod output;
 mod path;
 mod read;
 mod search;
+mod secrets;
 mod shell;
 mod todo;
 mod truncate;
@@ -40,6 +41,7 @@ pub use ls::LsTool;
 pub use path::{display as display_path, resolve as resolve_path};
 pub use read::ReadTool;
 pub use search::{FindTool, GrepTool};
+pub use secrets::is_secret_path;
 pub use shell::{Shell, kill_tree};
 pub use todo::{TodoItem, TodoList, TodoStatus, TodoTool};
 pub use truncate::{

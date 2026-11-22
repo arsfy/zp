@@ -554,7 +554,7 @@ impl SubagentTool {
         options.request_options.max_retries = Some(0);
         let prompt = task_prompt(&task.instructions, task.context.as_deref(), &task.scope);
         let scope = Arc::new(task.scope);
-        options.tools = zp_tools::read_only_tools(&scope.root)
+        options.tools = subagent_tools(&scope.root)
             .into_iter()
             .map(|tool| {
                 Arc::new(ScopedReadTool {
@@ -761,6 +761,21 @@ impl AgentTool for SubagentTool {
     }
 }
 
+/// The read-only tools, with `grep` skipping credential files: a child may run on another
+/// provider than the main model, and its tasks can be steered by repository content.
+fn subagent_tools(root: &Path) -> Vec<Arc<dyn AgentTool>> {
+    zp_tools::READ_ONLY_TOOLS
+        .iter()
+        .filter_map(|name| match *name {
+            "grep" => {
+                Some(Arc::new(zp_tools::GrepTool::new(root).skipping_secrets())
+                    as Arc<dyn AgentTool>)
+            }
+            name => zp_tools::create_tool(name, root),
+        })
+        .collect()
+}
+
 struct WorkspaceScope {
     root: PathBuf,
     paths: Vec<PathBuf>,
@@ -821,6 +836,12 @@ impl AgentTool for ScopedReadTool {
     ) -> BoxFuture<'a, anyhow::Result<AgentToolResult>> {
         Box::pin(async move {
             let path = self.scope.resolve(args["path"].as_str().unwrap_or("."))?;
+            if zp_tools::is_secret_path(path.strip_prefix(&self.scope.root).unwrap_or(&path)) {
+                bail!(
+                    "Subagents cannot read credential files (.env files, private keys, .git, \
+                     .ssh and similar)"
+                );
+            }
             if !self.scope.paths.is_empty()
                 && !self
                     .scope

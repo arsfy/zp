@@ -151,6 +151,91 @@ async fn task_profiles_run_a_distinct_model_with_scoped_tools_and_accounted_usag
     assert_eq!(parent.requests().len(), 2);
 }
 
+/// A child on another provider than the main model, steered by repository content, must
+/// not get credentials: not by reading them, nor by searching the workspace for them.
+#[tokio::test]
+async fn subagents_on_another_provider_cannot_read_or_search_credential_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("project");
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::create_dir_all(root.join(".git")).unwrap();
+    std::fs::create_dir_all(root.join("keys")).unwrap();
+    std::fs::write(root.join(".env"), "API_TOKEN=sk-live-abc123\n").unwrap();
+    std::fs::write(root.join(".env.example"), "API_TOKEN=\n").unwrap();
+    std::fs::write(
+        root.join(".git/config"),
+        "url = https://user:sk-live-abc123@example.com/repo\n",
+    )
+    .unwrap();
+    std::fs::write(root.join("keys/deploy.pem"), "sk-live-abc123 private key\n").unwrap();
+    std::fs::write(
+        root.join("src/config.rs"),
+        "let token = env(\"API_TOKEN\");\n",
+    )
+    .unwrap();
+
+    let parent = FauxProvider::new("parent");
+    let child = FauxProvider::new("child");
+    let mut config = settings();
+    config.assignment = Some(Assignment::TaskProfiles);
+    config.default_profile = Some("explore".into());
+    config.profiles.insert("explore".into(), profile(&child));
+    parent.push(delegate(json!({"task": "collect the deployment settings"})));
+    parent.push(FauxResponse::text("Parent conclusion"));
+    let call = |name: &str, arguments: Value| FauxBlock::ToolCall {
+        name: name.into(),
+        arguments,
+    };
+    child.push(FauxResponse::blocks(vec![
+        call("read", json!({"path": ".env"})),
+        call("read", json!({"path": ".git/config"})),
+        call("read", json!({"path": "keys/deploy.pem"})),
+        call("grep", json!({"pattern": "sk-live"})),
+        call("grep", json!({"pattern": "sk-live", "glob": "*.env"})),
+        call("grep", json!({"pattern": "sk-live", "path": ".env"})),
+        call("grep", json!({"pattern": "API_TOKEN"})),
+        call("read", json!({"path": ".env.example"})),
+    ]));
+    child.push(FauxResponse::text("No credentials available"));
+
+    let coding = coding(&root, &[&parent, &child], config, None);
+    coding.prompt("deploy it").await.unwrap();
+
+    let requests = child.requests();
+    let results: Vec<(bool, String)> = requests[1]
+        .messages
+        .iter()
+        .filter_map(|message| match message {
+            Message::ToolResult(result) => Some((
+                result.is_error,
+                result.content[0].as_text().unwrap_or_default().to_owned(),
+            )),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(results.len(), 8);
+    let sent_to_child = serde_json::to_string(&requests[1].messages).unwrap();
+    assert!(
+        !sent_to_child.contains("sk-live-abc123"),
+        "a credential reached the child's provider: {results:#?}"
+    );
+    // Reading a credential file directly, or searching only it, is refused.
+    for (index, (is_error, text)) in results.iter().enumerate().take(3) {
+        assert!(*is_error, "read {index}: {text}");
+        assert!(text.contains("credential files"), "read {index}: {text}");
+    }
+    assert!(results[5].0, "{}", results[5].1);
+    // Searching the workspace skips credential files and still finds the rest.
+    assert_eq!(results[3], (false, "No matches found".to_owned()));
+    assert_eq!(results[4], (false, "No matches found".to_owned()));
+    assert!(!results[6].0);
+    assert!(results[6].1.contains("src/config.rs"), "{}", results[6].1);
+    assert!(results[6].1.contains(".env.example"), "{}", results[6].1);
+    assert!(!results[6].1.contains(".env:"), "{}", results[6].1);
+    // Templates without values stay readable.
+    assert!(!results[7].0, "{}", results[7].1);
+}
+
 #[tokio::test]
 async fn follow_main_model_rejects_overrides_and_applies_to_future_runs() {
     let dir = tempfile::tempdir().unwrap();

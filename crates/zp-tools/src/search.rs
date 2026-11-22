@@ -82,12 +82,23 @@ async fn run_blocking<T: Send + 'static>(
 #[derive(Clone, Debug)]
 pub struct GrepTool {
     cwd: PathBuf,
+    skip_secrets: bool,
 }
 
 impl GrepTool {
     /// A grep tool for `cwd`.
     pub fn new(cwd: impl Into<PathBuf>) -> Self {
-        Self { cwd: cwd.into() }
+        Self {
+            cwd: cwd.into(),
+            skip_secrets: false,
+        }
+    }
+
+    /// Does not search files [`is_secret_path`](crate::is_secret_path) flags (relative to
+    /// `cwd`), e.g. `.env` and private keys.
+    pub fn skipping_secrets(mut self) -> Self {
+        self.skip_secrets = true;
+        self
     }
 }
 
@@ -99,6 +110,8 @@ struct GrepRequest {
     literal: bool,
     context: usize,
     limit: usize,
+    /// Files under this directory that look like credentials are skipped.
+    secrets_below: Option<PathBuf>,
 }
 
 fn grep(request: GrepRequest, cancel: CancellationToken) -> anyhow::Result<AgentToolResult> {
@@ -143,6 +156,11 @@ fn grep(request: GrepRequest, cancel: CancellationToken) -> anyhow::Result<Agent
             continue;
         }
         let path = entry.path();
+        if let Some(base) = &request.secrets_below
+            && crate::is_secret_path(path.strip_prefix(base).unwrap_or(path))
+        {
+            continue;
+        }
         if entry
             .metadata()
             .is_ok_and(|m| m.len() > GREP_MAX_FILE_BYTES)
@@ -275,6 +293,7 @@ impl AgentTool for GrepTool {
                     .as_i64()
                     .map_or(0, |c| usize::try_from(c.max(0)).unwrap_or(0)),
                 limit: limit_arg(&args, "limit", GREP_DEFAULT_LIMIT),
+                secrets_below: self.skip_secrets.then(|| self.cwd.clone()),
             };
             let cancel = ctx.cancel.clone();
             run_blocking(&ctx.cancel, move || grep(request, cancel)).await
