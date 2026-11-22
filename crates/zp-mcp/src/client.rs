@@ -71,6 +71,48 @@ pub struct Client {
     pub instructions: Option<String>,
 }
 
+/// Splits a `text/event-stream` body into the `data` of each event. Works on bytes, so a
+/// character split across chunks is decoded whole; accepts `\r\n` line ends (servers built
+/// on sse-starlette send them) as well as `\n`.
+#[derive(Default)]
+struct SseEvents {
+    buffer: Vec<u8>,
+}
+
+impl SseEvents {
+    /// Adds a chunk; returns the data of the events it completed.
+    fn push(&mut self, chunk: &[u8]) -> Vec<String> {
+        // A `\r` only ends lines in SSE (JSON escapes it inside strings), so dropping it
+        // turns `\r\n` into `\n`.
+        self.buffer
+            .extend(chunk.iter().copied().filter(|&byte| byte != b'\r'));
+        let mut events = Vec::new();
+        while let Some(end) = self.buffer.windows(2).position(|pair| pair == b"\n\n") {
+            let event: Vec<u8> = self.buffer.drain(..end + 2).collect();
+            if let Some(data) = event_data(&event) {
+                events.push(data);
+            }
+        }
+        events
+    }
+
+    /// The data of a last event not followed by a blank line.
+    fn finish(&mut self) -> Option<String> {
+        event_data(&std::mem::take(&mut self.buffer))
+    }
+}
+
+/// The joined `data:` lines of one event, if it has any.
+fn event_data(event: &[u8]) -> Option<String> {
+    let event = String::from_utf8_lossy(event);
+    let lines: Vec<&str> = event
+        .lines()
+        .filter_map(|line| line.strip_prefix("data:"))
+        .map(str::trim_start)
+        .collect();
+    (!lines.is_empty()).then(|| lines.join("\n"))
+}
+
 fn rpc_error(error: &Value) -> String {
     let message = error["message"].as_str().unwrap_or("unknown error");
     match error["code"].as_i64() {
@@ -354,31 +396,37 @@ impl Client {
                     } else {
                         vec![body]
                     };
-                    return Ok(messages.into_iter().find(|m| m["id"].as_u64() == Some(id)));
+                    // No answer here means none is coming: fail now rather than wait for
+                    // the timeout.
+                    return messages
+                        .into_iter()
+                        .find(|m| m["id"].as_u64() == Some(id))
+                        .map(Some)
+                        .context("the server's response does not answer the request");
                 }
                 // Server-sent events: wait for the response with our id.
                 let mut stream = response.bytes_stream();
-                let mut buffer = String::new();
+                let mut events = SseEvents::default();
+                let mut handle = |data: String| -> Option<Value> {
+                    let message = serde_json::from_str::<Value>(&data).ok()?;
+                    if message["id"].as_u64() == Some(id) && message.get("method").is_none() {
+                        return Some(message);
+                    }
+                    if message["method"] == "notifications/tools/list_changed" {
+                        self.tools_changed.store(true, Ordering::SeqCst);
+                    }
+                    None
+                };
                 while let Some(chunk) = stream.next().await {
-                    buffer.push_str(&String::from_utf8_lossy(&chunk?));
-                    while let Some(end) = buffer.find("\n\n") {
-                        let event: String = buffer.drain(..end + 2).collect();
-                        let data: String = event
-                            .lines()
-                            .filter_map(|line| line.strip_prefix("data:"))
-                            .map(str::trim_start)
-                            .collect::<Vec<_>>()
-                            .join("\n");
-                        let Ok(message) = serde_json::from_str::<Value>(&data) else {
-                            continue;
-                        };
-                        if message["id"].as_u64() == Some(id) && message.get("method").is_none() {
+                    for data in events.push(&chunk?) {
+                        if let Some(message) = handle(data) {
                             return Ok(Some(message));
                         }
-                        if message["method"] == "notifications/tools/list_changed" {
-                            self.tools_changed.store(true, Ordering::SeqCst);
-                        }
                     }
+                }
+                // An event the server ended the stream with, without a blank line.
+                if let Some(message) = events.finish().and_then(&mut handle) {
+                    return Ok(Some(message));
                 }
                 bail!("the server closed the stream without answering")
             }
@@ -496,5 +544,51 @@ impl Client {
 impl Drop for Client {
     fn drop(&mut self) {
         self.shutdown();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SseEvents;
+
+    fn split(chunks: &[&[u8]]) -> (Vec<String>, Option<String>) {
+        let mut events = SseEvents::default();
+        let data = chunks.iter().flat_map(|chunk| events.push(chunk)).collect();
+        (data, events.finish())
+    }
+
+    #[test]
+    fn events_end_with_lf_or_crlf_blank_lines() {
+        let lf: &[u8] = b"event: message\ndata: {\"id\":1}\n\n";
+        let crlf: &[u8] = b"event: message\r\ndata: {\"id\":1}\r\n\r\n";
+        for body in [lf, crlf] {
+            assert_eq!(split(&[body]), (vec![r#"{"id":1}"#.to_owned()], None));
+        }
+        // A blank line split across chunks, and multi-line data.
+        assert_eq!(
+            split(&[b"data: a\r\ndata: b\r", b"\n\r\n: comment\r\n\r\n"]).0,
+            ["a\nb"]
+        );
+    }
+
+    #[test]
+    fn characters_split_across_chunks_stay_whole() {
+        let body = "data: {\"text\":\"\u{4e2d}\u{6587}\"}\n\n".as_bytes();
+        // Split inside the three-byte encoding of the first character.
+        let at = body.iter().position(|&b| b >= 0x80).unwrap() + 1;
+        let (data, _) = split(&[&body[..at], &body[at..]]);
+        assert_eq!(data, ["{\"text\":\"\u{4e2d}\u{6587}\"}"]);
+    }
+
+    #[test]
+    fn a_last_event_without_a_blank_line_is_kept() {
+        assert_eq!(
+            split(&[b"data: {\"id\":1}\n\ndata: {\"id\":2}"]),
+            (
+                vec![r#"{"id":1}"#.to_owned()],
+                Some(r#"{"id":2}"#.to_owned())
+            )
+        );
+        assert_eq!(split(&[b"event: ping\n\n"]), (Vec::new(), None));
     }
 }

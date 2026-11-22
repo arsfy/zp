@@ -190,14 +190,20 @@ async fn http_server(
             } else {
                 let (kind, payload) = responses.next().unwrap();
                 let payload = payload.replace("$ID", &request["id"].to_string());
-                let body = if kind == "sse" {
-                    format!(
+                let body = if kind.starts_with("sse") {
+                    let events = format!(
                         "event: message\ndata: {{\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\",\"params\":{{}}}}\n\nevent: message\ndata: {payload}\n\n"
-                    )
+                    );
+                    // Python servers (sse-starlette) end lines with CRLF.
+                    if kind == "sse-crlf" {
+                        events.replace('\n', "\r\n")
+                    } else {
+                        events
+                    }
                 } else {
                     payload
                 };
-                let content_type = if kind == "sse" {
+                let content_type = if kind.starts_with("sse") {
                     "text/event-stream"
                 } else {
                     "application/json"
@@ -218,7 +224,7 @@ async fn http_server_tools() {
     let (url, mut requests) = http_server(vec![
         ("json", r#"{"jsonrpc":"2.0","id":$ID,"result":{"protocolVersion":"2025-06-18","capabilities":{}}}"#.into()),
         ("sse", r#"{"jsonrpc":"2.0","id":$ID,"result":{"tools":[{"name":"search","description":"Search docs","inputSchema":{"type":"object","properties":{"q":{"type":"string"}}}}]}}"#.into()),
-        ("json", r#"{"jsonrpc":"2.0","id":$ID,"result":{"content":[{"type":"text","text":"3 results"}]}}"#.into()),
+        ("sse-crlf", r#"{"jsonrpc":"2.0","id":$ID,"result":{"content":[{"type":"text","text":"3 results 中文"}]}}"#.into()),
     ])
     .await;
     let hub = McpHub::new(
@@ -237,7 +243,7 @@ async fn http_server_tools() {
     let tools = hub.tools();
     assert_eq!(tools[0].name(), "mcp__docs__search");
     let result = tools[0].execute(json!({"q": "mcp"}), ctx()).await.unwrap();
-    assert_eq!(result.content[0].as_text(), Some("3 results"));
+    assert_eq!(result.content[0].as_text(), Some("3 results 中文"));
 
     let mut methods = Vec::new();
     while let Ok((request, session)) = requests.try_recv() {
