@@ -234,7 +234,7 @@ impl ConversationView {
                 .h(px(self.composer_height.get() + COMPOSER_FADE))
                 .into_any_element();
         }
-        let row = self.transcript.rows().get(ix).cloned();
+        let row = self.transcript.rows().get(ix);
         let content = match &row {
             Some(Row::User { .. }) if self.editing().is_some_and(|edit| edit.row == ix) => {
                 self.render_user_editor(cx)
@@ -253,7 +253,7 @@ impl ConversationView {
                 let openness = self.disclosures.openness(key.clone(), expanded, cx);
                 let toggle_key = key.clone();
                 let summary = collapsible(&openness, || {
-                    let blocks = self.parsed_markdown(text);
+                    let blocks = self.parsed_markdown(text, false);
                     let mut ids = IdGen::new(
                         format!("compaction-md-{ix}"),
                         (ix, 0),
@@ -341,7 +341,7 @@ impl ConversationView {
             }
             None => div().into_any_element(),
         };
-        let footer = row.and_then(|row| self.render_row_footer(ix, &row, cx));
+        let footer = row.and_then(|row| self.render_row_footer(ix, row, cx));
         let row = centered(
             div()
                 .py_1()
@@ -810,18 +810,20 @@ impl ConversationView {
     }
 
     fn render_assistant(&self, row: usize, cx: &mut Context<Self>) -> AnyElement {
-        let Some(message) = self.transcript.assistant(row).cloned() else {
+        let Some(message) = self.transcript.assistant(row) else {
             return div().into_any_element();
         };
         let streaming = self.transcript.is_streaming(row);
         let colors = cx.theme().colors.clone();
         let style = MarkdownStyle::from_theme(cx);
         let mut column = div().flex().flex_col().gap_2();
+        // Only the last block of a streaming message still changes.
+        let growing = |block: usize| streaming && block + 1 == message.content.len();
         for (block, content) in message.content.iter().enumerate() {
             column = match content {
                 AssistantContent::Text(text) if text.text.trim().is_empty() => column,
                 AssistantContent::Text(text) => {
-                    let blocks = self.parsed_markdown(&text.text);
+                    let blocks = self.parsed_markdown(&text.text, growing(block));
                     let mut ids = IdGen::new(
                         format!("md-{row}-{block}"),
                         (row, block),
@@ -1426,7 +1428,7 @@ impl ConversationView {
                 )
             })
             .unwrap_or_default();
-        let blocks = self.parsed_markdown(&shown);
+        let blocks = self.parsed_markdown(&shown, false);
         let mut ids = IdGen::new(
             format!("subagent-md-{}", call.id),
             (row, block),

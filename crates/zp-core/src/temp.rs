@@ -110,7 +110,7 @@ impl Snapshot {
         for root in &self.roots {
             for alias in &root.aliases {
                 let prefix = format!("{alias}/");
-                let mut rest = expanded.as_str();
+                let mut rest: &str = &expanded;
                 while let Some(at) = rest.find(&prefix) {
                     // A path starts the text or follows a separator or quote, not another path.
                     let starts_path = at == 0
@@ -177,14 +177,20 @@ impl Snapshot {
 }
 
 /// `$TMPDIR`, `${TMPDIR}` and `%TEMP%` written out, so paths built from them are found.
-fn expand_temp_variables(text: &str) -> String {
+fn expand_temp_variables(text: &str) -> std::borrow::Cow<'_, str> {
+    // Most text (file contents, output) names no variable: no copies then.
+    if !text.contains(['$', '%']) {
+        return std::borrow::Cow::Borrowed(text);
+    }
     let temp = std::env::temp_dir();
     let temp = temp.to_string_lossy();
     let temp = temp.trim_end_matches(['/', '\\']);
-    text.replace("${TMPDIR}", temp)
-        .replace("$TMPDIR", temp)
-        .replace("%TEMP%", temp)
-        .replace("%TMP%", temp)
+    std::borrow::Cow::Owned(
+        text.replace("${TMPDIR}", temp)
+            .replace("$TMPDIR", temp)
+            .replace("%TEMP%", temp)
+            .replace("%TMP%", temp),
+    )
 }
 
 /// Bytes `path` takes: a file's size, or a directory's files (symlinks not followed).
@@ -238,6 +244,24 @@ mod tests {
             aliases: vec![path.to_string_lossy().into_owned(), alias.to_owned()],
             path,
         }
+    }
+
+    #[test]
+    fn paths_built_from_temp_variables_are_found() {
+        let temp = std::env::temp_dir();
+        let alias = temp
+            .to_string_lossy()
+            .trim_end_matches(['/', '\\'])
+            .to_owned();
+        let snapshot = Snapshot::take(vec![root(&temp, &alias)]);
+        let canonical = temp.canonicalize().unwrap();
+        assert_eq!(
+            snapshot.mentioned("cat $TMPDIR/zp-a/x \"${TMPDIR}/zp-b\"; ls %TEMP%/zp-c"),
+            ["zp-a", "zp-b", "zp-c"]
+                .map(|name| canonical.join(name))
+                .into()
+        );
+        assert!(snapshot.mentioned("costs 5% of $5").is_empty());
     }
 
     #[test]

@@ -45,9 +45,10 @@ enum Cleanup {
 }
 
 /// Every string in `value` (the arguments of a call), so paths in any field are found.
-fn strings(value: &Value, out: &mut Vec<String>) {
+/// Borrowed: a write's arguments hold the whole file.
+fn strings<'a>(value: &'a Value, out: &mut Vec<&'a str>) {
     match value {
-        Value::String(text) => out.push(text.clone()),
+        Value::String(text) => out.push(text),
         Value::Array(items) => items.iter().for_each(|item| strings(item, out)),
         Value::Object(fields) => fields.values().for_each(|field| strings(field, out)),
         _ => {}
@@ -76,13 +77,12 @@ impl ConversationView {
                 result
                     .content
                     .iter()
-                    .filter_map(zp_ai::UserContent::as_text)
-                    .map(str::to_owned),
+                    .filter_map(zp_ai::UserContent::as_text),
             ),
             _ => return,
         }
         for text in texts {
-            let found = run.snapshot.mentioned(&text);
+            let found = run.snapshot.mentioned(text);
             run.mentioned.extend(found);
         }
     }

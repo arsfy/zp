@@ -1466,7 +1466,13 @@ impl ConversationView {
             .collect()
     }
 
-    fn parsed_markdown(&self, text: &str) -> Rc<Vec<Block>> {
+    /// Parsed `text`, cached by its content. Text that is still streaming (`growing`) is
+    /// parsed without caching: each frame's text is new, and caching it would only fill
+    /// the cache until it is cleared, taking every other row's parse with it.
+    fn parsed_markdown(&self, text: &str, growing: bool) -> Rc<Vec<Block>> {
+        if growing {
+            return Rc::new(parse(text));
+        }
         use std::hash::{Hash, Hasher};
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         text.hash(&mut hasher);
