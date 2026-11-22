@@ -504,6 +504,29 @@ fn notifications_for_background_tabs(cx: &mut TestAppContext) {
     background.update(cx, |v, cx| v.abort(cx));
 }
 
+#[gpui::test]
+fn closing_a_window_forgets_its_notifications(cx: &mut TestAppContext) {
+    let _data = setup_models(cx, &[&FauxProvider::default()], false);
+    let (_first_dir, first_project) = project_dir();
+    let (_second_dir, second_project) = project_dir();
+    let first = open(cx, &first_project);
+    let second = open(cx, &second_project);
+    for window in [first, second] {
+        let conversation = active(window, cx).entity_id();
+        window
+            .update(cx, |_, window, cx| {
+                crate::notifications::notify(window, conversation, "t".into(), "b".into(), cx)
+            })
+            .unwrap();
+    }
+    assert_eq!(cx.update(|cx| crate::notifications::target_count(cx)), 2);
+    first
+        .update(cx, |_, window, _| window.remove_window())
+        .unwrap();
+    cx.run_until_parked();
+    assert_eq!(cx.update(|cx| crate::notifications::target_count(cx)), 1);
+}
+
 #[cfg(unix)]
 #[gpui::test]
 fn mcp_tools_reach_the_agent(cx: &mut TestAppContext) {

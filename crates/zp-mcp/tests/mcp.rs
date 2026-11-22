@@ -144,8 +144,9 @@ async fn stdio_server_tools() {
     assert!(error.to_string().contains("disconnected"), "{error}");
 }
 
-/// Serves `responses` (one per request, in order) as an MCP HTTP endpoint; returns the
-/// URL and the received request bodies.
+/// Serves `responses` (one per request, in order; kind `hang` never answers) as an MCP
+/// HTTP endpoint; returns the URL and the received request bodies (`{"method": "DELETE"}`
+/// for a `DELETE`).
 async fn http_server(
     responses: Vec<(&'static str, String)>,
 ) -> (
@@ -183,12 +184,26 @@ async fn http_server(
                 .lines()
                 .find_map(|l| l.strip_prefix("mcp-session-id:"))
                 .map(|v| v.trim().to_owned());
+            if head.starts_with("delete ") {
+                let _ = sender.send((json!({"method": "DELETE"}), session));
+                let _ = socket
+                    .write_all(b"HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-length: 0\r\n\r\n")
+                    .await;
+                continue;
+            }
             let request: Value = serde_json::from_str(&body).unwrap();
             let _ = sender.send((request.clone(), session));
             let reply = if request.get("id").is_none() {
                 "HTTP/1.1 202 Accepted\r\nconnection: close\r\ncontent-length: 0\r\n\r\n".to_owned()
             } else {
                 let (kind, payload) = responses.next().unwrap();
+                if kind == "hang" {
+                    tokio::spawn(async move {
+                        let _socket = socket;
+                        tokio::time::sleep(Duration::from_secs(60)).await;
+                    });
+                    continue;
+                }
                 let payload = payload.replace("$ID", &request["id"].to_string());
                 let body = if kind.starts_with("sse") {
                     let events = format!(
@@ -258,4 +273,122 @@ async fn http_server_tools() {
             ("tools/call".into(), Some("s-42".into())),
         ]
     );
+
+    // Shutting down ends the session.
+    hub.shutdown();
+    let (request, session) = tokio::time::timeout(Duration::from_secs(5), requests.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(request["method"], "DELETE");
+    assert_eq!(session.as_deref(), Some("s-42"));
+}
+
+/// A stdio server that appends every line it receives to `$LOG` and answers only
+/// `initialize` and `tools/list`: its tool `slow` never answers.
+#[cfg(unix)]
+const LOGGING_SCRIPT: &str = r#"
+while IFS= read -r line; do
+  printf '%s\n' "$line" >> "$LOG"
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2025-06-18","capabilities":{}}}\n' "$id" ;;
+    *'"method":"tools/list"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":[{"name":"slow","inputSchema":{"type":"object"}}]}}\n' "$id" ;;
+  esac
+done
+"#;
+
+#[cfg(unix)]
+#[tokio::test]
+async fn timed_out_requests_are_cancelled() {
+    let dir = tempfile::tempdir().unwrap();
+    let log = dir.path().join("log");
+    let mut slow = server(
+        "slow",
+        Transport::Stdio {
+            command: "sh".into(),
+            args: vec!["-c".into(), LOGGING_SCRIPT.into()],
+            env: BTreeMap::from([("LOG".to_owned(), log.display().to_string())]),
+            cwd: None,
+        },
+    );
+    slow.timeout_secs = 1;
+    let hub = McpHub::new(vec![slow], Vec::new());
+    hub.start();
+    wait_connected(&hub).await;
+
+    let tools = hub.tools();
+    let error = tools[0].execute(json!({}), ctx()).await.unwrap_err();
+    assert!(
+        format!("{error:#}").contains("no answer within 1 s"),
+        "{error:#}"
+    );
+    let read = || std::fs::read_to_string(&log).unwrap_or_default();
+    for _ in 0..50 {
+        if read().contains("notifications/cancelled") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let cancelled = read()
+        .lines()
+        .find(|line| line.contains("notifications/cancelled"))
+        .map(|line| serde_json::from_str::<Value>(line).unwrap());
+    let call_id = read()
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .find(|message| message["method"] == "tools/call")
+        .unwrap()["id"]
+        .clone();
+    assert_eq!(
+        cancelled.map(|message| message["params"]["requestId"].clone()),
+        Some(call_id)
+    );
+}
+
+#[tokio::test]
+async fn a_timed_out_initialize_is_not_cancelled() {
+    let (url, mut requests) = http_server(vec![("hang", String::new())]).await;
+    let mut silent = server(
+        "silent",
+        Transport::Http {
+            url,
+            headers: Default::default(),
+        },
+    );
+    silent.timeout_secs = 1;
+    let hub = McpHub::new(vec![silent], Vec::new());
+    hub.start();
+    wait_connected(&hub).await;
+    let ServerState::Failed(error) = &hub.statuses()[0].state else {
+        panic!("{:?}", hub.statuses())
+    };
+    assert!(error.contains("no answer within 1 s"), "{error}");
+    // A cancellation would have been sent before the connection failed.
+    let mut methods = Vec::new();
+    while let Ok((request, _)) = requests.try_recv() {
+        methods.push(request["method"].as_str().unwrap().to_owned());
+    }
+    assert_eq!(methods, ["initialize"]);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_server_connected_after_shutdown_is_not_kept() {
+    // Answers 0.3 s late, so the hub shuts down while it connects.
+    let slow = Transport::Stdio {
+        command: "sh".into(),
+        args: vec!["-c".into(), format!("sleep 0.3\n{SCRIPT}")],
+        env: BTreeMap::new(),
+        cwd: None,
+    };
+    let hub = McpHub::new(vec![server("late", slow)], Vec::new());
+    tokio::join!(hub.connect("late"), async {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        hub.shutdown();
+    });
+    assert!(hub.tools().is_empty());
+    assert_ne!(hub.statuses()[0].state, ServerState::Connected);
 }

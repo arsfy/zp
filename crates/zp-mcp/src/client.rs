@@ -24,6 +24,9 @@ const STDERR_LINES: usize = 20;
 /// How long a failed handshake waits for an exiting server's stderr to be read (a process
 /// it started may keep the pipe open).
 const STDERR_DRAIN: Duration = Duration::from_secs(1);
+/// How long a best-effort message (a cancellation, ending an HTTP session) may take, so a
+/// stalled server cannot hold up the caller.
+const NOTICE_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// A tool offered by a server.
 #[derive(Clone, Debug, PartialEq, Deserialize)]
@@ -55,6 +58,9 @@ enum Connection {
         url: String,
         headers: Vec<(String, String)>,
         session: Mutex<Option<String>>,
+        /// The runtime the client was connected on: [`Client::shutdown`] may run without
+        /// one and ends the session from here.
+        runtime: tokio::runtime::Handle,
     },
 }
 
@@ -252,6 +258,7 @@ impl Client {
                     .map(|(k, v)| (k.clone(), v.clone()))
                     .collect(),
                 session: Mutex::new(None),
+                runtime: tokio::runtime::Handle::current(),
             },
         };
         let mut client = Self {
@@ -343,6 +350,7 @@ impl Client {
                 url,
                 headers,
                 session,
+                ..
             } => {
                 let mut request = http
                     .post(url)
@@ -463,13 +471,18 @@ impl Client {
         let never = CancellationToken::new();
         let cancel = cancel.unwrap_or(&never);
         let outcome = tokio::select! {
-            result = tokio::time::timeout(self.timeout, exchange) => {
-                result.unwrap_or_else(|_| Err(anyhow!("no answer within {} s", self.timeout.as_secs())))
-            }
+            result = tokio::time::timeout(self.timeout, exchange) => match result {
+                Ok(result) => result,
+                Err(_) => {
+                    // `initialize` must not be cancelled (the spec forbids it).
+                    if method != "initialize" {
+                        self.notify_cancelled(id, "timed out").await;
+                    }
+                    Err(anyhow!("no answer within {} s", self.timeout.as_secs()))
+                }
+            },
             () = cancel.cancelled() => {
-                let _ = self
-                    .notify("notifications/cancelled", json!({"requestId": id, "reason": "cancelled by the user"}))
-                    .await;
+                self.notify_cancelled(id, "cancelled by the user").await;
                 Err(anyhow!("cancelled"))
             }
         };
@@ -478,6 +491,19 @@ impl Client {
             .unwrap_or_else(PoisonError::into_inner)
             .remove(&id);
         outcome.with_context(|| format!("`{method}` failed"))
+    }
+
+    /// Tells the server request `id` is abandoned (best effort, bounded by
+    /// [`NOTICE_TIMEOUT`] so a full stdio pipe cannot block).
+    async fn notify_cancelled(&self, id: u64, reason: &str) {
+        let _ = tokio::time::timeout(
+            NOTICE_TIMEOUT,
+            self.notify(
+                "notifications/cancelled",
+                json!({"requestId": id, "reason": reason}),
+            ),
+        )
+        .await;
     }
 
     pub async fn notify(&self, method: &str, params: Value) -> anyhow::Result<()> {
@@ -526,18 +552,53 @@ impl Client {
         .await
     }
 
-    /// Stops a stdio server (its whole process group).
+    /// Stops a stdio server (its whole process tree) or ends an HTTP session.
     pub fn shutdown(&self) {
-        if let Connection::Stdio { child, .. } = &self.connection
-            && let Some(mut child) = child.lock().unwrap_or_else(PoisonError::into_inner).take()
-        {
-            #[cfg(unix)]
-            if let Some(pid) = child.id() {
-                zp_tools::kill_tree(pid);
+        match &self.connection {
+            Connection::Stdio { child, .. } => {
+                if let Some(mut child) = child.lock().unwrap_or_else(PoisonError::into_inner).take()
+                {
+                    // The tree first: once the child is killed its id may be reused.
+                    if let Some(pid) = child.id() {
+                        zp_tools::kill_tree(pid);
+                    }
+                    let _ = child.start_kill();
+                }
             }
-            let _ = child.start_kill();
+            Connection::Http { .. } => self.end_session(),
         }
         self.closed.store(true, Ordering::SeqCst);
+    }
+
+    /// Sends a best-effort `DELETE` ending the HTTP session, if one was established.
+    fn end_session(&self) {
+        let Connection::Http {
+            http,
+            url,
+            headers,
+            session,
+            runtime,
+        } = &self.connection
+        else {
+            return;
+        };
+        let Some(id) = session
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
+        else {
+            return;
+        };
+        let mut request = http
+            .delete(url)
+            .header("mcp-protocol-version", PROTOCOL_VERSION)
+            .header("mcp-session-id", id);
+        for (name, value) in headers {
+            request = request.header(name, value);
+        }
+        runtime.spawn(async move {
+            let _ = tokio::time::timeout(NOTICE_TIMEOUT, request.send()).await;
+        });
     }
 }
 

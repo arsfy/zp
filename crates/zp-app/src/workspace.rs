@@ -82,10 +82,13 @@ impl Workspaces {
     /// Called when a project window's view is released.
     pub(crate) fn project_closed(path: &Path, cx: &mut App) {
         let this = cx.global_mut::<Self>();
-        this.projects.remove(path);
+        let closed = this.projects.remove(path);
         let keep_for_restore = this.quitting || this.window_count() == 0;
         if !keep_for_restore {
             AppStore::update(cx, |state| state.mark_closed(path));
+        }
+        if let Some(window) = closed {
+            crate::notifications::forget_window(window.into(), cx);
         }
     }
 

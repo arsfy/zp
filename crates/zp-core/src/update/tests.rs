@@ -208,6 +208,89 @@ async fn discovery_paginates_sorts_and_never_downloads_packages() {
 }
 
 #[tokio::test]
+async fn releases_without_a_manifest_are_skipped_but_bad_manifests_fail() {
+    let (url, routes, _, task) = server().await;
+    // Serves a signed manifest for `version` under `/<version>/` (with `signature`, or a
+    // valid one), and returns the release's assets: the `names` among the manifest, its
+    // signature and the package.
+    let publish = |version: &str, signature: Option<Vec<u8>>, names: &[&str]| {
+        let package = Asset {
+            name: "ZP.zip".into(),
+            kind: PackageKind::MacApp,
+            url: format!("{url}/{version}/ZP.zip"),
+            size: 3,
+            sha256: sha256_hex(b"new"),
+        };
+        let mut feed: serde_json::Value = serde_json::from_slice(&manifest(version)).unwrap();
+        feed["platforms"] = json!({"darwin-aarch64": [package]});
+        let bytes = serde_json::to_vec(&feed).unwrap();
+        let signature = signature.unwrap_or_else(|| key().sign(&bytes).as_ref().to_vec());
+        let mut routes = routes.lock().unwrap();
+        routes.insert(format!("/{version}/release.json"), bytes.clone());
+        routes.insert(format!("/{version}/release.json.sig"), signature);
+        let assets: Vec<_> = [
+            ("release.json", bytes.len()),
+            ("release.json.sig", 64),
+            ("ZP.zip", 3),
+        ]
+        .into_iter()
+        .filter(|(name, _)| names.contains(name))
+        .map(|(name, size)| {
+            json!({"name": name, "browser_download_url": format!("{url}/{version}/{name}"), "size": size})
+        })
+        .collect();
+        json!({"tag_name": format!("v{version}"), "draft": false, "prerelease": true, "assets": assets})
+    };
+    let all = ["release.json", "release.json.sig", "ZP.zip"];
+    let releases = |list: Vec<serde_json::Value>| {
+        routes.lock().unwrap().insert(
+            "/releases?per_page=100&page=1".into(),
+            serde_json::to_vec(&list).unwrap(),
+        );
+    };
+    let check_preview = || {
+        let url = format!("{url}/releases");
+        async move {
+            check(
+                &url,
+                UpdateChannel::Preview,
+                "0.1.0",
+                "darwin-aarch64",
+                PackageKind::MacApp,
+                &public_key(),
+            )
+            .await
+        }
+    };
+
+    // The newest release lacks its signature, the next its manifest: the one after is used.
+    let unsigned = publish("0.3.0-rc.10", None, &["release.json", "ZP.zip"]);
+    let unlisted = publish("0.3.0-rc.9", None, &["release.json.sig", "ZP.zip"]);
+    let complete = publish("0.3.0-rc.8", None, &all);
+    releases(vec![unsigned.clone(), unlisted.clone(), complete.clone()]);
+    assert!(matches!(check_preview().await.unwrap(),
+        CheckResult::Available(update) if update.version == "0.3.0-rc.8"));
+
+    // A manifest that is there but fails verification is not skipped.
+    let forged = publish("0.3.0-rc.11", Some(vec![0; 64]), &all);
+    releases(vec![forged, complete.clone()]);
+    let error = check_preview().await.unwrap_err();
+    assert!(
+        format!("{error:#}").contains("signature is invalid"),
+        "{error:#}"
+    );
+
+    // Without any manifest, the newest release's problem is reported.
+    releases(vec![unsigned, unlisted]);
+    let error = check_preview().await.unwrap_err();
+    assert!(
+        format!("{error:#}").contains("missing its signature"),
+        "{error:#}"
+    );
+    task.abort();
+}
+
+#[tokio::test]
 async fn downloads_verify_and_remove_incomplete_files() {
     let (url, routes, _, task) = server().await;
     routes

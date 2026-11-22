@@ -21,8 +21,6 @@ tokio-util.workspace = true
 tracing.workspace = true
 zp-agent.workspace = true
 zp-ai.workspace = true
-
-[target.'cfg(unix)'.dependencies]
 zp-tools.workspace = true
 
 [dev-dependencies]

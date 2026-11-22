@@ -459,28 +459,29 @@ fn apply(update: Update, path: PathBuf, cx: &mut App) {
         update.asset.kind,
         PackageKind::Deb | PackageKind::WindowsInstaller
     ) {
-        if let Err(error) = zp_core::update::verify_download(&path, &update.asset) {
-            fail("Could not install the update", error, cx);
-            return;
-        }
-        if let Err(error) = crate::workspace::save_for_update(cx) {
-            fail("Could not save your workspace", error, cx);
-            return;
-        }
-        cx.open_with_system(&path);
-        let deb = update.asset.kind == PackageKind::Deb;
-        set_state(UpdateState::Ready(update, path), cx);
-        prompt(
-            PromptLevel::Info,
-            if deb {
-                "Install with your package manager"
-            } else {
-                "Install the update"
-            },
-            "Finish installing the downloaded package, then restart ZP.",
-            &["OK"],
-            cx,
-        );
+        // Hashing the package takes a while: off the UI thread, and the Update button
+        // shows Installing meanwhile so it cannot start another verification.
+        set_state(UpdateState::Installing, cx);
+        let task = gpui_tokio::Tokio::spawn(cx, {
+            let (path, asset) = (path.clone(), update.asset.clone());
+            async move {
+                tokio::task::spawn_blocking(move || zp_core::update::verify_download(&path, &asset))
+                    .await?
+            }
+        });
+        cx.spawn(async move |cx| {
+            let result = task.await;
+            cx.update(|cx| match result {
+                Ok(Ok(())) => open_package(update, path, cx),
+                Ok(Err(error)) => fail("Could not install the update", error, cx),
+                Err(error) => fail(
+                    "Could not install the update",
+                    anyhow::anyhow!(error.to_string()),
+                    cx,
+                ),
+            });
+        })
+        .detach();
         return;
     }
     let bundle = (update.asset.kind == PackageKind::MacApp)
@@ -507,6 +508,29 @@ fn apply(update: Update, path: PathBuf, cx: &mut App) {
         });
     })
     .detach();
+}
+
+/// Hands a verified package the user installs themselves (a `.deb` or Windows installer)
+/// to the system, after saving the workspace for the restart.
+fn open_package(update: Update, path: PathBuf, cx: &mut App) {
+    if let Err(error) = crate::workspace::save_for_update(cx) {
+        fail("Could not save your workspace", error, cx);
+        return;
+    }
+    cx.open_with_system(&path);
+    let deb = update.asset.kind == PackageKind::Deb;
+    set_state(UpdateState::Ready(update, path), cx);
+    prompt(
+        PromptLevel::Info,
+        if deb {
+            "Install with your package manager"
+        } else {
+            "Install the update"
+        },
+        "Finish installing the downloaded package, then restart ZP.",
+        &["OK"],
+        cx,
+    );
 }
 
 fn finish_install(prepared: install::Prepared, ready: (Update, PathBuf), cx: &mut App) {

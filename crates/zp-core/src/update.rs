@@ -266,19 +266,22 @@ pub async fn check(
             .unwrap()
             .cmp_precedence(&parse_version(&a.tag_name).unwrap())
     });
-    let Some(release) = releases.first() else {
+    let Some(newest) = releases.first() else {
         return Ok(CheckResult::UpToDate);
     };
-    let manifest = release
-        .assets
-        .iter()
-        .find(|a| a.name == "release.json")
-        .context("this release is missing release.json")?;
-    let signature = release
-        .assets
-        .iter()
-        .find(|a| a.name == "release.json.sig")
-        .context("this release is missing its signature")?;
+    // A release published without its manifest is skipped; anything wrong with a manifest
+    // that is there still fails the check.
+    let Some((release, manifest, signature)) = releases.iter().find_map(|release| {
+        match manifest_assets(release) {
+            Ok((manifest, signature)) => Some((release, manifest, signature)),
+            Err(error) => {
+                tracing::warn!(release = %release.tag_name, %error, "skipping an update release");
+                None
+            }
+        }
+    }) else {
+        return Err(manifest_assets(newest).expect_err("no release has a manifest"));
+    };
     let bytes = metadata(client.get(&manifest.browser_download_url).send().await?).await?;
     let signature = metadata(client.get(&signature.browser_download_url).send().await?).await?;
     let feed = verify_manifest(&bytes, &signature, public_key)?;
@@ -307,6 +310,21 @@ pub async fn check(
         notes: feed.notes,
         asset: asset.clone(),
     }))
+}
+
+/// The signed manifest of `release` and its signature.
+fn manifest_assets(release: &Release) -> anyhow::Result<(&ReleaseAsset, &ReleaseAsset)> {
+    let manifest = release
+        .assets
+        .iter()
+        .find(|a| a.name == "release.json")
+        .context("this release is missing release.json")?;
+    let signature = release
+        .assets
+        .iter()
+        .find(|a| a.name == "release.json.sig")
+        .context("this release is missing its signature")?;
+    Ok((manifest, signature))
 }
 
 fn validate_asset(asset: &Asset) -> anyhow::Result<()> {

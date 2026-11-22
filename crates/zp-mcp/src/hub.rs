@@ -1,6 +1,7 @@
 //! The MCP servers of a project: connecting them in the background and exposing their
 //! tools to the agent as `mcp__<server>__<tool>`.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, Weak};
 
 use futures::future::BoxFuture;
@@ -14,6 +15,10 @@ use crate::config::Server;
 
 /// Longest tool name most providers accept.
 const MAX_TOOL_NAME: usize = 64;
+/// Largest image (decoded) passed on to the model; providers reject bigger ones.
+const MAX_IMAGE_BYTES: usize = 5 * 1024 * 1024;
+/// Image types every provider accepts.
+const IMAGE_TYPES: [&str; 4] = ["image/png", "image/jpeg", "image/gif", "image/webp"];
 
 /// Connection state of a server.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -74,10 +79,10 @@ pub fn convert_result(result: &Value) -> AgentToolResult {
             Some("text") => content.push(UserContent::text(
                 block["text"].as_str().unwrap_or_default(),
             )),
-            Some("image") => content.push(UserContent::Image(ImageContent {
-                data: block["data"].as_str().unwrap_or_default().to_owned(),
-                mime_type: block["mimeType"].as_str().unwrap_or("image/png").to_owned(),
-            })),
+            Some("image") => content.push(convert_image(
+                block["data"].as_str().unwrap_or_default(),
+                block["mimeType"].as_str().unwrap_or("image/png"),
+            )),
             Some("resource") => {
                 let resource = &block["resource"];
                 let uri = resource["uri"].as_str().unwrap_or_default();
@@ -111,9 +116,36 @@ pub fn convert_result(result: &Value) -> AgentToolResult {
     }
 }
 
+/// An image block as an attachment, or a note in its place when providers would reject it
+/// (which, kept in the history, would fail every later turn): no data, an unsupported
+/// type, or more than [`MAX_IMAGE_BYTES`].
+fn convert_image(data: &str, mime_type: &str) -> UserContent {
+    if data.is_empty() {
+        return UserContent::text("[image omitted: no data]");
+    }
+    if !IMAGE_TYPES.contains(&mime_type) {
+        return UserContent::text(format!("[image omitted: unsupported type {mime_type}]"));
+    }
+    // Every 4 base64 characters encode 3 bytes; `=` pads the last group.
+    let size = data.trim_end_matches('=').len() * 3 / 4;
+    if size > MAX_IMAGE_BYTES {
+        return UserContent::text(format!(
+            "[image omitted: {}, limit {}]",
+            zp_tools::format_size(size),
+            zp_tools::format_size(MAX_IMAGE_BYTES)
+        ));
+    }
+    UserContent::Image(ImageContent {
+        data: data.to_owned(),
+        mime_type: mime_type.to_owned(),
+    })
+}
+
 /// The MCP servers of one project.
 pub struct McpHub {
     entries: Mutex<Vec<Entry>>,
+    /// Set by [`McpHub::shutdown`]: connections finishing later are closed, not kept.
+    closed: AtomicBool,
     /// Configuration problems.
     errors: Vec<String>,
     changed: watch::Sender<u64>,
@@ -136,6 +168,7 @@ impl McpHub {
             .collect();
         Arc::new(Self {
             entries: Mutex::new(entries),
+            closed: AtomicBool::new(false),
             errors,
             changed: watch::channel(0).0,
         })
@@ -172,10 +205,13 @@ impl McpHub {
         }
     }
 
-    /// (Re)connects server `name` and lists its tools.
+    /// (Re)connects server `name` and lists its tools (nothing once the hub is shut down).
     pub async fn connect(self: &Arc<Self>, name: &str) {
         let server = {
             let mut entries = self.entries();
+            if self.closed.load(Ordering::SeqCst) {
+                return;
+            }
             let Some(entry) = entries.iter_mut().find(|e| e.server.name == name) else {
                 return;
             };
@@ -194,6 +230,13 @@ impl McpHub {
         .await;
         {
             let mut entries = self.entries();
+            // Shut down while connecting: keeping the client would leave the server running.
+            if self.closed.load(Ordering::SeqCst) {
+                if let Ok((client, _)) = result {
+                    client.shutdown();
+                }
+                return;
+            }
             if let Some(entry) = entries.iter_mut().find(|e| e.server.name == name) {
                 match result {
                     Ok((client, tools)) => {
@@ -273,9 +316,11 @@ impl McpHub {
             .collect()
     }
 
-    /// Stops every server.
+    /// Stops every server, including ones still connecting.
     pub fn shutdown(&self) {
-        for entry in self.entries().iter_mut() {
+        let mut entries = self.entries();
+        self.closed.store(true, Ordering::SeqCst);
+        for entry in entries.iter_mut() {
             if let Some(client) = entry.client.take() {
                 client.shutdown();
             }
@@ -390,5 +435,34 @@ mod tests {
         assert!(matches!(&result.content[1], UserContent::Image(i) if i.mime_type == "image/jpeg"));
         let structured = convert_result(&json!({"content": [], "structuredContent": {"n": 1}}));
         assert_eq!(structured.content[0].as_text(), Some("{\"n\":1}"));
+    }
+
+    #[test]
+    fn images_providers_reject_become_notes() {
+        // 7.1 MB decoded.
+        let huge = "A".repeat((7.1 * 1024.0 * 1024.0) as usize / 3 * 4);
+        // Exactly the limit: a last group of 3 characters and `=` encodes 2 bytes.
+        assert_eq!(MAX_IMAGE_BYTES % 3, 2);
+        let limit = format!("{}=", "A".repeat(MAX_IMAGE_BYTES / 3 * 4 + 3));
+        let result = convert_result(&json!({
+            "content": [
+                {"type": "image", "data": huge, "mimeType": "image/png"},
+                {"type": "image", "data": "AAAA", "mimeType": "image/svg+xml"},
+                {"type": "image", "data": "", "mimeType": "image/png"},
+                {"type": "image", "mimeType": "image/png"},
+                {"type": "image", "data": limit, "mimeType": "image/webp"},
+            ]
+        }));
+        let notes: Vec<Option<&str>> = result.content.iter().map(UserContent::as_text).collect();
+        assert_eq!(
+            notes[..4],
+            [
+                Some("[image omitted: 7.1MB, limit 5.0MB]"),
+                Some("[image omitted: unsupported type image/svg+xml]"),
+                Some("[image omitted: no data]"),
+                Some("[image omitted: no data]"),
+            ]
+        );
+        assert!(matches!(&result.content[4], UserContent::Image(i) if i.mime_type == "image/webp"));
     }
 }

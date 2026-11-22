@@ -40,6 +40,22 @@ pub fn enabled(cx: &App) -> bool {
         .is_none_or(|_| AppSettings::get(cx).notifications.unwrap_or(true))
 }
 
+/// Forgets where the notifications of `window` led, once it closed.
+pub fn forget_window(window: AnyWindowHandle, cx: &mut App) {
+    if cx.has_global::<Targets>() {
+        cx.global_mut::<Targets>()
+            .0
+            .retain(|_, (target, _)| target.window_id() != window.window_id());
+    }
+}
+
+/// Number of notifications that can still be followed (tests).
+#[cfg(test)]
+pub fn target_count(cx: &App) -> usize {
+    cx.try_global::<Targets>()
+        .map_or(0, |targets| targets.0.len())
+}
+
 /// Shows a notification about `conversation` in `window`.
 pub fn notify(window: &Window, conversation: EntityId, title: String, body: String, cx: &mut App) {
     if !enabled(cx) {

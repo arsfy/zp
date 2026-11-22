@@ -329,6 +329,10 @@ pub(crate) async fn run(models: &Models, args: RunArgs) -> Result<()> {
                 .find_map(AgentMessage::as_assistant)
                 .is_some_and(|m| matches!(m.stop_reason, StopReason::Error | StopReason::Aborted));
             if failed {
+                // `exit` skips destructors: stop the MCP servers (their process trees) here.
+                if let Some(hub) = &mcp {
+                    hub.shutdown();
+                }
                 std::process::exit(1);
             }
             Ok(())

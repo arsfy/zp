@@ -224,6 +224,36 @@ fn confirmed_update_downloads_verifies_and_reaches_installation(cx: &mut TestApp
 }
 
 #[gpui::test]
+fn system_packages_are_verified_off_the_ui_thread(cx: &mut TestAppContext) {
+    let data = setup_models(cx, &[&FauxProvider::default()], false);
+    let (_directory, project) = crate::tests::project_dir();
+    let _window = open(cx, &project);
+    let mut update = available(cx);
+    update.asset.kind = PackageKind::Deb;
+    update.asset.name = "zp.deb".into();
+    let path = data.path().join("zp.deb");
+    std::fs::write(&path, b"zp!").unwrap();
+    cx.update(|cx| set_state(UpdateState::Ready(update.clone(), path.clone()), cx));
+    cx.update(activate);
+    // Verifying in the background; clicking again does nothing meanwhile.
+    assert_eq!(cx.update(|cx| state(cx)), UpdateState::Installing);
+    cx.update(activate);
+    assert_eq!(cx.update(|cx| state(cx)), UpdateState::Installing);
+    // The package does not match its checksum: it is not opened.
+    wait_until(cx, |cx| {
+        matches!(cx.update(|cx| state(cx)), UpdateState::Failed(_))
+    });
+    assert!(
+        matches!(cx.update(|cx| state(cx)), UpdateState::Failed(error) if error.contains("download it again")),
+        "{:?}",
+        cx.update(|cx| state(cx))
+    );
+    if cx.has_pending_prompt() {
+        cx.simulate_prompt_answer("OK");
+    }
+}
+
+#[gpui::test]
 fn update_dialog_answers_with_keys_and_buttons(cx: &mut TestAppContext) {
     let _data = setup_models(cx, &[&FauxProvider::default()], false);
     let (_directory, project) = crate::tests::project_dir();
