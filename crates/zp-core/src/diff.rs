@@ -8,7 +8,7 @@ use similar::{ChangeTag, TextDiff};
 pub const DEFAULT_CONTEXT: usize = 3;
 
 /// Inputs larger than this are not diffed line by line (summarized instead).
-const MAX_DIFF_BYTES: usize = 8 * 1024 * 1024;
+pub const MAX_DIFF_BYTES: usize = 8 * 1024 * 1024;
 
 /// Gives up on a minimal diff after this long (the result is still correct, just
 /// coarser).

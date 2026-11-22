@@ -592,6 +592,13 @@ fn inline_diffs_panel_and_reverts(cx: &mut TestAppContext) {
             ("b.txt".into(), FileKind::Modified, 1, 1),
         ]
     );
+    // The turns are only computed while shown.
+    assert_ne!(
+        panel.read_with(cx, |panel, _| panel.mode()),
+        ChangesMode::Turns
+    );
+    assert!(group_labels(&panel, cx).is_empty());
+    panel.update(cx, |panel, cx| panel.set_mode(ChangesMode::Turns, cx));
     assert_eq!(
         group_labels(&panel, cx),
         ["Turn 2: second", "Turn 1: first"]

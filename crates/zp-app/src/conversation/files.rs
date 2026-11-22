@@ -52,16 +52,18 @@ impl ConversationView {
         self.coding.as_ref().map(|coding| coding.blobs().clone())
     }
 
-    /// The file changes along the shown branch.
-    pub fn change_log(&self) -> ChangeLog {
+    /// The file changes along the shown branch (shared with the cache, so the cards that
+    /// ask on every frame do not copy it).
+    pub fn change_log(&self) -> Rc<ChangeLog> {
         if let Some(log) = self.change_log_cache.borrow().as_ref() {
             return log.clone();
         }
-        let log = self
-            .coding
-            .as_ref()
-            .map(|coding| coding.change_log())
-            .unwrap_or_default();
+        let log = Rc::new(
+            self.coding
+                .as_ref()
+                .map(|coding| coding.change_log())
+                .unwrap_or_default(),
+        );
         self.change_log_cache.borrow_mut().replace(log.clone());
         log
     }
@@ -186,6 +188,7 @@ impl ConversationView {
             caption: format!("Change by tool call {}", short_id(call_id)),
             before,
             after,
+            too_large: false,
             status: if reverted {
                 RevertStatus::Reverted
             } else {
@@ -278,6 +281,7 @@ impl ConversationView {
                     caption: caption.clone(),
                     before,
                     after,
+                    too_large: false,
                     status,
                     revert: (status != RevertStatus::Reverted).then(|| {
                         Rc::new(move |window: &mut Window, cx: &mut App| {

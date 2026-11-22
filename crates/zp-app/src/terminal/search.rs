@@ -1,5 +1,8 @@
 //! Literal, case-insensitive search over the terminal's screen and scrollback.
 
+use std::rc::Rc;
+use std::time::Duration;
+
 use alacritty_terminal::event::EventListener;
 use alacritty_terminal::grid::Dimensions as _;
 use alacritty_terminal::index::{Column, Direction, Line, Point};
@@ -13,9 +16,14 @@ use gpui_elements::editable_text::text_input;
 use super::TerminalView;
 use crate::theme::ActiveTheme;
 
+/// How long new output waits before it is searched: output arrives in many small batches,
+/// and each search scans the whole scrollback.
+pub(super) const OUTPUT_SEARCH_DELAY: Duration = Duration::from_millis(100);
+
 #[derive(Default)]
 pub(super) struct Search {
-    pub matches: Vec<Match>,
+    /// Shared with the frame being painted, which would otherwise copy it every frame.
+    pub matches: Rc<Vec<Match>>,
     pub current: usize,
     query: String,
     regex: Option<RegexSearch>,
@@ -46,6 +54,21 @@ impl TerminalView {
         }
     }
 
+    /// Searches again after new output, at most once per [`OUTPUT_SEARCH_DELAY`].
+    /// Typing in the search bar still searches right away.
+    pub(super) fn schedule_output_search(&mut self, cx: &mut Context<Self>) {
+        if self.search.is_none() || self.pending_output_search.is_some() {
+            return;
+        }
+        self.pending_output_search = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(OUTPUT_SEARCH_DELAY).await;
+            let _ = this.update(cx, |this, cx| {
+                this.pending_output_search = None;
+                this.refresh_search(false, cx);
+            });
+        }));
+    }
+
     pub(super) fn next_match(&mut self, backwards: bool, cx: &mut Context<Self>) {
         if let Some(search) = &mut self.search {
             search.advance(backwards);
@@ -58,6 +81,7 @@ impl TerminalView {
 
     pub(super) fn close_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.search = None;
+        self.pending_output_search = None;
         self.focus_handle.focus(window, cx);
         cx.notify();
     }
@@ -154,7 +178,7 @@ impl Search {
                 .map(|range| *range.start())
                 .unwrap_or_default()
         };
-        self.matches.clear();
+        let mut matches = Vec::new();
         if self.query != query {
             self.query = query.to_owned();
             self.regex = (!query.is_empty())
@@ -162,7 +186,7 @@ impl Search {
                 .flatten();
         }
         if let Some(regex) = self.regex.as_mut() {
-            self.matches = RegexIter::new(
+            matches = RegexIter::new(
                 Point::new(term.topmost_line(), Column(0)),
                 Point::new(term.bottommost_line(), term.last_column()),
                 Direction::Right,
@@ -172,6 +196,7 @@ impl Search {
             .take(10_000)
             .collect();
         }
+        self.matches = Rc::new(matches);
         self.current = self
             .matches
             .iter()

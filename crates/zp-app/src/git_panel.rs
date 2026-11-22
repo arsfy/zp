@@ -16,7 +16,9 @@ use gpui_elements::editable_text::{
     EditableTextState, StringStorage, TextChanged, text_area, text_input,
 };
 use zp_core::changes::RevertStatus;
-use zp_core::git::{Branch, Commit, CommitOptions, GitFile, GitFileStatus, GitStatus};
+use zp_core::git::{
+    Branch, Commit, CommitOptions, FileText, GitFile, GitFileStatus, GitStatus, file_in_worktree,
+};
 
 use crate::context_menu::ContextMenu;
 use crate::diff_view::DiffItem;
@@ -104,8 +106,27 @@ struct DiffData {
     path: PathBuf,
     display: String,
     caption: String,
-    before: Option<String>,
-    after: Option<String>,
+    before: FileText,
+    after: FileText,
+}
+
+impl DiffData {
+    /// The diff view's item; a version too large to compare shows the whole file as too
+    /// large (not as added or deleted).
+    fn into_item(self) -> DiffItem {
+        let too_large = self.before == FileText::TooLarge || self.after == FileText::TooLarge;
+        let text = |side: FileText| side.into_text().filter(|_| !too_large).map(Arc::from);
+        DiffItem {
+            path: self.path,
+            display: self.display,
+            caption: self.caption,
+            before: text(self.before),
+            after: text(self.after),
+            too_large,
+            status: RevertStatus::Active,
+            revert: None,
+        }
+    }
 }
 
 pub struct GitPanel {
@@ -756,15 +777,7 @@ impl GitPanel {
                 Ok(data) if !data.is_empty() => {
                     let items = data
                         .into_iter()
-                        .map(|data| DiffItem {
-                            path: data.path,
-                            display: data.display,
-                            caption: data.caption,
-                            before: data.before.map(Arc::from),
-                            after: data.after.map(Arc::from),
-                            status: RevertStatus::Active,
-                            revert: None,
-                        })
+                        .map(DiffData::into_item)
                         .collect::<Vec<_>>();
                     let index = index.min(items.len() - 1);
                     cx.emit(GitPanelEvent::OpenDiff { items, index });
@@ -814,11 +827,11 @@ impl GitPanel {
                             Side::Unstaged => (
                                 "Unstaged (working tree vs index)",
                                 if file.is_untracked() {
-                                    None
+                                    FileText::Missing
                                 } else {
                                     zp_core::git::file_at(&root, "", &file.repo_path)?
                                 },
-                                std::fs::read_to_string(&file.path).ok(),
+                                file_in_worktree(&file.path),
                             ),
                         };
                         Ok(DiffData {
@@ -856,7 +869,7 @@ impl GitPanel {
                                 "HEAD",
                                 file.renamed_from.as_deref().unwrap_or(&file.repo_path),
                             )?,
-                            after: std::fs::read_to_string(&file.path).ok(),
+                            after: file_in_worktree(&file.path),
                             path: file.path,
                             display,
                             caption: "Working tree vs HEAD".to_owned(),

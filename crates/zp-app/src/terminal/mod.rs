@@ -128,6 +128,8 @@ pub struct TerminalView {
     reported_focus: bool,
     search_input: Entity<EditableTextState>,
     search: Option<search::Search>,
+    /// A search of new output waiting for its delay (see `schedule_output_search`).
+    pending_output_search: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
     /// Finds the program in the foreground.
     process: process::Watch,
@@ -219,7 +221,7 @@ impl TerminalView {
                         this.handle_event(event, cx);
                     }
                     if changed {
-                        this.refresh_search(false, cx);
+                        this.schedule_output_search(cx);
                     }
                 });
                 if updated.is_err() {
@@ -260,6 +262,7 @@ impl TerminalView {
             reported_focus: false,
             search_input,
             search: None,
+            pending_output_search: None,
             _subscriptions: subscriptions,
             process,
             process_name: None,
@@ -903,7 +906,7 @@ impl TerminalView {
         let matches = self
             .search
             .as_ref()
-            .map(|search| search.matches.clone())
+            .map(|search| Rc::clone(&search.matches))
             .unwrap_or_default();
         let active_match = self
             .search
@@ -947,6 +950,8 @@ impl TerminalView {
                 let content = term.renderable_content();
                 let palette = Palette::new(&theme, content.colors);
                 let default_background = palette.background();
+                let cursor_color = to_hsla(palette.named(NamedColor::Cursor));
+                let foreground = to_hsla(palette.named(NamedColor::Foreground));
                 let selection_background = to_hsla(Rgb {
                     r: 0x26,
                     g: 0x4f,
@@ -1069,6 +1074,25 @@ impl TerminalView {
                     }
                 }
 
+                // The cursor (only at the bottom of the scrollback), with the cell it covers.
+                let cursor = content.cursor;
+                let line = cursor.point.line.0 + display_offset;
+                let cursor = (cursor.shape != CursorShape::Hidden
+                    && line >= 0
+                    && (line as usize) < term.screen_lines())
+                .then(|| {
+                    let under = &term.grid()[cursor.point];
+                    CursorCell {
+                        line: line as usize,
+                        column: cursor.point.column.0,
+                        shape: cursor.shape,
+                        wide: under.flags.contains(Flags::WIDE_CHAR),
+                        c: under.c,
+                    }
+                });
+                // Shaping text is slow: let the PTY thread update the terminal meanwhile.
+                drop(term);
+
                 for (line, column, len, color) in backgrounds {
                     window.paint_quad(quad_fill(
                         Bounds::new(at(line, column), size(cell.width * len as f32, cell.height)),
@@ -1089,23 +1113,15 @@ impl TerminalView {
                     );
                 }
 
-                // The cursor (only at the bottom of the scrollback).
-                let cursor = content.cursor;
-                let line = cursor.point.line.0 + display_offset;
-                let visible = cursor.shape != CursorShape::Hidden
-                    && line >= 0
-                    && (line as usize) < term.screen_lines();
-                if visible {
-                    let line = line as usize;
-                    let column = cursor.point.column.0;
-                    let wide = term.grid()[cursor.point].flags.contains(Flags::WIDE_CHAR);
-                    let width = cell.width * if wide { 2.0 } else { 1.0 };
-                    let bounds = Bounds::new(at(line, column), size(width, cell.height));
+                if let Some(cursor) = cursor {
+                    let width = cell.width * if cursor.wide { 2.0 } else { 1.0 };
+                    let bounds =
+                        Bounds::new(at(cursor.line, cursor.column), size(width, cell.height));
                     metrics.borrow_mut().cursor = Some(bounds);
-                    let color = to_hsla(palette.named(NamedColor::Cursor));
+                    let color = cursor_color;
                     if let Some(marked) = marked.as_deref() {
                         let style = Style {
-                            color: to_hsla(palette.named(NamedColor::Foreground)),
+                            color: foreground,
                             underline: true,
                             ..Style::default()
                         };
@@ -1152,14 +1168,13 @@ impl TerminalView {
                             _ => {
                                 window.paint_quad(quad_fill(bounds, color));
                                 // The character under a block cursor, in the background color.
-                                let c = term.grid()[cursor.point].c;
-                                if !c.is_whitespace() {
+                                if !cursor.c.is_whitespace() {
                                     let style = Style {
                                         color: to_hsla(default_background),
                                         ..Style::default()
                                     };
                                     paint_text(
-                                        &c.to_string(),
+                                        &cursor.c.to_string(),
                                         &style,
                                         &base,
                                         font_size,
@@ -1205,6 +1220,17 @@ fn mouse_button_code(button: MouseButton) -> Option<u8> {
         MouseButton::Right => Some(2),
         _ => None,
     }
+}
+
+/// The visible cursor, read from the terminal so it can be painted after unlocking it.
+struct CursorCell {
+    line: usize,
+    column: usize,
+    shape: CursorShape,
+    /// Whether it covers a wide character (two cells).
+    wide: bool,
+    /// The character under it.
+    c: char,
 }
 
 /// Cells of one line with the same style, painted as one run.

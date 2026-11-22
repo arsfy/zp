@@ -466,16 +466,13 @@ impl Session {
             }
         }
 
-        let compaction = path
-            .iter()
-            .rposition(|entry| matches!(entry.data, EntryData::Compaction { .. }));
         let push = |entry: &SessionEntry, context: &mut SessionContext| {
             if let Some(message) = entry.message() {
                 context.messages.push(message.clone());
                 context.entry_ids.push(entry.id.clone());
             }
         };
-        let Some(at) = compaction else {
+        let Some((kept_from, at)) = compaction_span(&path) else {
             for entry in &path {
                 push(entry, &mut context);
             }
@@ -483,17 +480,12 @@ impl Session {
         };
         let EntryData::Compaction {
             summary,
-            first_kept_entry_id,
             tokens_before,
             ..
         } = &path[at].data
         else {
             unreachable!()
         };
-        let kept_from = path[..at]
-            .iter()
-            .position(|entry| &entry.id == first_kept_entry_id)
-            .unwrap_or(at);
         let retained = path[kept_from..at]
             .iter()
             .filter(|entry| entry.message().is_some())
@@ -512,6 +504,25 @@ impl Session {
             push(entry, &mut context);
         }
         context
+    }
+
+    /// The `entry_ids` of [`Self::context_at`], without cloning the messages.
+    pub fn context_entry_ids_at(&self, leaf: Option<&str>) -> Vec<String> {
+        let path = self.branch_path(leaf);
+        let message_ids = |entries: &[&SessionEntry]| -> Vec<String> {
+            entries
+                .iter()
+                .filter(|entry| entry.message().is_some())
+                .map(|entry| entry.id.clone())
+                .collect()
+        };
+        let Some((kept_from, at)) = compaction_span(&path) else {
+            return message_ids(&path);
+        };
+        let mut ids = vec![path[at].id.clone()];
+        ids.extend(message_ids(&path[kept_from..at]));
+        ids.extend(message_ids(&path[at + 1..]));
+        ids
     }
 
     /// The whole tree; roots and children in creation order.
@@ -581,6 +592,26 @@ impl Session {
         self.file = Some(file);
         Ok(())
     }
+}
+
+/// For a branch `path` with a compaction, `(kept_from, at)`: the index of the first entry
+/// the last compaction kept (`at` when not found) and the index of that compaction.
+fn compaction_span(path: &[&SessionEntry]) -> Option<(usize, usize)> {
+    let at = path
+        .iter()
+        .rposition(|entry| matches!(entry.data, EntryData::Compaction { .. }))?;
+    let EntryData::Compaction {
+        first_kept_entry_id,
+        ..
+    } = &path[at].data
+    else {
+        unreachable!()
+    };
+    let kept_from = path[..at]
+        .iter()
+        .position(|entry| &entry.id == first_kept_entry_id)
+        .unwrap_or(at);
+    Some((kept_from, at))
 }
 
 /// Creates `path` (which must not exist) and writes `bytes` into it with `write`. If the

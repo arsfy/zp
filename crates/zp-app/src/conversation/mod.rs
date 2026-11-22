@@ -235,7 +235,7 @@ pub struct ConversationView {
     turn_files_expanded: HashSet<usize>,
     /// Subagent calls whose whole conclusion is shown.
     full_subagent_results: HashSet<String>,
-    change_log_cache: RefCell<Option<zp_core::changes::ChangeLog>>,
+    change_log_cache: RefCell<Option<Rc<zp_core::changes::ChangeLog>>>,
     /// Tool calls waiting for the user.
     approvals: Vec<permissions::Approval>,
     /// Calls the review model is deciding on (they wait, not run).
@@ -524,6 +524,7 @@ impl ConversationView {
                 while let Ok(event) = receiver.try_recv() {
                     batch.push(event);
                 }
+                let batch = coalesce_tool_updates(batch);
                 if this
                     .update(cx, |this, cx| {
                         // The coding session saves each completed message before forwarding it.
@@ -795,6 +796,11 @@ impl ConversationView {
         self.change_log_cache.borrow_mut().take();
         // Rows change meaning; the cards would sit under the wrong ones.
         self.temp_uses.clear();
+        // Choices kept by row would apply to other blocks; tool diffs are recomputed.
+        self.thinking_expanded.clear();
+        self.tool_expanded
+            .retain(|key, _| !key.starts_with(render::COMPACTION_KEY_PREFIX));
+        self.tool_diffs.borrow_mut().clear();
         if let Some(coding) = &self.coding {
             self.transcript = Transcript::from_session_at(&coding.session(), leaf, context_tokens);
             self.editing = None;
@@ -1904,6 +1910,40 @@ impl ConversationView {
     }
 }
 
+/// Keeps only the last [`AgentEvent::ToolExecutionUpdate`] of each tool call in `batch`:
+/// each carries the whole output so far, so earlier ones that piled up (a long command
+/// while the UI stalled) need not be applied. Other events keep their order. Details of a
+/// dropped update are carried into the kept one if it has none, as applying both would.
+fn coalesce_tool_updates(batch: Vec<ReceivedEvent>) -> Vec<ReceivedEvent> {
+    let mut kept: Vec<ReceivedEvent> = Vec::with_capacity(batch.len());
+    // Index in `kept` (reversed) of the last update of each call.
+    let mut last_update: HashMap<String, usize> = HashMap::new();
+    for mut received in batch.into_iter().rev() {
+        if let AgentEvent::ToolExecutionUpdate {
+            tool_call_id,
+            partial_result,
+            ..
+        } = &mut received.event
+        {
+            if let Some(&later) = last_update.get(tool_call_id.as_str()) {
+                if let AgentEvent::ToolExecutionUpdate {
+                    partial_result: later,
+                    ..
+                } = &mut kept[later].event
+                    && later.details.is_none()
+                {
+                    later.details = partial_result.details.take();
+                }
+                continue;
+            }
+            last_update.insert(tool_call_id.clone(), kept.len());
+        }
+        kept.push(received);
+    }
+    kept.reverse();
+    kept
+}
+
 /// Copies the branch of `coding` ending at `entry` into a new session (saved next to the
 /// original when there is a data directory).
 fn fork_session(coding: &CodingSession, entry: &str, cx: &App) -> anyhow::Result<Session> {
@@ -2139,6 +2179,145 @@ mod tests {
                 "manual close survives settings changes"
             );
         });
+    }
+
+    #[gpui::test]
+    fn rebuilt_transcript_forgets_choices_kept_by_row(cx: &mut TestAppContext) {
+        let faux = FauxProvider::default();
+        let _data = crate::tests_conversation::setup_models(cx, &[&faux], false);
+        let (_dir, project) = crate::tests::project_dir();
+        let window = crate::tests_conversation::open(cx, &project);
+        let conversation = crate::tests_conversation::active(window, cx);
+        cx.update(|cx| {
+            AppSettings::update(cx, |settings| {
+                settings.transcript.thinking = Some(BlockDisplay::Collapsed);
+            })
+            .unwrap();
+        });
+        let answer = |thinking: &str| -> zp_agent::AgentMessage {
+            let mut message = AssistantMessage::empty("faux", "faux", "faux-1");
+            message
+                .content
+                .push(zp_ai::AssistantContent::Thinking(zp_ai::ThinkingContent {
+                    thinking: thinking.into(),
+                    signature: None,
+                    redacted: false,
+                }));
+            message.into()
+        };
+        conversation.update(cx, |view, cx| {
+            // Two branches whose second answers, each with a thinking block, are row 3.
+            let coding = view.coding.clone().unwrap();
+            let (first, second) = {
+                let mut session = coding.session();
+                session
+                    .append_message(zp_agent::AgentMessage::user("one"))
+                    .unwrap();
+                let answered = session.append_message(answer("a")).unwrap();
+                session
+                    .append_message(zp_agent::AgentMessage::user("two"))
+                    .unwrap();
+                let first = session.append_message(answer("b")).unwrap();
+                session.branch(&answered).unwrap();
+                session
+                    .append_message(zp_agent::AgentMessage::user("two, again"))
+                    .unwrap();
+                (first, session.append_message(answer("c")).unwrap())
+            };
+            coding.branch(&first).unwrap();
+            view.reload_transcript();
+            assert_eq!(view.transcript.len(), 4);
+            view.toggle_thinking_block(3, 0, false, cx);
+            view.toggle_tool("compaction-1", 1, false, cx);
+            view.toggle_tool("call-1", 3, false, cx);
+            view.tool_diffs
+                .borrow_mut()
+                .insert("call-1".into(), Rc::new(Err("old".into())));
+            assert!(view.thinking_is_expanded(3, 0, cx));
+
+            coding.branch(&second).unwrap();
+            view.reload_transcript();
+            assert_eq!(view.transcript.len(), 4);
+            assert!(
+                !view.thinking_is_expanded(3, 0, cx),
+                "another answer's thinking is now row 3"
+            );
+            assert!(!view.tool_expanded.contains_key("compaction-1"));
+            assert_eq!(
+                view.tool_expanded.get("call-1"),
+                Some(&true),
+                "tool cards are kept by call id"
+            );
+            assert!(view.tool_diffs.borrow().is_empty());
+        });
+    }
+
+    fn tool_update(id: &str, output: &str, details: Option<serde_json::Value>) -> ReceivedEvent {
+        let mut partial_result = AgentToolResult::text(output);
+        partial_result.details = details;
+        ReceivedEvent::new(
+            Instant::now(),
+            AgentEvent::ToolExecutionUpdate {
+                tool_call_id: id.into(),
+                tool_name: "bash".into(),
+                partial_result,
+            },
+        )
+    }
+
+    /// `(call id, output)` of updates and the kind of other events.
+    fn summary(batch: &[ReceivedEvent]) -> Vec<String> {
+        batch
+            .iter()
+            .map(|received| match &received.event {
+                AgentEvent::ToolExecutionUpdate {
+                    tool_call_id,
+                    partial_result,
+                    ..
+                } => format!(
+                    "{tool_call_id}: {}",
+                    partial_result.content[0].as_text().unwrap()
+                ),
+                event => event.name().to_owned(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn coalesce_tool_updates_keeps_the_last_snapshot_of_each_call() {
+        let end = |id: &str| {
+            ReceivedEvent::new(
+                Instant::now(),
+                AgentEvent::ToolExecutionEnd {
+                    tool_call_id: id.into(),
+                    tool_name: "bash".into(),
+                    result: AgentToolResult::text("done"),
+                    is_error: false,
+                    duration_ms: None,
+                },
+            )
+        };
+        let batch = vec![
+            tool_update("a", "1", Some(serde_json::json!({"step": 1}))),
+            tool_update("b", "1", None),
+            tool_update("a", "12", None),
+            end("b"),
+            tool_update("a", "123", None),
+            end("a"),
+        ];
+        let coalesced = coalesce_tool_updates(batch);
+        assert_eq!(
+            summary(&coalesced),
+            ["b: 1", "tool_execution_end", "a: 123", "tool_execution_end"]
+        );
+        let AgentEvent::ToolExecutionUpdate { partial_result, .. } = &coalesced[2].event else {
+            unreachable!()
+        };
+        assert_eq!(
+            partial_result.details,
+            Some(serde_json::json!({"step": 1})),
+            "the latest details are kept"
+        );
     }
 
     #[gpui::test]

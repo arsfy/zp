@@ -908,7 +908,7 @@ impl CodingSession {
 
     /// The session entry behind each message of the agent transcript.
     pub fn context_entry_ids(&self) -> Vec<String> {
-        self.session().context().entry_ids
+        self.session().context_entry_ids_at(None)
     }
 
     /// Rewinds past a failed or aborted last response so that

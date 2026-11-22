@@ -194,6 +194,10 @@ fn approvals_with_reasons_grants_and_previews(cx: &mut TestAppContext) {
     // The edit asks too, with a preview of the change.
     let edit = wait_for_approval(&conversation, cx);
     assert_eq!(pending(&conversation, cx), ["a.txt"]);
+    // Computed in the background.
+    wait_until(cx, |cx| {
+        conversation.read_with(cx, |view, _| view.approval_preview(&edit).is_some())
+    });
     assert_eq!(
         conversation.read_with(cx, |view, _| view.approval_preview(&edit)),
         Some((1, 1))

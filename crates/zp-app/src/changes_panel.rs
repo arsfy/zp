@@ -2,6 +2,7 @@
 //! with revert actions, and the git working tree.
 
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 
 use gpui::{
     AnyElement, App, AppContext as _, Context, Entity, EventEmitter, FontWeight, IntoElement,
@@ -139,8 +140,14 @@ impl ChangesPanel {
 
     pub fn set_mode(&mut self, mode: ChangesMode, cx: &mut Context<Self>) {
         self.mode = mode;
-        if mode == ChangesMode::Git {
-            self.refresh_git(cx);
+        match mode {
+            ChangesMode::Git => self.refresh_git(cx),
+            // Only computed while shown (see `refresh`).
+            ChangesMode::Turns => {
+                let (log, blobs) = self.change_log(cx);
+                self.groups = self.group_rows(&log, blobs.as_ref());
+            }
+            ChangesMode::Session => {}
         }
         cx.notify();
     }
@@ -205,27 +212,42 @@ impl ChangesPanel {
         }
     }
 
-    /// Recomputes the lists from the conversation's change log.
-    pub fn refresh(&mut self, cx: &mut Context<Self>) {
-        let (log, blobs) = match &self.conversation {
+    /// The followed conversation's change log and file versions.
+    fn change_log(&self, cx: &App) -> (Rc<ChangeLog>, Option<BlobStore>) {
+        match &self.conversation {
             Some(conversation) => {
                 let view = conversation.read(cx);
                 (view.change_log(), view.blobs())
             }
-            None => (ChangeLog::default(), None),
-        };
-        self.files = self.rows(&log, Scope::Session, blobs.as_ref());
-        self.groups = log
-            .groups_with_changes()
+            None => (Rc::default(), None),
+        }
+    }
+
+    /// The turns view's groups, newest first.
+    fn group_rows(&self, log: &ChangeLog, blobs: Option<&BlobStore>) -> Vec<GroupRow> {
+        log.groups_with_changes()
             .map(|(index, group)| GroupRow {
                 index,
                 label: group.label(),
                 is_restore: matches!(group.kind, GroupKind::Restore { .. }),
                 status: log.revert_status(Scope::Group(index), None),
-                files: self.rows(&log, Scope::Group(index), blobs.as_ref()),
+                files: self.rows(log, Scope::Group(index), blobs),
             })
             .filter(|group| !group.files.is_empty())
-            .collect();
+            .collect()
+    }
+
+    /// Recomputes the lists from the conversation's change log. The session list is
+    /// always kept (the status bar counts its files); the groups, whose line counts may
+    /// read file versions from disk, only while the turns view is shown.
+    pub fn refresh(&mut self, cx: &mut Context<Self>) {
+        let (log, blobs) = self.change_log(cx);
+        self.files = self.rows(&log, Scope::Session, blobs.as_ref());
+        self.groups = if self.mode == ChangesMode::Turns {
+            self.group_rows(&log, blobs.as_ref())
+        } else {
+            Vec::new()
+        };
         cx.notify();
     }
 

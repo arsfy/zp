@@ -4,7 +4,7 @@ use std::path::Path;
 
 use anyhow::bail;
 
-use super::{git, git_ok};
+use super::{git, git_ok, git_remote_ok};
 
 /// Whether the repository has a commit yet.
 fn has_head(root: &Path) -> bool {
@@ -151,23 +151,23 @@ pub fn push(root: &Path) -> anyhow::Result<()> {
     let upstream =
         git(root, &["rev-parse", "--abbrev-ref", "@{upstream}"]).is_ok_and(|o| o.status.success());
     if upstream {
-        git_ok(root, &["push", "-q"])?;
+        git_remote_ok(root, &["push", "-q"])?;
     } else {
         let remote = default_remote(root)?;
-        git_ok(root, &["push", "-q", "-u", &remote, "HEAD"])?;
+        git_remote_ok(root, &["push", "-q", "-u", &remote, "HEAD"])?;
     }
     Ok(())
 }
 
 /// Pulls into the current branch (merging or rebasing as configured).
 pub fn pull(root: &Path) -> anyhow::Result<()> {
-    git_ok(root, &["pull", "-q", "--no-edit"])?;
+    git_remote_ok(root, &["pull", "-q", "--no-edit"])?;
     Ok(())
 }
 
 /// Fetches every remote.
 pub fn fetch(root: &Path) -> anyhow::Result<()> {
-    git_ok(root, &["fetch", "-q", "--all", "--prune"])?;
+    git_remote_ok(root, &["fetch", "-q", "--all", "--prune"])?;
     Ok(())
 }
 
@@ -379,6 +379,32 @@ mod tests {
         assert!(message.ends_with("Signed-off-by: t <t@t>"), "{message}");
     }
 
+    /// Logs the `-c` config of every git process that updates a ref of `root` (to see
+    /// what a remote command ran with); returns the log's path.
+    #[cfg(unix)]
+    fn log_ref_updates(root: &Path) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt as _;
+        let log = root.join(".git/ref-updates.log");
+        let hook = root.join(".git/hooks/reference-transaction");
+        std::fs::create_dir_all(hook.parent().unwrap()).unwrap();
+        let script = format!(
+            "#!/bin/sh\necho \"$GIT_CONFIG_PARAMETERS\" >> '{}'\n",
+            log.display()
+        );
+        std::fs::write(&hook, script).unwrap();
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+        log
+    }
+
+    /// Whether the ref updates logged since the last call ran with the stall limits of
+    /// remote commands; clears the log.
+    #[cfg(unix)]
+    fn used_remote_config(log: &Path) -> bool {
+        let text = std::fs::read_to_string(log).unwrap_or_default();
+        std::fs::write(log, "").unwrap();
+        text.contains("'http.lowSpeedLimit'='1000'") && text.contains("'http.lowSpeedTime'='30'")
+    }
+
     #[test]
     fn branches_and_remotes() {
         let remote_dir = tempfile::tempdir().unwrap();
@@ -394,8 +420,16 @@ mod tests {
             &["remote", "add", "origin", remote.to_str().unwrap()],
         );
 
+        #[cfg(unix)]
+        let ref_log = log_ref_updates(&root);
+
         // Publishing sets the upstream.
         push(&root).unwrap();
+        #[cfg(unix)]
+        assert!(
+            used_remote_config(&ref_log),
+            "push limits stalled transfers"
+        );
         let published = status(&root).unwrap().unwrap();
         assert_eq!(published.upstream.as_deref(), Some("origin/main"));
         assert!(published.has_remote);
@@ -416,9 +450,21 @@ mod tests {
         run(&other, &["push", "-q"]);
         run(&other, &["switch", "-q", "-c", "feature"]);
         run(&other, &["push", "-q", "-u", "origin", "feature"]);
+        #[cfg(unix)]
+        used_remote_config(&ref_log);
         fetch(&root).unwrap();
+        #[cfg(unix)]
+        assert!(
+            used_remote_config(&ref_log),
+            "fetch limits stalled transfers"
+        );
         assert_eq!(status(&root).unwrap().unwrap().behind, 1);
         pull(&root).unwrap();
+        #[cfg(unix)]
+        assert!(
+            used_remote_config(&ref_log),
+            "pull limits stalled transfers"
+        );
         assert!(root.join("c.txt").exists());
 
         // Branches: local first, remote ones without a local branch.

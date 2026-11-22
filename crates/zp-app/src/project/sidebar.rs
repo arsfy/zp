@@ -1,6 +1,7 @@
 //! The sessions sidebar: date groups, search, preview / open, and a context menu.
 
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 
 use chrono::{DateTime, Local, TimeZone as _};
 use gpui::{
@@ -8,7 +9,7 @@ use gpui::{
     MouseButton, MouseDownEvent, Pixels, Point, Task, Window, div, prelude::*, px, rgb_to_hsla,
 };
 use gpui_elements::editable_text::{EditableTextState, text_input};
-use zp_session::{Session, SessionInfo};
+use zp_session::{Session, SessionInfo, SessionManager};
 
 use super::{ProjectWindow, RenameTarget, session_delete_dialog, session_manager};
 use crate::context_menu::ContextMenu;
@@ -53,10 +54,10 @@ pub fn group_for(modified_ms: i64, now: DateTime<Local>) -> SessionGroup {
     }
 }
 
-/// Sessions shown in the sidebar.
+/// Sessions shown in the sidebar, shared so that rendering does not copy their search text.
 pub(super) enum SessionList {
     Loading,
-    Loaded(Vec<SessionInfo>),
+    Loaded(Vec<Rc<SessionInfo>>),
     Unavailable(String),
 }
 
@@ -66,6 +67,8 @@ pub(super) struct Sidebar {
     /// The highlighted session (keyboard navigation, last opened).
     pub selected: Option<PathBuf>,
     load_task: Option<Task<()>>,
+    /// Kept across loads so that unchanged session files are not parsed again.
+    manager: Option<SessionManager>,
 }
 
 impl Sidebar {
@@ -75,6 +78,7 @@ impl Sidebar {
             search,
             selected: None,
             load_task: None,
+            manager: None,
         }
     }
 
@@ -89,16 +93,26 @@ impl ProjectWindow {
             cx.notify();
             return;
         };
+        let manager = match &self.sidebar.manager {
+            Some(manager) if manager.root() == dir => manager.clone(),
+            _ => self
+                .sidebar
+                .manager
+                .insert(SessionManager::new(dir))
+                .clone(),
+        };
         let root = self.root.clone();
         let listing = cx
             .background_executor()
-            .spawn(async move { zp_session::SessionManager::new(dir).list(&root) });
+            .spawn(async move { manager.list(&root) });
         // Replacing the task prevents an older listing from overwriting a fresher one.
         self.sidebar.load_task = Some(cx.spawn(async move |this, cx| {
             let result = listing.await;
             let _ = this.update(cx, |this, cx| {
                 this.sidebar.sessions = match result {
-                    Ok(sessions) => SessionList::Loaded(sessions),
+                    Ok(sessions) => {
+                        SessionList::Loaded(sessions.into_iter().map(Rc::new).collect())
+                    }
                     Err(error) => SessionList::Unavailable(format!("{error:#}")),
                 };
                 cx.notify();
@@ -107,7 +121,7 @@ impl ProjectWindow {
     }
 
     /// Unhidden sessions matching the search, most recent first.
-    pub(crate) fn visible_sessions(&self, cx: &App) -> Vec<SessionInfo> {
+    pub(crate) fn visible_sessions(&self, cx: &App) -> Vec<Rc<SessionInfo>> {
         let SessionList::Loaded(sessions) = &self.sidebar.sessions else {
             return Vec::new();
         };

@@ -10,7 +10,7 @@ use std::process::Command;
 
 use anyhow::{Context as _, bail};
 
-pub use log::{Commit, CommitFile, commit_files, file_at, history};
+pub use log::{Commit, CommitFile, FileText, commit_files, file_at, file_in_worktree, history};
 pub use ops::{
     Branch, CommitOptions, branches, commit, create_branch, discard, fetch, last_commit_message,
     pull, push, stage, stage_all, stage_tracked, switch_branch, uncommit, unstage, unstage_all,
@@ -122,12 +122,28 @@ impl GitStatus {
     }
 }
 
-/// Runs git in `dir`, never waiting for a terminal prompt or an editor.
-pub(crate) fn git(dir: &Path, args: &[&str]) -> anyhow::Result<std::process::Output> {
+/// The SSH command used when the user has not set `GIT_SSH_COMMAND`: never prompts, and
+/// gives up on a connection that cannot be made in 15 s or stops answering for 45 s.
+const DEFAULT_SSH_COMMAND: &str = "ssh -o BatchMode=yes -o ConnectTimeout=15 \
+     -o ServerAliveInterval=15 -o ServerAliveCountMax=3";
+
+/// Config for commands that talk to a remote: aborts an HTTP transfer that stays
+/// below 1000 bytes/s for 30 s.
+const REMOTE_CONFIG: &[&str] = &[
+    "-c",
+    "http.lowSpeedLimit=1000",
+    "-c",
+    "http.lowSpeedTime=30",
+];
+
+/// The git command for `args` in `dir`, with `config` (`-c` options) before them; it
+/// never waits for a terminal prompt or an editor.
+fn git_command(dir: &Path, config: &[&str], args: &[&str]) -> Command {
     let mut command = Command::new("git");
     command
         .arg("-C")
         .arg(dir)
+        .args(config)
         .args(args)
         .env("GIT_OPTIONAL_LOCKS", "0")
         .env("GIT_TERMINAL_PROMPT", "0")
@@ -135,7 +151,7 @@ pub(crate) fn git(dir: &Path, args: &[&str]) -> anyhow::Result<std::process::Out
         .env("GIT_EDITOR", "true")
         .env("LC_ALL", "C");
     if std::env::var_os("GIT_SSH_COMMAND").is_none() {
-        command.env("GIT_SSH_COMMAND", "ssh -o BatchMode=yes");
+        command.env("GIT_SSH_COMMAND", DEFAULT_SSH_COMMAND);
     }
     #[cfg(windows)]
     {
@@ -143,12 +159,32 @@ pub(crate) fn git(dir: &Path, args: &[&str]) -> anyhow::Result<std::process::Out
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         command.creation_flags(CREATE_NO_WINDOW);
     }
-    command.output().context("could not run git")
+    command
+}
+
+/// Runs git in `dir`, never waiting for a terminal prompt or an editor.
+pub(crate) fn git(dir: &Path, args: &[&str]) -> anyhow::Result<std::process::Output> {
+    git_command(dir, &[], args)
+        .output()
+        .context("could not run git")
 }
 
 /// Runs git and returns its output, or an error with what git said.
 pub(crate) fn git_ok(dir: &Path, args: &[&str]) -> anyhow::Result<String> {
-    let output = git(dir, args)?;
+    checked_output(git(dir, args)?, args)
+}
+
+/// Like [`git_ok`], for commands that talk to a remote (`push`, `pull`, `fetch`): a
+/// stalled HTTP transfer is aborted (see [`REMOTE_CONFIG`]).
+pub(crate) fn git_remote_ok(dir: &Path, args: &[&str]) -> anyhow::Result<String> {
+    let output = git_command(dir, REMOTE_CONFIG, args)
+        .output()
+        .context("could not run git")?;
+    checked_output(output, args)
+}
+
+/// The standard output of git run with `args`, or an error with what git said.
+fn checked_output(output: std::process::Output, args: &[&str]) -> anyhow::Result<String> {
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -481,6 +517,44 @@ pub(crate) mod tests {
         let detached = super::status(&root).unwrap().unwrap();
         assert_eq!(detached.branch, None);
         assert!(detached.head.is_some());
+    }
+
+    #[test]
+    fn remote_commands_give_up_on_stalled_connections() {
+        let command = git_command(Path::new("repo"), REMOTE_CONFIG, &["fetch", "-q"]);
+        let args: Vec<&str> = command.get_args().map(|a| a.to_str().unwrap()).collect();
+        assert_eq!(
+            args,
+            [
+                "-C",
+                "repo",
+                "-c",
+                "http.lowSpeedLimit=1000",
+                "-c",
+                "http.lowSpeedTime=30",
+                "fetch",
+                "-q"
+            ]
+        );
+        let ssh = command
+            .get_envs()
+            .find(|(key, _)| *key == "GIT_SSH_COMMAND")
+            .and_then(|(_, value)| value);
+        if std::env::var_os("GIT_SSH_COMMAND").is_none() {
+            assert_eq!(
+                ssh.and_then(|value| value.to_str()),
+                Some(
+                    "ssh -o BatchMode=yes -o ConnectTimeout=15 \
+                     -o ServerAliveInterval=15 -o ServerAliveCountMax=3"
+                )
+            );
+        } else {
+            assert_eq!(ssh, None, "the user's GIT_SSH_COMMAND is kept");
+        }
+
+        // Local commands get no transfer limits.
+        let local = git_command(Path::new("repo"), &[], &["status"]);
+        assert_eq!(local.get_args().count(), 3);
     }
 
     fn status_of(dir: &Path) -> Vec<String> {

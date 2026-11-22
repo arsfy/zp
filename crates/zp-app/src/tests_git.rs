@@ -446,3 +446,67 @@ fn long_history_draws_only_the_commits_in_view_within_the_panel(cx: &mut TestApp
         "commits out of view are not built"
     );
 }
+
+#[gpui::test]
+fn files_too_large_to_compare_open_as_too_large_without_being_read(cx: &mut TestAppContext) {
+    let _data = setup_models(cx, &[&FauxProvider::default()], false);
+    let (_dir, project) = project_dir();
+    git(&project, &["init", "-q"]);
+    git(&project, &["config", "user.name", "Tester"]);
+    git(&project, &["config", "user.email", "t@example.com"]);
+    git(&project, &["config", "commit.gpgsign", "false"]);
+    git(&project, &["config", "core.autocrlf", "false"]);
+    let big = "x".repeat(zp_core::diff::MAX_DIFF_BYTES + 1);
+    std::fs::write(project.join("grown.txt"), "small\n").unwrap();
+    std::fs::write(project.join("shrunk.txt"), &big).unwrap();
+    std::fs::write(project.join("small.txt"), "one\n").unwrap();
+    git(&project, &["add", "."]);
+    git(&project, &["commit", "-q", "-m", "init"]);
+    std::fs::write(project.join("grown.txt"), &big).unwrap();
+    std::fs::write(project.join("shrunk.txt"), "small\n").unwrap();
+    std::fs::write(project.join("small.txt"), "one\ntwo\n").unwrap();
+
+    let window = open(cx, &project);
+    let panel = window
+        .update(cx, |view, _, cx| {
+            view.changes_panel().read(cx).git().clone()
+        })
+        .unwrap();
+    settle(&panel, cx, |s| s.files.len() == 3);
+    panel.update(cx, |panel, cx| panel.open_all(cx));
+    wait_until(cx, |cx| {
+        window
+            .update(cx, |view, _, _| view.diff_view())
+            .unwrap()
+            .is_some()
+    });
+    let diff = window
+        .update(cx, |view, _, _| view.diff_view())
+        .unwrap()
+        .unwrap();
+    let items: Vec<(String, bool, bool, bool, usize)> = diff.read_with(cx, |diff, _| {
+        diff.items()
+            .iter()
+            .map(|item| {
+                let lines = item.diff();
+                (
+                    item.display.clone(),
+                    item.too_large,
+                    item.before.is_some() || item.after.is_some(),
+                    lines.too_large,
+                    lines.added,
+                )
+            })
+            .collect()
+    });
+    // A side too large to compare is not read, and the file shows as too large rather
+    // than as added or deleted.
+    assert_eq!(
+        items,
+        [
+            ("grown.txt".to_owned(), true, false, true, 0),
+            ("shrunk.txt".to_owned(), true, false, true, 0),
+            ("small.txt".to_owned(), false, true, false, 1),
+        ]
+    );
+}

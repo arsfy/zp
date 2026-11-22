@@ -1,6 +1,7 @@
 //! Tool call approvals in a conversation: pending requests, the approval card and the
 //! permission mode picker.
 
+use std::path::Path;
 use std::rc::Rc;
 
 use futures::channel::oneshot;
@@ -32,6 +33,31 @@ pub(super) fn permission_mode_color(mode: PermissionMode, cx: &App) -> Option<Rg
         PermissionMode::AutoReview => Some(colors.accent),
         PermissionMode::FullAuto => Some(colors.warning),
     }
+}
+
+/// What a pending `write` / `edit` call (`tool_name` with `args`) would change in project
+/// `root`. Reads the file: run it off the main thread.
+fn change_preview(root: &Path, tool_name: &str, args: &serde_json::Value) -> Option<ToolDiff> {
+    let path = zp_tools::resolve_path(root, args["path"].as_str()?);
+    let before = std::fs::read_to_string(&path).ok();
+    let after = match tool_name {
+        "write" => args["content"].as_str()?.to_owned(),
+        "edit" => {
+            let edits: Vec<zp_tools::EditSpec> = args["edits"]
+                .as_array()?
+                .iter()
+                .map(|edit| zp_tools::EditSpec {
+                    old_text: edit["oldText"].as_str().unwrap_or_default().to_owned(),
+                    new_text: edit["newText"].as_str().unwrap_or_default().to_owned(),
+                })
+                .collect();
+            zp_tools::apply_edits(before.as_deref()?, &edits, "file").ok()?
+        }
+        _ => return None,
+    };
+    let diff = FileDiff::compute(before.as_deref(), Some(&after), DEFAULT_CONTEXT);
+    let rows = unified_rows(&diff);
+    Some(ToolDiff { diff, rows })
 }
 
 /// A tool call waiting for the user.
@@ -122,8 +148,10 @@ impl ConversationView {
     pub(super) fn add_approval(&mut self, pending: PendingApproval, cx: &mut Context<Self>) {
         let request = pending.request;
         let reason = cx.new(|cx| EditableTextState::new(StringStorage::default(), cx));
-        let preview = self.change_preview(&request).map(Rc::new);
         let call_id = request.tool_call_id.clone();
+        if request.kind == ToolKind::Edit {
+            self.load_change_preview(&request, cx);
+        }
         cx.emit(ConversationEvent::ApprovalRequested(
             request.summary.clone(),
         ));
@@ -131,7 +159,7 @@ impl ConversationView {
             request,
             reply: Some(pending.reply),
             reason,
-            preview,
+            preview: None,
         });
         self.progress
             .update(cx, |progress, cx| progress.set_paused(true, cx));
@@ -140,35 +168,36 @@ impl ConversationView {
         cx.notify();
     }
 
-    /// What a pending `write` / `edit` would change, from the arguments of its call.
-    fn change_preview(
+    /// Computes the preview of a pending file change in the background (it reads the file
+    /// and diffs it), then shows it in the approval card if that still waits.
+    fn load_change_preview(
         &self,
         request: &zp_core::permissions::PermissionRequest,
-    ) -> Option<ToolDiff> {
-        if request.kind != ToolKind::Edit {
-            return None;
-        }
-        let args = &request.args;
-        let path = zp_tools::resolve_path(&self.root, args["path"].as_str()?);
-        let before = std::fs::read_to_string(&path).ok();
-        let after = match request.tool_name.as_str() {
-            "write" => args["content"].as_str()?.to_owned(),
-            "edit" => {
-                let edits: Vec<zp_tools::EditSpec> = args["edits"]
-                    .as_array()?
-                    .iter()
-                    .map(|edit| zp_tools::EditSpec {
-                        old_text: edit["oldText"].as_str().unwrap_or_default().to_owned(),
-                        new_text: edit["newText"].as_str().unwrap_or_default().to_owned(),
-                    })
-                    .collect();
-                zp_tools::apply_edits(before.as_deref()?, &edits, "file").ok()?
-            }
-            _ => return None,
-        };
-        let diff = FileDiff::compute(before.as_deref(), Some(&after), DEFAULT_CONTEXT);
-        let rows = unified_rows(&diff);
-        Some(ToolDiff { diff, rows })
+        cx: &mut Context<Self>,
+    ) {
+        let root = self.root.clone();
+        let (tool_name, args) = (request.tool_name.clone(), request.args.clone());
+        let call_id = request.tool_call_id.clone();
+        let task = cx
+            .background_executor()
+            .spawn(async move { change_preview(&root, &tool_name, &args) });
+        cx.spawn(async move |this, cx| {
+            let Some(preview) = task.await else {
+                return;
+            };
+            let _ = this.update(cx, |this, cx| {
+                if let Some(approval) = this
+                    .approvals
+                    .iter_mut()
+                    .find(|a| a.request.tool_call_id == call_id)
+                {
+                    approval.preview = Some(Rc::new(preview));
+                    this.refresh_tool_row(&call_id);
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
     }
 
     /// Answers the approval of tool call `call_id`.

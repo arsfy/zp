@@ -44,6 +44,9 @@ pub struct DiffItem {
     pub before: Option<Arc<str>>,
     /// `None`: the file was deleted.
     pub after: Option<Arc<str>>,
+    /// A version was too large to read, so `before` and `after` were not loaded and the
+    /// diff is only shown as too large.
+    pub too_large: bool,
     pub status: RevertStatus,
     /// Offered as "Revert" when set.
     pub revert: Option<RevertFn>,
@@ -51,6 +54,12 @@ pub struct DiffItem {
 
 impl DiffItem {
     pub fn diff(&self) -> FileDiff {
+        if self.too_large {
+            return FileDiff {
+                too_large: true,
+                ..FileDiff::default()
+            };
+        }
         FileDiff::compute(
             self.before.as_deref(),
             self.after.as_deref(),

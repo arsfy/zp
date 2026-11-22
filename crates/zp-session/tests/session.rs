@@ -338,6 +338,40 @@ fn context_entry_ids_and_latest_leaves() {
 }
 
 #[test]
+fn context_entry_ids_at_matches_context_at_on_every_branch() {
+    let mut session = Session::in_memory(Path::new("/p"));
+    assert!(session.context_entry_ids_at(None).is_empty());
+    let u1 = session.append_message(AgentMessage::user("u1")).unwrap();
+    session.append_model_change("p", "m").unwrap();
+    let a1 = session.append_message(assistant("a1", "m")).unwrap();
+    let u2 = session.append_message(AgentMessage::user("u2")).unwrap();
+    session.append_message(assistant("a2", "m")).unwrap();
+    session
+        .append_compaction("s1".into(), &u2, 1, None)
+        .unwrap();
+    session.append_message(AgentMessage::user("u3")).unwrap();
+    session
+        .append_compaction("s2".into(), &u1, 2, None)
+        .unwrap();
+    session.append_message(assistant("a3", "m")).unwrap();
+    session.branch(&a1).unwrap();
+    session.append_label(&u1, Some("start".into())).unwrap();
+    session.append_message(AgentMessage::user("u2b")).unwrap();
+
+    for leaf in session.entries().iter().map(|entry| entry.id.as_str()) {
+        assert_eq!(
+            session.context_entry_ids_at(Some(leaf)),
+            session.context_at(Some(leaf)).entry_ids,
+            "leaf {leaf}"
+        );
+    }
+    assert_eq!(
+        session.context_entry_ids_at(None),
+        session.context().entry_ids
+    );
+}
+
+#[test]
 fn session_info_search() {
     let root = tempfile::tempdir().unwrap();
     let manager = SessionManager::new(root.path());

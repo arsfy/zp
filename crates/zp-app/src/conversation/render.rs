@@ -79,6 +79,8 @@ const INLINE_DIFF_ROWS: usize = 40;
 const TURN_FILE_PREVIEW: usize = 3;
 /// Models listed at once in the picker.
 pub(super) const PICKER_LIMIT: usize = 200;
+/// Start of the toggle key of a compaction summary, followed by its row.
+pub(super) const COMPACTION_KEY_PREFIX: &str = "compaction-";
 
 pub(super) fn id(name: impl Into<SharedString>, index: usize) -> ElementId {
     ElementId::NamedInteger(name.into(), index as u64)
@@ -248,7 +250,7 @@ impl ConversationView {
             Some(Row::Assistant { .. }) => self.render_assistant(ix, cx),
             Some(Row::Notice { kind, text, .. }) if kind == zp_session::COMPACTION_SUMMARY_TYPE => {
                 let colors = cx.theme().colors.clone();
-                let key = format!("compaction-{ix}");
+                let key = format!("{COMPACTION_KEY_PREFIX}{ix}");
                 let expanded = self.tool_expanded.get(&key).copied().unwrap_or(false);
                 let openness = self.disclosures.openness(key.clone(), expanded, cx);
                 let toggle_key = key.clone();
