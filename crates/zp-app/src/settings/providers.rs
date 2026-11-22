@@ -84,6 +84,12 @@ impl ProviderForm {
         self.test.as_ref()
     }
 
+    /// The error shown after a failed save (tests).
+    #[cfg(test)]
+    pub fn error(&self) -> Option<&str> {
+        self.error.as_deref()
+    }
+
     /// The provider described by the form.
     fn definition(&self, cx: &App) -> anyhow::Result<CustomProvider> {
         let text = |input: &Entity<EditableTextState>| input.read(cx).as_str().trim().to_owned();
@@ -491,7 +497,10 @@ impl SettingsWindow {
         }
     }
 
-    /// Validates and saves the form: settings, registry, key, then a model list refresh.
+    /// Validates and saves the form: key, settings, registry, then a model list refresh.
+    /// The key comes first: the keychain is what fails most (access denied), and until the
+    /// settings and registry change, saving again is a plain retry rather than "already
+    /// exists".
     pub fn save_provider_form(&mut self, cx: &mut Context<Self>) {
         let Some(ProviderDialog::Custom(form)) = &self.dialog else {
             return;
@@ -512,14 +521,14 @@ impl SettingsWindow {
                 .collect();
             zp_core::providers::validate_custom_provider(&def, &taken)?;
             let provider = zp_core::providers::custom_provider(&def)?;
+            if !key.is_empty() {
+                cx.global::<AppModels>().credentials.set(&def.id, &key)?;
+            }
             AppSettings::update(cx, |settings| {
                 settings.providers.retain(|p| p.id != def.id);
                 settings.providers.push(def.clone());
             })?;
             models.register(provider);
-            if !key.is_empty() {
-                cx.global::<AppModels>().credentials.set(&def.id, &key)?;
-            }
             AppModels::credential_changed(cx, &def.id);
             Ok(())
         })();

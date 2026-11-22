@@ -514,6 +514,103 @@ fn custom_provider_form_tests_the_model_list(cx: &mut TestAppContext) {
     drop(runtime);
 }
 
+/// A keychain that refuses to store keys until told otherwise (like a denied macOS
+/// keychain prompt).
+#[derive(Default)]
+struct FlakyKeychain {
+    refuse: std::sync::atomic::AtomicBool,
+    secrets: std::sync::Mutex<std::collections::HashMap<String, String>>,
+}
+
+impl zp_core::credentials::SecretBackend for FlakyKeychain {
+    fn get(&self, provider: &str) -> anyhow::Result<Option<String>> {
+        Ok(self.secrets.lock().unwrap().get(provider).cloned())
+    }
+    fn set(&self, provider: &str, secret: &str) -> anyhow::Result<()> {
+        if self.refuse.load(std::sync::atomic::Ordering::SeqCst) {
+            anyhow::bail!("keychain access denied");
+        }
+        self.secrets
+            .lock()
+            .unwrap()
+            .insert(provider.to_owned(), secret.to_owned());
+        Ok(())
+    }
+    fn delete(&self, provider: &str) -> anyhow::Result<()> {
+        self.secrets.lock().unwrap().remove(provider);
+        Ok(())
+    }
+}
+
+/// When the keychain refuses the key, nothing is saved, so saving again works once it
+/// allows it (instead of failing with "already exists").
+#[gpui::test]
+fn a_new_custom_provider_can_be_saved_again_after_the_keychain_refuses(cx: &mut TestAppContext) {
+    let faux = FauxProvider::default();
+    let data = setup_models(cx, &[&faux], false);
+    let keychain = Arc::new(FlakyKeychain::default());
+    keychain
+        .refuse
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    cx.update(|cx| {
+        let credentials = Arc::new(zp_core::credentials::Credentials::new(
+            keychain.clone(),
+            None,
+        ));
+        let app = cx.global_mut::<AppModels>();
+        app.models = app.models.clone().with_credentials(credentials.clone());
+        app.credentials = credentials;
+    });
+    let window = settings_window(Page::Providers, cx);
+    let save = |cx: &mut TestAppContext| {
+        window
+            .update(cx, |view, window, cx| {
+                if view.provider_form().is_none() {
+                    view.open_provider_form(None, window, cx);
+                }
+                let form = view.provider_form().unwrap();
+                for (field, text) in [
+                    (&form.id, "acme"),
+                    (&form.name, "Acme"),
+                    (&form.base_url, "https://llm.acme.test/v1"),
+                    (&form.models, "acme-chat"),
+                    (&form.key, "sk-acme"),
+                ] {
+                    field.update(cx, |input, cx| input.emplace(text, cx));
+                }
+                view.save_provider_form(cx);
+                view.provider_form()
+                    .map(|form| form.error().unwrap_or_default().to_owned())
+            })
+            .unwrap()
+    };
+    let registered = |cx: &mut TestAppContext| {
+        cx.update(|cx| cx.global::<AppModels>().models.provider("acme"))
+            .is_some()
+    };
+
+    let error = save(cx).expect("the form stays open");
+    assert!(error.contains("keychain access denied"), "{error}");
+    assert!(saved(&data).providers.is_empty(), "nothing saved");
+    assert!(!registered(cx));
+
+    keychain
+        .refuse
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(save(cx), None, "saved and closed");
+    assert_eq!(saved(&data).providers[0].id, "acme");
+    assert!(registered(cx));
+    assert_eq!(
+        keychain
+            .secrets
+            .lock()
+            .unwrap()
+            .get("acme")
+            .map(String::as_str),
+        Some("sk-acme")
+    );
+}
+
 #[gpui::test]
 fn general_defaults_apply_to_new_conversations(cx: &mut TestAppContext) {
     let faux = FauxProvider::default();
