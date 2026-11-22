@@ -1,4 +1,40 @@
-## v0.1.0 20 Nov 2026
+## v0.1.1-rc.1 23 Nov 2026
+
+#### Providers and models
+
+- The custom provider form warns when a typed header looks like a secret (headers are stored in plain text in `settings.json`; secrets belong in the API key field) and when a saved key would be sent to an `http://` endpoint unencrypted. Testing a changed base URL asks for the key again instead of sending the stored one to a new destination.
+- Fixed a new provider's API key not being stored when the provider was saved for the first time.
+- Synced model data no longer brings a request endpoint into a provider that did not set one itself.
+- OAuth logins keep token lifetimes and device-poll intervals within what each provider accepts.
+- A streaming response that goes silent times out and the request is retried; only requests that never reached the server are retried, so nothing runs or is billed twice.
+
+#### Permissions and tools
+
+- **Auto-review** can now judge calls with TypeSafe's Jev service, configured in **Settings → Permissions**.
+- The review prompt was reworked and the review model must end with a clear verdict, so an inconclusive answer no longer stalls the approval card.
+- In **Auto-approve edits** and **Auto-review**, routine Git commands (`status`, `add`, `commit`, `diff`, `log`, `fetch`, `clone`, …) and `echo` writes inside the project run without asking. Git that can run other programs (aliases, pagers, hooks, config overrides), history rewriting, and writes outside the project still need approval.
+- Subagent tools (`read`, `grep`, `find`) refuse credential files — `.env`, SSH and cloud keys, and the like — even when a path names one directly.
+- `zp-cli` asks whether you trust the project before using its instruction files, `.zp` settings, MCP servers, prompts and skills: pass `--trust` to trust it, answer on the terminal, or they are ignored with a notice saying so.
+
+#### Security
+
+- The terminal only opens links it recognizes as safe URLs, and programs running in it can write to the clipboard only through a bounded copy escape (OSC52), capped at 1 MB.
+- Pasted or attached images are limited to 5 MB.
+- Credentials saved to the keychain are cached and retried later when the keychain is unavailable, instead of being lost or failing outright.
+
+#### Reliability
+
+- Session, settings and state files are written atomically, and data left behind by an interrupted write is recovered or rebuilt instead of breaking the session.
+- MCP servers no longer leak: stdio servers (including their whole process tree) are stopped when done, HTTP sessions are ended, and a stalled server cannot hold up shutdown. Slow MCP requests time out with a clear error.
+- MCP streams are parsed correctly when events arrive with CRLF line endings or a multi-byte character is split across chunks.
+- Restored windows are placed on a display that is actually connected, instead of landing at an off-screen origin after a display was unplugged.
+
+#### Performance
+
+- The app stops re-reading and re-parsing files that have not changed — sessions on disk, Git history and status, diffs and terminal search results — so long projects no longer redo that work on every frame.
+- Streaming render output is no longer copied and cached on its way to the screen, cutting memory churn while a response streams in.
+
+## v0.1.0 20 Nov 2026 `00fcb07`
 
 #### Subagents
 
