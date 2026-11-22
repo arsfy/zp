@@ -268,17 +268,35 @@ impl ChangeLog {
                     });
                 }
                 AgentMessage::Custom(custom) if custom.custom_type == FILE_RESTORE_TYPE => {
-                    let Some(details) = custom
+                    let details = match custom
                         .details
                         .clone()
-                        .and_then(|d| serde_json::from_value::<RestoreDetails>(d).ok())
-                    else {
-                        continue;
+                        .map(serde_json::from_value::<RestoreDetails>)
+                    {
+                        Some(Ok(details)) => details,
+                        Some(Err(error)) => {
+                            tracing::warn!(
+                                entry = %entry.id,
+                                %error,
+                                "skipping unreadable file restore details"
+                            );
+                            continue;
+                        }
+                        None => continue,
                     };
                     let changes = details
                         .changes
                         .iter()
-                        .filter_map(RecordedChange::from_details)
+                        .filter_map(|details| {
+                            let change = RecordedChange::from_details(details);
+                            if change.is_none() {
+                                tracing::warn!(
+                                    entry = %entry.id,
+                                    "skipping unreadable change of a file restore"
+                                );
+                            }
+                            change
+                        })
                         .map(|change| ChangeRecord {
                             entry_id: entry.id.clone(),
                             tool_call_id: None,

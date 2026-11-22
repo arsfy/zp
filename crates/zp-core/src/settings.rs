@@ -228,14 +228,11 @@ impl Settings {
         })
     }
 
-    /// Writes the settings to `path`.
+    /// Writes the settings to `path` atomically (through a symlink to its target).
     pub fn save(&self, path: &Path) -> anyhow::Result<()> {
-        if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir)?;
-        }
         let mut text = serde_json::to_string_pretty(self)?;
         text.push('\n');
-        std::fs::write(path, text).with_context(|| format!("could not write {}", path.display()))
+        crate::fs::write_atomic(path, text.as_bytes())
     }
 }
 

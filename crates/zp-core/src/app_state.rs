@@ -4,7 +4,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context as _, Result};
+use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use zp_ai::now_ms;
 
@@ -159,11 +159,13 @@ pub struct AppState {
 }
 
 impl AppState {
-    /// Reads `path`; a missing or unreadable file yields the default state.
+    /// Reads `path`; a missing or unreadable file yields the default state. An invalid
+    /// file is moved aside (see [`crate::fs::move_aside_corrupt`]) so saving does not
+    /// destroy it.
     pub fn load(path: &Path) -> Self {
         match std::fs::read(path) {
             Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_else(|error| {
-                tracing::warn!(path = %path.display(), %error, "ignoring invalid state file");
+                crate::fs::move_aside_corrupt(path, &error);
                 Self::default()
             }),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Self::default(),
@@ -176,14 +178,7 @@ impl AppState {
 
     /// Writes the state atomically.
     pub fn save(&self, path: &Path) -> Result<()> {
-        if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
-        }
-        let temp = path.with_extension(format!("json.{}.tmp", std::process::id()));
-        std::fs::write(&temp, serde_json::to_vec_pretty(self)?)
-            .with_context(|| format!("writing {}", temp.display()))?;
-        std::fs::rename(&temp, path).with_context(|| format!("replacing {}", path.display()))?;
-        Ok(())
+        crate::fs::write_atomic(path, &serde_json::to_vec_pretty(self)?)
     }
 
     /// Moves `path` to the front of the recent projects.
@@ -295,5 +290,31 @@ mod tests {
         assert_eq!(AppState::load(&path).open_projects, [Path::new("/x")]);
         std::fs::write(&path, "not json").unwrap();
         assert_eq!(AppState::load(&path), AppState::default());
+    }
+
+    #[test]
+    fn invalid_state_is_moved_aside_before_saving() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        std::fs::write(&path, "{ truncated").unwrap();
+        let mut state = AppState::load(&path);
+        assert_eq!(state, AppState::default());
+        state.touch_recent(Path::new("/work/app"));
+        state.save(&path).unwrap();
+
+        let backups: Vec<PathBuf> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|entry| entry != &path)
+            .collect();
+        assert_eq!(backups.len(), 1, "{backups:?}");
+        let name = backups[0]
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        assert!(name.starts_with("state.json.corrupt-"), "{name}");
+        assert_eq!(std::fs::read_to_string(&backups[0]).unwrap(), "{ truncated");
+        assert_eq!(AppState::load(&path), state);
     }
 }

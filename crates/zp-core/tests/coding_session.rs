@@ -131,7 +131,9 @@ async fn read_edit_test_then_resume() {
     assert_eq!(files[0].path, cwd.join("add.sh"));
     let plan = RestorePlan::prepare(&log.revert_targets(Scope::Group(0), None), &blobs).unwrap();
     assert_eq!(plan.conflicts().count(), 0);
-    let restored = plan.apply(false, &blobs).unwrap();
+    let applied = plan.apply(false, &blobs);
+    assert!(applied.error.is_none() && applied.changed_since_prepare.is_empty());
+    let restored = applied.changes;
     assert_eq!(
         std::fs::read_to_string(cwd.join("add.sh")).unwrap(),
         "echo $((2+2))\n"
@@ -145,7 +147,9 @@ async fn read_edit_test_then_resume() {
     assert_eq!(coding.agent().messages().len(), 11);
     // Put the fix back for the rest of the test.
     let plan = RestorePlan::prepare(&log.revert_targets(Scope::Group(1), None), &blobs).unwrap();
-    let redone = plan.apply(false, &blobs).unwrap();
+    let applied = plan.apply(false, &blobs);
+    assert!(applied.error.is_none() && applied.changed_since_prepare.is_empty());
+    let redone = applied.changes;
     coding
         .record_restore("Reverted the restore", &redone)
         .unwrap();

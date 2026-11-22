@@ -351,6 +351,9 @@ impl Session {
         }
         line.push_str(&serde_json::to_string(entry)?);
         line.push('\n');
+        // A write that fails midway may leave part of the line; start the next one on a
+        // fresh line so it is not glued to the broken bytes.
+        self.needs_newline = true;
         OpenOptions::new()
             .append(true)
             .open(&path)
@@ -372,10 +375,7 @@ impl Session {
             text.push_str(&serde_json::to_string(entry)?);
             text.push('\n');
         }
-        let mut file = File::create_new(path)
-            .with_context(|| format!("could not create {}", path.display()))?;
-        file.write_all(text.as_bytes())
-            .with_context(|| format!("could not write {}", path.display()))?;
+        create_and_write(path, text.as_bytes(), |file, bytes| file.write_all(bytes))?;
         self.flushed = true;
         Ok(())
     }
@@ -580,5 +580,87 @@ impl Session {
         }
         self.file = Some(file);
         Ok(())
+    }
+}
+
+/// Creates `path` (which must not exist) and writes `bytes` into it with `write`. If the
+/// write fails the half-written file is removed, so the next attempt can create it again
+/// instead of failing with `AlreadyExists` from then on; it was created exclusively here,
+/// so nothing else is lost.
+fn create_and_write(
+    path: &Path,
+    bytes: &[u8],
+    write: impl FnOnce(&mut File, &[u8]) -> std::io::Result<()>,
+) -> anyhow::Result<()> {
+    let mut file =
+        File::create_new(path).with_context(|| format!("could not create {}", path.display()))?;
+    if let Err(error) = write(&mut file, bytes) {
+        drop(file);
+        if let Err(remove_error) = std::fs::remove_file(path) {
+            tracing::warn!(
+                path = %path.display(),
+                error = %remove_error,
+                "could not remove a partly written session file"
+            );
+        }
+        return Err(error).with_context(|| format!("could not write {}", path.display()));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_failed_first_write_leaves_no_file_behind() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.jsonl");
+        let error = create_and_write(&path, b"header\nentry\n", |file, bytes| {
+            file.write_all(&bytes[..4])?;
+            Err(std::io::Error::other("disk full"))
+        })
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("disk full"));
+        assert!(!path.exists(), "the partial file is removed");
+
+        // So the next attempt can create it.
+        create_and_write(&path, b"header\n", |file, bytes| file.write_all(bytes)).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "header\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_append_after_a_failed_one_starts_a_new_line() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.jsonl");
+        let mut session = Session::new(Some(path.clone()), Path::new("/p"), None);
+        session.append_message(AgentMessage::user("one")).unwrap();
+
+        let set_mode = |mode| {
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+        };
+        set_mode(0o444);
+        let failed = session.append_message(AgentMessage::user("two"));
+        set_mode(0o644);
+        if failed.is_ok() {
+            // Permissions are not enforced (running as root).
+            return;
+        }
+        // Stand-in for the part of the line a write that failed midway left behind.
+        OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b"{\"type\":\"mess")
+            .unwrap();
+        session.append_message(AgentMessage::user("three")).unwrap();
+
+        let reopened = Session::open(&path).unwrap();
+        let ids: Vec<&str> = reopened.entries().iter().map(|e| e.id.as_str()).collect();
+        let expected: Vec<&str> = session.entries().iter().map(|e| e.id.as_str()).collect();
+        assert_eq!(ids, expected, "the entry after the broken bytes survives");
     }
 }

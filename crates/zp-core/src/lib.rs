@@ -12,6 +12,7 @@ pub mod coding_session;
 pub mod compaction;
 pub mod credentials;
 pub mod diff;
+pub mod fs;
 pub mod git;
 pub mod logging;
 pub mod model_catalog;

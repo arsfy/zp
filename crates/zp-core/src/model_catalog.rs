@@ -17,7 +17,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use anyhow::{Context as _, Result};
+use anyhow::Result;
 use futures::future::join_all;
 use serde::{Deserialize, Serialize};
 use zp_ai::{
@@ -391,15 +391,9 @@ fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> Option<T> {
         .ok()
 }
 
-/// Writes through a temporary file so readers never see a partial file.
+/// Writes atomically so readers never see a partial file.
 fn write_json(path: &Path, value: &impl Serialize) -> Result<()> {
-    let dir = path.parent().context("cache path has no parent")?;
-    fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
-    let temp = path.with_extension(format!("json.{}.tmp", std::process::id()));
-    fs::write(&temp, serde_json::to_vec(value)?)
-        .with_context(|| format!("writing {}", temp.display()))?;
-    fs::rename(&temp, path).with_context(|| format!("replacing {}", path.display()))?;
-    Ok(())
+    crate::fs::write_atomic(path, &serde_json::to_vec(value)?)
 }
 
 #[cfg(test)]

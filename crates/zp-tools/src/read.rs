@@ -1,11 +1,12 @@
 //! `read`: file contents (text with paging, or an image attachment).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, bail};
 use base64::Engine as _;
 use futures::future::BoxFuture;
 use serde_json::{Value, json};
+use tokio::io::AsyncReadExt as _;
 use zp_agent::{AgentTool, AgentToolResult, ToolContext};
 use zp_ai::{ImageContent, UserContent};
 
@@ -14,6 +15,10 @@ use crate::truncate::{DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, format_size, truncat
 
 /// Largest image sent to the model (providers reject bigger ones).
 const MAX_IMAGE_BYTES: usize = 5 * 1024 * 1024;
+/// Largest file `read`, `edit` and `write` load into memory whole.
+const MAX_FILE_BYTES: u64 = 64 * 1024 * 1024;
+/// Bytes enough to recognize an image by [`image_mime`].
+const IMAGE_HEADER_BYTES: u64 = 12;
 
 /// Reads files relative to a working directory.
 #[derive(Clone, Debug)]
@@ -41,6 +46,43 @@ fn image_mime(bytes: &[u8]) -> Option<&'static str> {
     } else {
         None
     }
+}
+
+/// Checks, before `shown` is loaded whole, that it is a regular file (devices and FIFOs can
+/// grow without bound or block) of at most [`MAX_FILE_BYTES`].
+pub(crate) fn ensure_loadable(metadata: &std::fs::Metadata, shown: &str) -> anyhow::Result<()> {
+    if !metadata.is_file() {
+        bail!("{shown} is not a regular file; it cannot be read");
+    }
+    if metadata.len() > MAX_FILE_BYTES {
+        bail!(
+            "{shown} is {}, exceeds {} limit for loading a whole file. Use bash to work with \
+             parts of it, e.g. sed -n '1,{DEFAULT_MAX_LINES}p' {shown} or head -c {DEFAULT_MAX_BYTES} {shown}",
+            format_size(usize::try_from(metadata.len()).unwrap_or(usize::MAX)),
+            format_size(MAX_FILE_BYTES as usize)
+        );
+    }
+    Ok(())
+}
+
+/// The first bytes of `path`, enough for [`image_mime`].
+async fn read_header(path: &Path) -> std::io::Result<Vec<u8>> {
+    let mut header = Vec::new();
+    tokio::fs::File::open(path)
+        .await?
+        .take(IMAGE_HEADER_BYTES)
+        .read_to_end(&mut header)
+        .await?;
+    Ok(header)
+}
+
+/// The result for an image too large to attach.
+fn image_too_large(mime: &str, size: usize) -> AgentToolResult {
+    AgentToolResult::text(format!(
+        "Read image file [{mime}], but it is {} (limit {}); not attached.",
+        format_size(size),
+        format_size(MAX_IMAGE_BYTES)
+    ))
 }
 
 /// Heuristic used by most tools: a NUL byte in the first 8 KB.
@@ -89,18 +131,28 @@ impl AgentTool for ReadTool {
             let raw_path = args["path"].as_str().unwrap_or_default();
             let path = resolve(&self.cwd, raw_path);
             let shown = display(&self.cwd, &path);
+            let metadata = tokio::fs::metadata(&path)
+                .await
+                .with_context(|| format!("Could not read {shown}"))?;
+            ensure_loadable(&metadata, &shown)?;
+            let size = usize::try_from(metadata.len()).unwrap_or(usize::MAX);
+            if size > MAX_IMAGE_BYTES {
+                let header = read_header(&path)
+                    .await
+                    .with_context(|| format!("Could not read {shown}"))?;
+                if let Some(mime) = image_mime(&header) {
+                    return Ok(image_too_large(mime, size));
+                }
+            }
             let bytes = tokio::select! {
                 () = ctx.cancel.cancelled() => bail!("Operation aborted"),
                 bytes = tokio::fs::read(&path) => bytes.with_context(|| format!("Could not read {shown}"))?,
             };
 
             if let Some(mime) = image_mime(&bytes) {
+                // The file may have grown since its size was checked.
                 if bytes.len() > MAX_IMAGE_BYTES {
-                    return Ok(AgentToolResult::text(format!(
-                        "Read image file [{mime}], but it is {} (limit {}); not attached.",
-                        format_size(bytes.len()),
-                        format_size(MAX_IMAGE_BYTES)
-                    )));
+                    return Ok(image_too_large(mime, bytes.len()));
                 }
                 let data = base64::engine::general_purpose::STANDARD.encode(&bytes);
                 return Ok(AgentToolResult {

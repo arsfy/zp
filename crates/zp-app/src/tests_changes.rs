@@ -396,6 +396,40 @@ fn individual_edit_card_revert_protects_external_changes(cx: &mut TestAppContext
 }
 
 #[gpui::test]
+fn a_file_changed_while_asking_about_conflicts_is_left_alone(cx: &mut TestAppContext) {
+    let faux = FauxProvider::default();
+    faux.push(edit("a.txt", "one", "ONE"));
+    faux.push(FauxResponse::text("Updated the file."));
+    let _data = setup_models(cx, &[&faux], false);
+    let (_dir, project) = project_dir();
+    std::fs::write(project.join("a.txt"), "one\n").unwrap();
+    let window = open(cx, &project);
+    let conversation = active(window, cx);
+    send(window, "update the file", cx);
+    idle(&conversation, 3, cx);
+    let call = tool_calls(&conversation, cx).remove(0);
+    conversation.update(cx, |view, cx| view.toggle_tool(&call, 1, true, cx));
+    std::fs::write(project.join("a.txt"), "outside edit\n").unwrap();
+    click(window, "tool-revert", cx);
+    cx.simulate_prompt_answer("Revert");
+    cx.run_until_parked();
+    assert!(cx.has_pending_prompt());
+    std::fs::write(project.join("a.txt"), "changed while asking\n").unwrap();
+    cx.simulate_prompt_answer("Overwrite");
+    cx.run_until_parked();
+    assert_eq!(
+        read(&project, "a.txt").as_deref(),
+        Some("changed while asking\n")
+    );
+    let failure = conversation.read_with(cx, |view, _| view.failure());
+    assert!(
+        failure.as_deref().is_some_and(|f| f.contains("a.txt")),
+        "{failure:?}"
+    );
+    assert!(!conversation.read_with(cx, |view, _| view.change_log().tool_reverted(&call)));
+}
+
+#[gpui::test]
 fn partial_reverts_survive_reopening_and_skipped_files_remain_active(cx: &mut TestAppContext) {
     let faux = FauxProvider::default();
     for path in ["a.txt", "b.txt", "c.txt"] {

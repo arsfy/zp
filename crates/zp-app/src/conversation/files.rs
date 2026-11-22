@@ -405,7 +405,8 @@ impl ConversationView {
 
     /// Restores files (asking before overwriting files changed outside ZP). With
     /// `record`, the restore is added to the transcript so the model knows. Resolves to
-    /// whether it went ahead.
+    /// whether it went ahead; it fails, after recording what was restored, when a file
+    /// could not be restored or changed while the user was being asked.
     pub(super) fn restore_files(
         &mut self,
         targets: Vec<FileTarget>,
@@ -456,21 +457,36 @@ impl ConversationView {
                     _ => return Ok(false),
                 },
             };
-            let changes = plan.apply(overwrite, &blobs)?;
+            let applied = plan.apply(overwrite, &blobs);
             this.update(cx, |this, cx| {
+                // Record what was restored even when the rest failed or was skipped.
                 if let Some(record) = record {
                     coding.record_restore_with_sources(
                         &record.description,
-                        &changes,
+                        &applied.changes,
                         &record.sources,
                     )?;
                     this.reload_transcript();
-                    if !changes.is_empty() {
+                    if !applied.changes.is_empty() {
                         cx.emit(ConversationEvent::FilesRestored);
                     }
                 }
                 cx.emit(ConversationEvent::FilesChanged);
                 cx.notify();
+                if let Some(error) = applied.error {
+                    return Err(error.context("Could not restore every file"));
+                }
+                if !applied.changed_since_prepare.is_empty() {
+                    let names: Vec<String> = applied
+                        .changed_since_prepare
+                        .iter()
+                        .map(|path| this.display_path(path))
+                        .collect();
+                    anyhow::bail!(
+                        "These files changed while ZP was asking and were left as they are: {}",
+                        names.join(", ")
+                    );
+                }
                 anyhow::Ok(true)
             })?
         })

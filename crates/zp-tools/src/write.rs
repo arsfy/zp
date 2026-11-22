@@ -9,6 +9,7 @@ use zp_agent::{AgentTool, AgentToolResult, ToolContext};
 
 use crate::file_change::FileChange;
 use crate::path::{display, lock_file, resolve, slash};
+use crate::read::ensure_loadable;
 
 /// Writes files relative to a working directory.
 #[derive(Clone, Debug)]
@@ -23,8 +24,16 @@ impl WriteTool {
     }
 }
 
-/// The current text of `path`, `None` if it does not exist.
-pub(crate) async fn read_existing(path: &std::path::Path) -> anyhow::Result<Option<String>> {
+/// The current text of `path` (shown as `shown`), `None` if it does not exist.
+pub(crate) async fn read_existing(
+    path: &std::path::Path,
+    shown: &str,
+) -> anyhow::Result<Option<String>> {
+    match tokio::fs::metadata(path).await {
+        Ok(metadata) => ensure_loadable(&metadata, shown)?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    }
     match tokio::fs::read(path).await {
         Ok(bytes) => Ok(Some(String::from_utf8_lossy(&bytes).into_owned())),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
@@ -74,7 +83,7 @@ impl AgentTool for WriteTool {
             if ctx.cancel.is_cancelled() {
                 bail!("Operation aborted");
             }
-            let before = read_existing(&path)
+            let before = read_existing(&path, &shown)
                 .await
                 .with_context(|| format!("Could not read {shown}"))?;
             if let Some(dir) = path.parent() {

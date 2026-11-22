@@ -154,6 +154,76 @@ async fn read_images_and_binary_files() {
 
     let error = run(&*read, json!({"path": "blob.bin"})).await.unwrap_err();
     assert!(error.to_string().contains("binary file"));
+
+    // An image over the attachment limit is reported, not attached.
+    let mut big_png = png.to_vec();
+    big_png.resize(6 * 1024 * 1024, 0);
+    std::fs::write(dir.path().join("big.png"), big_png).unwrap();
+    let result = run(&*read, json!({"path": "big.png"})).await.unwrap();
+    assert_eq!(
+        text(&result),
+        "Read image file [image/png], but it is 6.0MB (limit 5.0MB); not attached."
+    );
+}
+
+/// Files larger than the 64 MiB load limit (sparse, so cheap to create).
+fn huge_file(dir: &Path, name: &str) {
+    let file = std::fs::File::create(dir.join(name)).unwrap();
+    file.set_len(64 * 1024 * 1024 + 1).unwrap();
+}
+
+#[tokio::test]
+async fn read_edit_and_write_refuse_huge_files_and_non_regular_files() {
+    let dir = tempfile::tempdir().unwrap();
+    huge_file(dir.path(), "huge.log");
+    std::fs::create_dir(dir.path().join("folder")).unwrap();
+    for (name, args) in [
+        ("read", json!({"path": "huge.log"})),
+        (
+            "edit",
+            json!({"path": "huge.log", "edits": [{"oldText": "a", "newText": "b"}]}),
+        ),
+        ("write", json!({"path": "huge.log", "content": "x"})),
+    ] {
+        let error = run(&*tool(name, dir.path()), args).await.unwrap_err();
+        assert!(
+            format!("{error:#}").contains(
+                "huge.log is 64.0MB, exceeds 64.0MB limit for loading a whole file. Use bash"
+            ),
+            "{name}: {error:#}"
+        );
+    }
+    assert_eq!(
+        std::fs::metadata(dir.path().join("huge.log"))
+            .unwrap()
+            .len(),
+        64 * 1024 * 1024 + 1,
+        "not overwritten"
+    );
+
+    let error = run(&*tool("read", dir.path()), json!({"path": "folder"}))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        format!("{error:#}"),
+        "folder is not a regular file; it cannot be read"
+    );
+    // Devices are not read (`/dev/zero` would never end).
+    #[cfg(unix)]
+    for (name, args) in [
+        ("read", json!({"path": "/dev/null"})),
+        (
+            "edit",
+            json!({"path": "/dev/null", "edits": [{"oldText": "a", "newText": "b"}]}),
+        ),
+        ("write", json!({"path": "/dev/null", "content": "x"})),
+    ] {
+        let error = run(&*tool(name, dir.path()), args).await.unwrap_err();
+        assert!(
+            format!("{error:#}").contains("/dev/null is not a regular file"),
+            "{name}: {error:#}"
+        );
+    }
 }
 
 // ----- write / edit ----------------------------------------------------------------------

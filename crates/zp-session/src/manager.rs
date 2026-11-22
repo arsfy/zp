@@ -180,8 +180,13 @@ impl SessionManager {
     }
 
     /// Sessions of `cwd`, most recently active first. Unreadable files are skipped.
+    ///
+    /// Different directories can share a project directory (`/a-b` and `/a/b` both
+    /// encode to `--a-b--`), so only sessions whose header names `cwd` are listed.
     pub fn list(&self, cwd: &Path) -> anyhow::Result<Vec<SessionInfo>> {
-        list_dir(&self.project_dir(cwd))
+        let mut sessions = list_dir(&self.project_dir(cwd))?;
+        sessions.retain(|info| Path::new(&info.cwd) == cwd);
+        Ok(sessions)
     }
 
     /// Sessions of every project, most recently active first.

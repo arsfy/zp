@@ -71,19 +71,16 @@ pub fn apply_edits(raw: &str, edits: &[EditSpec], path: &str) -> Result<String, 
     } else {
         normalized.clone()
     };
-    let fuzzy_base = if used_fuzzy {
-        base.clone()
-    } else {
-        fuzzy(&base)
-    };
 
     let mut matched = Vec::with_capacity(total);
     for (i, edit) in edits.iter().enumerate() {
         let fuzzy_old = fuzzy(&edit.old_text);
-        let (start, len) = match base.find(&edit.old_text) {
-            Some(start) => (start, edit.old_text.len()),
-            None => match base.find(&fuzzy_old) {
-                Some(start) => (start, fuzzy_old.len()),
+        // Uniqueness is judged by the needle that actually matched.
+        let (start, needle) = match base.find(&edit.old_text) {
+            Some(start) => (start, edit.old_text.as_str()),
+            // Whitespace-only text normalizes to nothing, which would match anywhere.
+            None => match base.find(&fuzzy_old).filter(|_| !fuzzy_old.is_empty()) {
+                Some(start) => (start, fuzzy_old.as_str()),
                 None => {
                     return Err(if total == 1 {
                         format!(
@@ -99,7 +96,8 @@ pub fn apply_edits(raw: &str, edits: &[EditSpec], path: &str) -> Result<String, 
                 }
             },
         };
-        let occurrences = fuzzy_base.matches(fuzzy_old.as_str()).count();
+        let len = needle.len();
+        let occurrences = base.matches(needle).count();
         if occurrences > 1 {
             return Err(format!(
                 "Found {occurrences} occurrences of {} in {path}. {} must be unique. Please \
@@ -374,6 +372,30 @@ mod tests {
                 .contains("overlap")
         );
         assert!(apply_edits(file, &[], "f").is_err());
+    }
+
+    #[test]
+    fn uniqueness_counts_the_text_that_matched() {
+        // Exactly unique, though the lines are equal once trailing whitespace is ignored.
+        assert_eq!(
+            apply_edits("a  \na\n", &[edit("a  ", "b")], "f").unwrap(),
+            "b\na\n"
+        );
+        assert_eq!(
+            apply_edits(
+                "s = \u{201C}x\u{201D}\ns = \"x\"\n",
+                &[edit("s = \"x\"", "t")],
+                "f"
+            )
+            .unwrap(),
+            "s = \u{201C}x\u{201D}\nt\n"
+        );
+        // Whitespace-only text that is not in the file is not found (not "Found N").
+        assert!(
+            apply_edits("x = 1\n", &[edit("   ", "y")], "f")
+                .unwrap_err()
+                .starts_with("Could not find the exact text in f.")
+        );
     }
 
     #[test]

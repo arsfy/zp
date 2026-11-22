@@ -132,22 +132,24 @@ impl AppSettings {
             .unwrap_or_default()
     }
 
-    /// Changes the settings, saves them and applies them to the running app.
+    /// Changes the settings, saves them and applies them to the running app. Nothing
+    /// changes when they cannot be saved, or when the file cannot be read: writing what is
+    /// in memory over a hand-edited file with a mistake would silently drop the edits.
     pub fn update(cx: &mut App, change: impl FnOnce(&mut Settings)) -> anyhow::Result<()> {
-        let this = cx.global_mut::<Self>();
+        let this = cx.global::<Self>();
         // Pick up edits made to the file meanwhile.
-        if let Some(path) = &this.path
-            && let Ok(current) = Settings::load(path)
-        {
-            this.settings = current;
-        }
-        change(&mut this.settings);
-        let result = match &this.path {
-            Some(path) => this.settings.save(path),
-            None => Ok(()),
+        let mut settings = match &this.path {
+            Some(path) => Settings::load(path)
+                .map_err(|error| anyhow::anyhow!("{error:#}. Fix it first; nothing was changed"))?,
+            None => this.settings.clone(),
         };
+        change(&mut settings);
+        if let Some(path) = &this.path {
+            settings.save(path)?;
+        }
+        cx.global_mut::<Self>().settings = settings;
         crate::apply_settings(cx);
-        result
+        Ok(())
     }
 }
 

@@ -79,6 +79,29 @@ pub struct PlannedFile {
     current: Option<Arc<str>>,
 }
 
+impl PlannedFile {
+    /// Whether the disk still has what [`RestorePlan::prepare`] saw. A file that was not
+    /// readable as text then counts as unchanged while it still is not.
+    fn unchanged_since_prepare(&self) -> bool {
+        let unreadable = self.outcome == Outcome::Conflict(ConflictKind::Unreadable);
+        match read_current(&self.path) {
+            Ok(current) => !unreadable && current.as_deref() == self.current.as_deref(),
+            Err(()) => unreadable,
+        }
+    }
+}
+
+/// What [`RestorePlan::apply`] did.
+#[derive(Debug, Default)]
+pub struct AppliedRestore {
+    /// The changes made, recorded in the store (including those made before an error).
+    pub changes: Vec<RecordedChange>,
+    /// Files left as they are because they changed after the plan was prepared.
+    pub changed_since_prepare: Vec<PathBuf>,
+    /// What stopped the restore; later files were not touched.
+    pub error: Option<anyhow::Error>,
+}
+
 /// Restores checked against the disk, ready to apply.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RestorePlan {
@@ -125,53 +148,64 @@ impl RestorePlan {
         self.files.iter().all(|file| file.action == Action::Keep)
     }
 
-    /// Writes the plan; conflicts are overwritten only if `overwrite_conflicts`. Returns
-    /// the changes made, recorded in `store`.
-    pub fn apply(
-        &self,
-        overwrite_conflicts: bool,
-        store: &BlobStore,
-    ) -> anyhow::Result<Vec<RecordedChange>> {
-        let mut changes = Vec::new();
+    /// Writes the plan; conflicts are overwritten only if `overwrite_conflicts`. A file
+    /// that changed since [`Self::prepare`] (e.g. while the user was asked about
+    /// conflicts) is left alone and reported. Stops at the first error, still returning
+    /// the changes made until then.
+    pub fn apply(&self, overwrite_conflicts: bool, store: &BlobStore) -> AppliedRestore {
+        let mut applied = AppliedRestore::default();
         for file in &self.files {
-            if matches!(file.outcome, Outcome::Conflict(_)) && !overwrite_conflicts {
+            let skipped_conflict =
+                matches!(file.outcome, Outcome::Conflict(_)) && !overwrite_conflicts;
+            if skipped_conflict || file.action == Action::Keep {
                 continue;
             }
-            let after = match &file.action {
-                Action::Keep => continue,
-                Action::Write(text) => {
-                    if let Some(dir) = file.path.parent() {
-                        std::fs::create_dir_all(dir)
-                            .with_context(|| format!("could not create {}", dir.display()))?;
-                    }
-                    std::fs::write(&file.path, text.as_bytes())
-                        .with_context(|| format!("could not write {}", file.path.display()))?;
-                    Some(text.as_ref())
+            if !file.unchanged_since_prepare() {
+                applied.changed_since_prepare.push(file.path.clone());
+                continue;
+            }
+            match apply_file(file, store) {
+                Ok(Some(change)) => applied.changes.push(change),
+                Ok(None) => {}
+                Err(error) => {
+                    applied.error = Some(error);
+                    break;
                 }
-                Action::Delete => {
-                    match std::fs::remove_file(&file.path) {
-                        Ok(()) => {}
-                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                        Err(error) => {
-                            return Err(error).with_context(|| {
-                                format!("could not delete {}", file.path.display())
-                            });
-                        }
-                    }
-                    None
-                }
-            };
-            if file.current.as_deref() != after {
-                changes.push(RecordedChange::store(
-                    store,
-                    &file.path,
-                    file.current.as_deref(),
-                    after,
-                )?);
             }
         }
-        Ok(changes)
+        applied
     }
+}
+
+/// Applies the action of `file`, returning the change made (recorded in `store`).
+fn apply_file(file: &PlannedFile, store: &BlobStore) -> anyhow::Result<Option<RecordedChange>> {
+    let after = match &file.action {
+        Action::Keep => return Ok(None),
+        Action::Write(text) => {
+            if let Some(dir) = file.path.parent() {
+                std::fs::create_dir_all(dir)
+                    .with_context(|| format!("could not create {}", dir.display()))?;
+            }
+            std::fs::write(&file.path, text.as_bytes())
+                .with_context(|| format!("could not write {}", file.path.display()))?;
+            Some(text.as_ref())
+        }
+        Action::Delete => {
+            match std::fs::remove_file(&file.path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(error)
+                        .with_context(|| format!("could not delete {}", file.path.display()));
+                }
+            }
+            None
+        }
+    };
+    if file.current.as_deref() == after {
+        return Ok(None);
+    }
+    RecordedChange::store(store, &file.path, file.current.as_deref(), after).map(Some)
 }
 
 /// The file's text; `Ok(None)` when it does not exist, `Err` when it is not text.
@@ -344,6 +378,12 @@ mod tests {
         }
     }
 
+    fn applied_cleanly(applied: AppliedRestore) -> Vec<RecordedChange> {
+        assert!(applied.error.is_none(), "{:?}", applied.error);
+        assert!(applied.changed_since_prepare.is_empty());
+        applied.changes
+    }
+
     #[test]
     fn clean_merged_and_conflicting_restores() {
         let dir = tempfile::tempdir().unwrap();
@@ -397,7 +437,7 @@ mod tests {
         );
         assert_eq!(plan.conflicts().count(), 2);
 
-        let changes = plan.apply(false, &store).unwrap();
+        let changes = applied_cleanly(plan.apply(false, &store));
         let read = |name: &str| std::fs::read_to_string(path(name)).ok();
         assert_eq!(read("clean").as_deref(), Some("old\n"));
         assert_eq!(
@@ -418,7 +458,7 @@ mod tests {
         // Overwriting applies the conflicts too.
         let plan = RestorePlan::prepare(&targets, &store).unwrap();
         assert_eq!(plan.conflicts().count(), 2);
-        plan.apply(true, &store).unwrap();
+        applied_cleanly(plan.apply(true, &store));
         assert_eq!(read("conflict").as_deref(), Some("original\n"));
         assert_eq!(read("deleted").as_deref(), Some("original\n"));
         assert!(RestorePlan::prepare(&targets, &store).unwrap().is_noop());
@@ -480,6 +520,73 @@ mod tests {
         assert_eq!(
             plan.files[1].outcome,
             Outcome::Conflict(ConflictKind::Created)
+        );
+    }
+
+    #[test]
+    fn files_changed_after_prepare_are_left_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = BlobStore::in_memory();
+        let edited = dir.path().join("edited");
+        let untouched = dir.path().join("untouched");
+        std::fs::write(&edited, "new\n").unwrap();
+        std::fs::write(&untouched, "new\n").unwrap();
+        let plan = RestorePlan::prepare(
+            &[
+                target(&store, &edited, Some("new\n"), Some("old\n")),
+                target(&store, &untouched, Some("new\n"), Some("old\n")),
+            ],
+            &store,
+        )
+        .unwrap();
+        // E.g. while the user was asked about conflicts.
+        std::fs::write(&edited, "edited meanwhile\n").unwrap();
+
+        let applied = plan.apply(true, &store);
+        assert!(applied.error.is_none());
+        assert_eq!(applied.changed_since_prepare, std::slice::from_ref(&edited));
+        assert_eq!(
+            std::fs::read_to_string(&edited).unwrap(),
+            "edited meanwhile\n"
+        );
+        assert_eq!(std::fs::read_to_string(&untouched).unwrap(), "old\n");
+        assert_eq!(applied.changes.len(), 1);
+        assert_eq!(applied.changes[0].path, untouched);
+    }
+
+    #[test]
+    fn an_error_keeps_the_changes_made_before_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = BlobStore::in_memory();
+        let first = dir.path().join("first");
+        let last = dir.path().join("last");
+        std::fs::write(&first, "new\n").unwrap();
+        std::fs::write(&last, "new\n").unwrap();
+        std::fs::write(dir.path().join("blocker"), "a file, not a directory\n").unwrap();
+        let blocked = dir.path().join("blocker/inside");
+        let plan = RestorePlan::prepare(
+            &[
+                target(&store, &first, Some("new\n"), Some("old\n")),
+                target(&store, &blocked, None, Some("old\n")),
+                target(&store, &last, Some("new\n"), Some("old\n")),
+            ],
+            &store,
+        )
+        .unwrap();
+
+        let applied = plan.apply(true, &store);
+        assert!(applied.error.is_some());
+        assert_eq!(
+            applied.changes.len(),
+            1,
+            "the restored file is still reported"
+        );
+        assert_eq!(applied.changes[0].path, first);
+        assert_eq!(std::fs::read_to_string(&first).unwrap(), "old\n");
+        assert_eq!(
+            std::fs::read_to_string(&last).unwrap(),
+            "new\n",
+            "files after the error are not touched"
         );
     }
 }

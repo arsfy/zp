@@ -282,6 +282,35 @@ fn manager_lists_finds_and_forks() {
 }
 
 #[test]
+fn projects_sharing_a_directory_list_only_their_own_sessions() {
+    let root = tempfile::tempdir().unwrap();
+    let manager = SessionManager::new(root.path());
+    let dashed = Path::new("/x/a-b");
+    let nested = Path::new("/x/a/b");
+    assert_eq!(manager.project_dir(dashed), manager.project_dir(nested));
+
+    let mut first = manager.create(dashed);
+    first.append_message(AgentMessage::user("dashed")).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    let mut second = manager.create(nested);
+    second.append_message(AgentMessage::user("nested")).unwrap();
+
+    let ids = |cwd: &Path| -> Vec<String> {
+        manager
+            .list(cwd)
+            .unwrap()
+            .into_iter()
+            .map(|info| info.id)
+            .collect()
+    };
+    assert_eq!(ids(dashed), [first.id()]);
+    assert_eq!(ids(nested), [second.id()]);
+    assert_eq!(manager.continue_recent(dashed).unwrap().id(), first.id());
+    assert!(manager.find(nested, &first.id()[..13]).unwrap().is_none());
+    assert_eq!(manager.list_all().unwrap().len(), 2);
+}
+
+#[test]
 fn context_entry_ids_and_latest_leaves() {
     let mut session = Session::in_memory(Path::new("/p"));
     let u1 = session.append_message(AgentMessage::user("u1")).unwrap();

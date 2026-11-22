@@ -10,6 +10,7 @@ use zp_agent::{AgentTool, AgentToolResult, ToolContext};
 use crate::edit_apply::{EditSpec, apply_edits};
 use crate::file_change::FileChange;
 use crate::path::{display, lock_file, resolve, slash};
+use crate::read::ensure_loadable;
 
 /// Edits files relative to a working directory.
 #[derive(Clone, Debug)]
@@ -140,6 +141,10 @@ impl AgentTool for EditTool {
             if ctx.cancel.is_cancelled() {
                 bail!("Operation aborted");
             }
+            let metadata = tokio::fs::metadata(&path)
+                .await
+                .with_context(|| format!("Could not edit file: {shown}"))?;
+            ensure_loadable(&metadata, &shown)?;
             let bytes = tokio::fs::read(&path)
                 .await
                 .with_context(|| format!("Could not edit file: {shown}"))?;

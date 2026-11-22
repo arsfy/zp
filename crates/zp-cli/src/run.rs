@@ -35,7 +35,8 @@ pub(crate) struct RunArgs {
     /// Reasoning level: off, minimal, low, medium, high, xhigh, max.
     #[arg(short, long)]
     thinking: Option<ThinkingLevel>,
-    /// Continue the most recent session of the project.
+    /// Continue the most recent session of the project. Sessions are not locked: do not
+    /// continue the same session in two places (another zp-cli or the app) at once.
     #[arg(short = 'c', long = "continue", conflicts_with_all = ["resume", "no_session"])]
     continue_session: bool,
     /// Resume a session by id prefix or file path (see `zp-cli sessions`).
