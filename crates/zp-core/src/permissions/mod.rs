@@ -1086,13 +1086,13 @@ mod tests {
     #[test]
     fn edit_modes_only_run_routine_git_and_echo_writes_in_the_project() {
         let dir = tempfile::tempdir().unwrap();
-        let root = canonical(dir.path()).join("project");
+        let base = canonical(dir.path());
+        let root = base.join("project");
         std::fs::create_dir_all(root.join("sub")).unwrap();
-        let scratch = tempfile::tempdir().unwrap();
-        let temp = canonical(scratch.path());
-        let outside = canonical(dir.path()).join("outside.txt");
+        let temp = base.join("scratch");
+        std::fs::create_dir(&temp).unwrap();
         #[cfg(unix)]
-        std::os::unix::fs::symlink(&outside, root.join("link")).unwrap();
+        std::os::unix::fs::symlink(base.join("outside.txt"), root.join("link")).unwrap();
         let grants = Grants::default();
         let routine = [
             "git status".to_owned(),
@@ -1107,8 +1107,11 @@ mod tests {
             "echo hello > notes.txt".to_owned(),
             "echo hello >> ./sub/notes.txt 2>&1".to_owned(),
             "echo hello > sub/../notes.txt".to_owned(),
-            format!("echo hello > {}", root.join("abs.txt").display()),
-            format!("echo scratch > {}", temp.join("out.txt").display()),
+            "echo scratch > ../scratch/out.txt".to_owned(),
+            #[cfg(unix)]
+            format!("echo hello > {:?}", root.join("abs.txt")),
+            #[cfg(unix)]
+            format!("echo scratch > {:?}", temp.join("out.txt")),
             "echo quiet > /dev/null".to_owned(),
         ];
         let not_routine = [
