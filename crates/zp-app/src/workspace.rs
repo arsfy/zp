@@ -122,9 +122,7 @@ fn placement(
             .or_else(|| cx.primary_display());
         if let Some(display) = display {
             let bounds = bounds_of(geometry);
-            let area = Bounds::new(point(px(0.0), px(0.0)), display.bounds().size);
-            let visible = bounds.intersect(&area);
-            if visible.size.width >= px(100.0) && visible.size.height >= px(100.0) {
+            if shows_enough_of(bounds, display.bounds()) {
                 let window_bounds = match geometry.mode {
                     WindowMode::Windowed => WindowBounds::Windowed(bounds),
                     WindowMode::Maximized => WindowBounds::Maximized(bounds),
@@ -138,6 +136,14 @@ fn placement(
     let offset = px(CASCADE * (cascade_index % 8) as f32);
     bounds.origin = point(bounds.origin.x + offset, bounds.origin.y + offset);
     (WindowBounds::Windowed(bounds), None)
+}
+
+/// Whether at least 100×100 of a window at `bounds` lies on a display at `display`.
+/// Both come from GPUI in the same coordinates: per display on macOS and X11 (the display's
+/// origin is zero there), global on Windows, where a secondary display's origin is not.
+fn shows_enough_of(bounds: Bounds<gpui::Pixels>, display: Bounds<gpui::Pixels>) -> bool {
+    let visible = bounds.intersect(&display);
+    visible.size.width >= px(100.0) && visible.size.height >= px(100.0)
 }
 
 /// The current geometry of `window`.
@@ -497,5 +503,33 @@ pub fn apply_permissions(cx: &mut App) {
                 project.update(cx, |view, cx| view.apply_permissions(cx));
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use gpui::{Bounds, point, px, size};
+
+    use super::shows_enough_of;
+
+    fn rect(x: f32, y: f32, width: f32, height: f32) -> Bounds<gpui::Pixels> {
+        Bounds::new(point(px(x), px(y)), size(px(width), px(height)))
+    }
+
+    #[test]
+    fn windows_are_placed_on_displays_with_a_nonzero_origin() {
+        // Windows: a secondary display right of the primary and one left of it, in global
+        // coordinates like the windows on them.
+        let right = rect(1920.0, 0.0, 2560.0, 1440.0);
+        let left = rect(-1920.0, -200.0, 1920.0, 1080.0);
+        assert!(shows_enough_of(rect(2200.0, 100.0, 1200.0, 800.0), right));
+        assert!(shows_enough_of(rect(-1500.0, 0.0, 1200.0, 800.0), left));
+        // Mostly off the display.
+        assert!(!shows_enough_of(rect(4450.0, 100.0, 1200.0, 800.0), right));
+        assert!(!shows_enough_of(rect(100.0, 100.0, 1200.0, 800.0), right));
+        // macOS and X11: displays and windows are relative to the display.
+        let display = rect(0.0, 0.0, 1512.0, 982.0);
+        assert!(shows_enough_of(rect(40.0, 40.0, 1200.0, 800.0), display));
+        assert!(!shows_enough_of(rect(1450.0, 40.0, 1200.0, 800.0), display));
     }
 }
