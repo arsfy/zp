@@ -288,6 +288,232 @@ fn git_arguments(words: &[String]) -> &[String] {
     args
 }
 
+/// Git subcommands the edit modes run without asking: they inspect or change the local
+/// repository in recoverable ways. Their destructive forms (`reset --hard`, `branch -D`, …)
+/// are still caught by [`segment_danger`]; anything else (`rebase`, `filter-branch`,
+/// `gc`, …) needs approval or review.
+const ROUTINE_GIT: [&str; 47] = [
+    "add",
+    "am",
+    "apply",
+    "bisect",
+    "blame",
+    "branch",
+    "cat-file",
+    "check-ignore",
+    "checkout",
+    "cherry-pick",
+    "clone",
+    "commit",
+    "config",
+    "describe",
+    "diff",
+    "diff-tree",
+    "fetch",
+    "for-each-ref",
+    "grep",
+    "help",
+    "init",
+    "log",
+    "ls-files",
+    "ls-remote",
+    "ls-tree",
+    "merge",
+    "merge-base",
+    "mv",
+    "name-rev",
+    "notes",
+    "pull",
+    "reflog",
+    "remote",
+    "reset",
+    "restore",
+    "rev-list",
+    "rev-parse",
+    "revert",
+    "rm",
+    "shortlog",
+    "show",
+    "show-ref",
+    "stash",
+    "status",
+    "switch",
+    "tag",
+    "version",
+];
+
+/// Git's global options that change nothing but output or where it runs (`-C dir`).
+/// Others (`-c`, `--config-env`, `--exec-path`, `--git-dir`, …) can make Git run any
+/// program or touch another repository, so they need approval or review.
+const HARMLESS_GIT_OPTIONS: [&str; 9] = [
+    "--no-pager",
+    "-P",
+    "-p",
+    "--paginate",
+    "--literal-pathspecs",
+    "--glob-pathspecs",
+    "--noglob-pathspecs",
+    "--icase-pathspecs",
+    "--no-optional-locks",
+];
+
+/// Subcommand options that run another program, set configuration or write files
+/// elsewhere (`clone --upload-pack=…`, `clone --config core.hooksPath=…`, `diff --output`).
+const GIT_PROGRAM_OPTIONS: [&str; 5] = [
+    "--upload-pack",
+    "--receive-pack",
+    "--exec",
+    "--config",
+    "--output",
+];
+
+/// Whether `segment` is a Git command the edit modes run without asking: a routine
+/// subcommand, called directly (environment assignments such as `GIT_CONFIG_*` or
+/// `GIT_PAGER` could run any program), without options that change its configuration or
+/// run other programs.
+fn routine_git(segment: &Segment) -> bool {
+    let words = command_words(segment);
+    if words.len() != segment.words.len() || program(words) != Some("git") {
+        return false;
+    }
+    let mut args = &words[1..];
+    while let Some(option) = args.first().filter(|option| option.starts_with('-')) {
+        args = match option.as_str() {
+            "-C" => match args.get(2..) {
+                Some(rest) => rest,
+                None => return false,
+            },
+            option if HARMLESS_GIT_OPTIONS.contains(&option) => &args[1..],
+            _ => return false,
+        };
+    }
+    let Some((subcommand, rest)) = args.split_first() else {
+        // Plain `git` prints its help.
+        return true;
+    };
+    let option_named = |names: &[&str]| {
+        rest.iter().any(|arg| {
+            let name = arg.split_once('=').map_or(arg.as_str(), |(name, _)| name);
+            names.contains(&name)
+        })
+    };
+    ROUTINE_GIT.contains(&subcommand.as_str())
+        && !option_named(&GIT_PROGRAM_OPTIONS)
+        && match subcommand.as_str() {
+            "commit" => !option_named(&["--amend"]),
+            // `-c` / `-u` of clone are `--config` / `--upload-pack`.
+            "clone" => !rest.iter().any(|arg| short_flag(arg, "cu")),
+            // Settings like `core.pager` or aliases run programs later: only reading.
+            "config" => git_config_reads(rest),
+            _ => true,
+        }
+}
+
+/// Whether `arg` is a short option cluster containing one of `letters`.
+fn short_flag(arg: &str, letters: &str) -> bool {
+    arg.strip_prefix('-')
+        .is_some_and(|flags| !flags.starts_with('-') && flags.chars().any(|f| letters.contains(f)))
+}
+
+/// Whether `git config <args>` only reads settings.
+fn git_config_reads(args: &[String]) -> bool {
+    let reads = args.iter().any(|arg| {
+        matches!(
+            arg.split_once('=').map_or(arg.as_str(), |(name, _)| name),
+            "--get"
+                | "--get-all"
+                | "--get-regexp"
+                | "--get-urlmatch"
+                | "--get-color"
+                | "--get-colorbool"
+                | "--list"
+                | "-l"
+        )
+    }) || matches!(
+        args.iter()
+            .find(|arg| !arg.starts_with('-'))
+            .map(String::as_str),
+        Some("get" | "list")
+    );
+    let writes = args.iter().any(|arg| {
+        matches!(
+            arg.as_str(),
+            "--add"
+                | "--unset"
+                | "--unset-all"
+                | "--replace-all"
+                | "--edit"
+                | "-e"
+                | "--rename-section"
+                | "--remove-section"
+        )
+    });
+    reads && !writes
+}
+
+/// Whether `git config <args>` writes settings outside the project's repository.
+fn git_config_writes_elsewhere(args: &[&str]) -> bool {
+    let owned: Vec<String> = args.iter().map(|arg| (*arg).to_owned()).collect();
+    !git_config_reads(&owned)
+        && args.iter().any(|arg| {
+            matches!(
+                arg.split_once('=').map_or(*arg, |(name, _)| name),
+                "--global" | "--system" | "--file" | "-f" | "--blob"
+            )
+        })
+}
+
+/// Whether `segment` is an `echo` whose redirections all read or write literal paths
+/// inside `roots` (the project first, then temporary directories). Relative paths resolve
+/// against `cwd`; without it (the command changed directory) only absolute ones qualify.
+fn echo_within(segment: &Segment, cwd: Option<&Path>, roots: &[PathBuf]) -> bool {
+    if program(command_words(segment)) != Some("echo") {
+        return false;
+    }
+    let mut words = segment.words.iter();
+    while let Some(word) = words.next() {
+        let operator_len = word
+            .find(|c: char| !matches!(c, '<' | '>' | '&' | '|'))
+            .unwrap_or(word.len());
+        let operator = &word[..operator_len];
+        if !operator.contains(['<', '>']) {
+            continue;
+        }
+        let target = match &word[operator_len..] {
+            "" => match words.next() {
+                Some(target) => target.as_str(),
+                None => return false,
+            },
+            glued => glued,
+        };
+        let descriptor = target == "-" || target.chars().all(|c| c.is_ascii_digit());
+        if operator.ends_with('&') && descriptor
+            || matches!(target, "/dev/null" | "/dev/stdout" | "/dev/stderr")
+        {
+            continue;
+        }
+        // Expansions make the target unknowable.
+        if target.is_empty() || target.contains(['$', '`', '*', '?', '[', '{', '~']) {
+            return false;
+        }
+        let absolute = Path::new(target).is_absolute();
+        let Some(path) = (match cwd {
+            Some(cwd) => literal_path(cwd, target),
+            None if absolute => literal_path(Path::new("/"), target),
+            None => None,
+        }) else {
+            return false;
+        };
+        if !roots
+            .iter()
+            .any(|root| removal_target_in_workspace(&path, root))
+        {
+            return false;
+        }
+    }
+    true
+}
+
 /// Programs whose first argument is a subcommand (`git status`, `cargo test`).
 const WITH_SUBCOMMANDS: [&str; 30] = [
     "git",
@@ -510,10 +736,19 @@ pub(super) enum CommandAssessment {
     Dangerous(String),
 }
 
-/// Applies the shell rules, treating verified removals inside `removable` (the project
-/// first, where commands start, then temporary directories) as edits.
-pub(super) fn assess(command: &str, allowed: &[String], removable: &[&Path]) -> CommandAssessment {
+/// Applies the shell rules. `edit_roots` is where the edit modes may change files (the
+/// project first, where commands start, then temporary directories; empty in other
+/// modes): verified removals and `echo` redirections there count as edits, and routine
+/// Git commands run too.
+pub(super) fn assess(command: &str, allowed: &[String], edit_roots: &[&Path]) -> CommandAssessment {
+    let removable = edit_roots;
     let parsed = split(command);
+    let edit_roots: Vec<PathBuf> = edit_roots
+        .iter()
+        .filter_map(|root| root.canonicalize().ok())
+        .collect();
+    // Relative redirections resolve against the project until a command changes directory.
+    let mut echo_cwd = edit_roots.first().cloned();
     let checks_removals = !parsed.compound
         && parsed
             .segments
@@ -545,7 +780,15 @@ pub(super) fn assess(command: &str, allowed: &[String], removable: &[&Path]) -> 
         if let Some(reason) = segment_danger(segment) {
             return CommandAssessment::Dangerous(reason);
         }
-        if !segment_allowed(segment, allowed) {
+        let edit_allowed = !edit_roots.is_empty()
+            && (routine_git(segment) || echo_within(segment, echo_cwd.as_deref(), &edit_roots));
+        if matches!(
+            program(command_words(segment)),
+            Some("cd" | "pushd" | "popd")
+        ) {
+            echo_cwd = None;
+        }
+        if !edit_allowed && !segment_allowed(segment, allowed) {
             needs_approval = true;
             if let Some(prefix) = prefix(segment)
                 && !prefixes.contains(&prefix)
@@ -732,6 +975,9 @@ fn segment_danger(segment: &Segment) -> Option<String> {
         }
         "git" => match args.first().copied() {
             Some("push") => Some("pushes to a remote repository"),
+            Some("config") if git_config_writes_elsewhere(&args[1..]) => {
+                Some("changes Git settings outside the project")
+            }
             Some("reset") if has("--hard") => Some("discards local changes"),
             Some("clean") => Some("deletes untracked files"),
             Some("checkout") if has("--") || has(".") || has_short('f') || has("--force") => {

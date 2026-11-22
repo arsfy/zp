@@ -198,8 +198,30 @@ async fn edit_modes_allow_echo_writes_and_local_git_but_still_ask_for_push() {
     for mode in [PermissionMode::AutoEdit, PermissionMode::AutoReview] {
         let project = tempfile::tempdir().unwrap();
         let root = project.path().canonicalize().unwrap();
+        // The repository and its identity are set up outside the agent: `git -c …` and
+        // config writes are not routine (they can make Git run other programs).
+        let git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&root)
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?}");
+        };
+        git(&["init", "-q", "--template="]);
+        for (key, value) in [
+            ("user.name", "Test"),
+            ("user.email", "test@example.com"),
+            ("commit.gpgsign", "false"),
+            ("core.hooksPath", "/dev/null"),
+        ] {
+            git(&["config", key, value]);
+        }
         let faux = FauxProvider::default();
-        faux.push(call("bash", json!({"command": "git init -q --template= && echo first>note.txt && echo second>>note.txt && git add note.txt && git -c user.name=Test -c user.email=test@example.com -c commit.gpgsign=false -c core.hooksPath=/dev/null commit -qm initial"})));
+        faux.push(call(
+            "bash",
+            json!({"command": "echo first>note.txt && echo second>>note.txt && git add note.txt && git commit -qm initial"}),
+        ));
         faux.push(call(
             "bash",
             json!({"command": "git -C . push origin main"}),

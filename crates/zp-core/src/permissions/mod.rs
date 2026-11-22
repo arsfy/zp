@@ -54,10 +54,10 @@ impl PermissionMode {
                 "Approve commands and file changes; read-only commands and echo output run automatically"
             }
             Self::AutoEdit => {
-                "Auto-approve file changes, echo writes and non-destructive Git operations"
+                "Auto-approve file changes, echo writes in the project, Python scripts and routine local Git operations"
             }
             Self::AutoReview => {
-                "Auto-approve file changes; a review model checks other commands; destructive ones need you"
+                "Like auto-approve edits; a review model checks other commands; destructive ones need you"
             }
             Self::FullAuto => "Everything runs without asking",
         }
@@ -413,8 +413,11 @@ impl PermissionPolicy {
                         .chain(&grants.commands)
                         .cloned()
                         .collect();
+                    // Routine Git commands and echo writes in the project are recognized by
+                    // `shell::assess`, not by prefix: a prefix would let any Git option or
+                    // redirection through.
                     if edits {
-                        allowed.extend(["git", "echo", "python", "python3"].map(str::to_owned));
+                        allowed.extend(["python", "python3"].map(str::to_owned));
                     }
                     let removable: Vec<&Path> = if edits {
                         std::iter::once(self.root.as_path())
@@ -1074,6 +1077,123 @@ mod tests {
                     evaluation,
                     Evaluation::Ask { .. } | Evaluation::Review { .. }
                 ));
+            }
+        }
+    }
+
+    /// Routine Git and echo writes in the project run in the edit modes; Git that can run
+    /// other programs or change settings, and writes outside the project, do not.
+    #[test]
+    fn edit_modes_only_run_routine_git_and_echo_writes_in_the_project() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = canonical(dir.path()).join("project");
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        let scratch = tempfile::tempdir().unwrap();
+        let temp = canonical(scratch.path());
+        let outside = canonical(dir.path()).join("outside.txt");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&outside, root.join("link")).unwrap();
+        let grants = Grants::default();
+        let routine = [
+            "git status".to_owned(),
+            "git add -u && git commit -m 'update'".to_owned(),
+            "git -C sub diff".to_owned(),
+            "git --no-pager log -5".to_owned(),
+            "git config --get user.name".to_owned(),
+            "git config --global --get user.email".to_owned(),
+            "git config list".to_owned(),
+            "git clone https://example.com/repo.git".to_owned(),
+            "git fetch origin && git merge origin/main".to_owned(),
+            "echo hello > notes.txt".to_owned(),
+            "echo hello >> ./sub/notes.txt 2>&1".to_owned(),
+            "echo hello > sub/../notes.txt".to_owned(),
+            format!("echo hello > {}", root.join("abs.txt").display()),
+            format!("echo scratch > {}", temp.join("out.txt").display()),
+            "echo quiet > /dev/null".to_owned(),
+        ];
+        let not_routine = [
+            // Configuration and options that make Git run any program.
+            "git -c alias.p=push p",
+            "git -c core.pager='sh -c whoami' log",
+            "git --config-env=core.pager=EVIL log",
+            "git --exec-path=/tmp/evil status",
+            "git --git-dir=/elsewhere/.git status",
+            "GIT_PAGER='sh -c whoami' git log",
+            "env GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.pager git log",
+            "git config core.pager 'sh -c whoami'",
+            "git config alias.p push",
+            "git clone -u 'sh -c whoami' https://example.com/repo.git",
+            "git clone --upload-pack='sh -c whoami' https://example.com/repo.git",
+            "git clone -c core.hooksPath=/tmp/hooks https://example.com/repo.git",
+            "git fetch --upload-pack=evil origin",
+            "git diff --output=/etc/motd",
+            // History rewriting.
+            "git rebase -i HEAD~3",
+            "git filter-branch --tree-filter true",
+            "git commit --amend -m changed",
+            // Writes outside the project.
+            "echo x >> ~/.zshrc",
+            "echo x > /etc/motd",
+            "echo x > ../outside.txt",
+            "echo x > $HOME/file",
+            "echo x > *.txt",
+            "cd /tmp && echo x > file",
+            #[cfg(unix)]
+            "echo x > link",
+        ];
+        let dangerous = [
+            "git config --global core.editor vim",
+            "git config --system core.pager less",
+            "git config --file /tmp/config user.name x",
+            "git -c alias.x=status push",
+        ];
+        for mode in PermissionMode::ALL {
+            let policy = PermissionPolicy {
+                mode,
+                root: root.clone(),
+                temp_directories: vec![temp.clone()],
+                ..PermissionPolicy::default()
+            };
+            let evaluate =
+                |command: &str| policy.evaluate("bash", &json!({ "command": command }), &grants);
+            for command in &routine {
+                let evaluation = evaluate(command);
+                match mode {
+                    PermissionMode::Ask => {
+                        assert!(matches!(evaluation, Evaluation::Ask { .. }), "{command}");
+                    }
+                    _ => assert_eq!(evaluation, Evaluation::Allow, "{mode:?}: {command}"),
+                }
+            }
+            for command in not_routine {
+                let evaluation = evaluate(command);
+                match mode {
+                    PermissionMode::FullAuto => assert_eq!(evaluation, Evaluation::Allow),
+                    PermissionMode::AutoReview => assert!(
+                        matches!(evaluation, Evaluation::Review { .. }),
+                        "reviewed: {command}: {evaluation:?}"
+                    ),
+                    _ => {
+                        let (reasons, _) = ask(evaluation);
+                        assert!(
+                            matches!(&reasons[..], [AskReason::Mode(_)]),
+                            "{mode:?}: {command}: {reasons:?}"
+                        );
+                    }
+                }
+            }
+            for command in dangerous {
+                let evaluation = evaluate(command);
+                if mode == PermissionMode::FullAuto {
+                    assert_eq!(evaluation, Evaluation::Allow);
+                } else {
+                    let (reasons, offers) = ask(evaluation);
+                    assert!(
+                        matches!(&reasons[..], [AskReason::Dangerous(_)]),
+                        "{mode:?}: {command}: {reasons:?}"
+                    );
+                    assert!(offers.is_empty());
+                }
             }
         }
     }
