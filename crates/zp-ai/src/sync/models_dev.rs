@@ -24,6 +24,10 @@ pub struct ModelsDevCatalog {
 }
 
 /// One models.dev provider.
+///
+/// Only model metadata is read. Its base URL (`api`) is deliberately not: requests carry
+/// the user's credentials, so where they go comes only from ZP's catalogs and the user's
+/// settings, never from this unsigned remote file.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ModelsDevProvider {
     /// models.dev provider id.
@@ -31,9 +35,6 @@ pub struct ModelsDevProvider {
     /// Display name.
     #[serde(default)]
     pub name: String,
-    /// OpenAI-compatible base URL, when models.dev knows one.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub api: Option<String>,
     /// Environment variables models.dev associates with the provider.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub env: Vec<String>,
@@ -423,7 +424,12 @@ mod tests {
         let catalog = ModelsDevCatalog::parse(&sample(), |id| id == "acme").unwrap();
         assert_eq!(catalog.providers.len(), 1);
         let acme = catalog.provider("acme").unwrap();
-        assert_eq!(acme.api.as_deref(), Some("https://api.acme.test/v1"));
+        // The endpoint models.dev names is not even kept.
+        assert!(
+            !serde_json::to_string(acme)
+                .unwrap()
+                .contains("api.acme.test")
+        );
         assert_eq!(acme.models.len(), 2, "the malformed model is skipped");
 
         let model = &acme.models["acme-2"];
