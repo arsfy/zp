@@ -74,6 +74,11 @@ pub(crate) struct RunArgs {
     /// Do not start the MCP servers of `~/.zp/mcp.json` / `.zp/mcp.json`.
     #[arg(long)]
     no_mcp: bool,
+    /// Trust the project: use its AGENTS.md, `.zp` settings, MCP servers, prompts and skills.
+    /// Remembered, like trusting it in the app. Without it, ZP asks on a terminal and
+    /// otherwise ignores them.
+    #[arg(long)]
+    trust: bool,
     /// The prompt. Read from stdin when piped; omit on a terminal for interactive mode.
     /// `@path` attaches a file; `/template args` and `/skill:name` expand.
     prompt: Vec<String>,
@@ -95,7 +100,7 @@ pub(crate) struct Style {
 }
 
 impl Style {
-    fn detect() -> Self {
+    pub(crate) fn detect() -> Self {
         Self {
             enabled: std::io::stderr().is_terminal(),
         }
@@ -217,11 +222,9 @@ pub(crate) async fn run(models: &Models, args: RunArgs) -> Result<()> {
     if !args.no_session {
         options.blobs = Some(zp_core::checkpoint::BlobStore::in_data_dir(&data_dir));
     }
-    // The project is trusted unless the user declined it in the app.
-    let trusted = zp_core::app_state::AppState::load(&zp_core::paths::state_file(&data_dir))
-        .project(&cwd)
-        .trusted
-        != Some(false);
+    // Only once the user said so (here or in the app): a cloned repository must not get to
+    // change the permissions, instruct the agent or start its MCP servers by itself.
+    let trusted = crate::trust::resolve(Some(&data_dir), &cwd, args.trust);
     let settings = ProjectSettings::load(Some(&data_dir), &cwd, trusted);
     if delegate {
         options.subagents = settings.subagents();

@@ -60,6 +60,17 @@ pub struct Resources {
     pub diagnostics: Vec<String>,
 }
 
+/// Prompt templates of a project directory (and its parents up to the repository root).
+pub(crate) const PROJECT_PROMPTS_DIR: &str = ".zp/prompts";
+
+/// Skill directories of a project directory (and its parents up to the repository root).
+pub(crate) const PROJECT_SKILL_DIRS: [&str; 4] = [
+    ".zp/skills",
+    ".agents/skills",
+    ".codex/skills",
+    ".claude/skills",
+];
+
 /// Splits `---` frontmatter (flat `key: value` lines) from the body.
 pub fn parse_frontmatter(text: &str) -> (BTreeMap<String, String>, String) {
     let text = text.trim_start_matches('\u{FEFF}');
@@ -265,18 +276,13 @@ impl Resources {
         };
         // More specific locations first: the first of a name wins.
         for dir in &project_dirs {
-            resources.load_templates(&dir.join(".zp/prompts"), Source::Project);
+            resources.load_templates(&dir.join(PROJECT_PROMPTS_DIR), Source::Project);
         }
         if let Some(data) = data_dir {
             resources.load_templates(&data.join("prompts"), Source::User);
         }
         for dir in &project_dirs {
-            for skills in [
-                ".zp/skills",
-                ".agents/skills",
-                ".codex/skills",
-                ".claude/skills",
-            ] {
+            for skills in PROJECT_SKILL_DIRS {
                 resources.load_skills(&dir.join(skills), Source::Project);
             }
         }

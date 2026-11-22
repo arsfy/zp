@@ -221,6 +221,15 @@ impl AppState {
         self.projects.get(path).cloned().unwrap_or_default()
     }
 
+    /// Whether the user trusts the project at `path`. Only an explicit yes counts (in the
+    /// app, or `zp-cli --trust`): a project never asked about, or a state file that was reset,
+    /// is not trusted. The app and the CLI both decide through this.
+    pub fn is_trusted(&self, path: &Path) -> bool {
+        self.projects
+            .get(path)
+            .is_some_and(|project| project.trusted == Some(true))
+    }
+
     /// Mutable UI state of `path`, created on demand.
     pub fn project_mut(&mut self, path: &Path) -> &mut ProjectUiState {
         self.projects.entry(path.to_path_buf()).or_default()

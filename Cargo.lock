@@ -8843,6 +8843,7 @@ dependencies = [
  "clap",
  "futures",
  "serde_json",
+ "tempfile",
  "tokio",
  "zp-agent",
  "zp-ai",

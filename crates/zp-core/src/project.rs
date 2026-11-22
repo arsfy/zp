@@ -109,17 +109,39 @@ pub fn trust_boundary(root: &Path) -> PathBuf {
         .to_path_buf()
 }
 
-/// Files of a project that change what the agent does (instructions and settings), which
-/// ZP only loads once the user trusts the project. Empty: nothing to trust.
+/// `<project>/.zp/mcp.json` (read by `zp-mcp`, which this crate does not depend on).
+const PROJECT_MCP_FILE: &str = ".zp/mcp.json";
+
+/// What a project brings that ZP only uses once the user trusts it: instruction files,
+/// `.zp/settings.json`, `.zp/mcp.json` (servers it would start), prompt templates and skill
+/// directories. Empty: nothing to trust.
 pub fn trust_files(root: &Path) -> Vec<PathBuf> {
     let boundary = trust_boundary(root);
     let mut files: Vec<PathBuf> = crate::system_prompt::project_context_files(root)
         .into_iter()
         .filter(|file| file.starts_with(&boundary))
         .collect();
-    let settings = crate::settings::project_settings_file(root);
-    if settings.is_file() {
-        files.push(settings);
+    for file in [
+        crate::settings::project_settings_file(root),
+        root.join(PROJECT_MCP_FILE),
+    ] {
+        if file.is_file() {
+            files.push(file);
+        }
+    }
+    // Templates and skills load from the project and its parents up to the repository.
+    for dir in root
+        .ancestors()
+        .take_while(|dir| dir.starts_with(&boundary))
+    {
+        for resources in std::iter::once(crate::resources::PROJECT_PROMPTS_DIR)
+            .chain(crate::resources::PROJECT_SKILL_DIRS)
+        {
+            let path = dir.join(resources);
+            if path.is_dir() {
+                files.push(path);
+            }
+        }
     }
     files
 }
@@ -127,6 +149,42 @@ pub fn trust_files(root: &Path) -> Vec<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn trust_files_cover_everything_trust_controls() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        let project = repo.join("app");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        std::fs::create_dir_all(project.join(".zp/prompts")).unwrap();
+        assert_eq!(
+            trust_files(&project),
+            [project.join(".zp/prompts")],
+            "an empty project only brings what exists"
+        );
+        std::fs::create_dir_all(repo.join(".claude/skills")).unwrap();
+        std::fs::create_dir_all(dir.path().join(".agents/skills")).unwrap();
+        std::fs::write(project.join(".zp/mcp.json"), "{}").unwrap();
+        std::fs::write(project.join(".zp/settings.json"), "{}").unwrap();
+        std::fs::write(repo.join("AGENTS.md"), "rules").unwrap();
+        let files = trust_files(&project);
+        for expected in [
+            repo.join("AGENTS.md"),
+            project.join(".zp/settings.json"),
+            project.join(".zp/mcp.json"),
+            project.join(".zp/prompts"),
+            repo.join(".claude/skills"),
+        ] {
+            assert!(
+                files.contains(&expected),
+                "{expected:?} missing from {files:?}"
+            );
+        }
+        assert!(
+            !files.contains(&dir.path().join(".agents/skills")),
+            "above the repository, files belong to the user"
+        );
+    }
 
     #[test]
     fn branch_from_head_files() {

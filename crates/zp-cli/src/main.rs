@@ -3,6 +3,7 @@
 mod approve;
 mod ask;
 mod run;
+mod trust;
 
 use std::io::IsTerminal as _;
 
@@ -58,6 +59,9 @@ enum Command {
         /// Project directory (default: the current directory).
         #[arg(short = 'C', long, value_name = "DIR")]
         cwd: Option<std::path::PathBuf>,
+        /// Trust the project, so its `.zp/mcp.json` servers are started (remembered).
+        #[arg(long)]
+        trust: bool,
     },
     /// Print data locations.
     Paths,
@@ -136,7 +140,7 @@ async fn main() -> Result<()> {
             list_providers(&models);
             Ok(())
         }
-        Command::Mcp { cwd } => list_mcp(cwd.as_deref(), data_dir.as_deref()).await,
+        Command::Mcp { cwd, trust } => list_mcp(cwd.as_deref(), data_dir.as_deref(), trust).await,
         Command::Auth {
             action: AuthCommand::Login { provider },
         } => {
@@ -177,18 +181,18 @@ async fn main() -> Result<()> {
     }
 }
 
-async fn list_mcp(cwd: Option<&std::path::Path>, data_dir: Option<&std::path::Path>) -> Result<()> {
+async fn list_mcp(
+    cwd: Option<&std::path::Path>,
+    data_dir: Option<&std::path::Path>,
+    trust: bool,
+) -> Result<()> {
     let cwd = match cwd {
         Some(dir) => dir.to_path_buf(),
         None => std::env::current_dir()?,
     };
     let cwd = zp_core::project::normalize_project_path(&cwd)?;
-    let trusted = data_dir.is_none_or(|dir| {
-        zp_core::app_state::AppState::load(&zp_core::paths::state_file(dir))
-            .project(&cwd)
-            .trusted
-            != Some(false)
-    });
+    // Connecting starts the servers: a project's own only once it is trusted.
+    let trusted = trust::resolve(data_dir, &cwd, trust);
     let env = |name: &str| std::env::var(name).ok();
     let (servers, errors) = zp_mcp::config::load(data_dir, &cwd, trusted, &env);
     for error in &errors {

@@ -25,3 +25,6 @@ zp-session.workspace = true
 zp-tools.workspace = true
 zp-core.workspace = true
 zp-mcp.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

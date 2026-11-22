@@ -109,7 +109,7 @@ impl zp_tools::Asker for ChannelAsker {
 
 /// Whether the user trusts the project at `root` (`false` until they said so).
 pub fn is_trusted(root: &Path, cx: &App) -> bool {
-    AppStore::state(cx).project(root).trusted == Some(true)
+    AppStore::state(cx).is_trusted(root)
 }
 
 /// The delegation policy of the project at `root`: the personal settings, restricted by
@@ -133,7 +133,7 @@ pub fn project_subagents(root: &Path, cx: &App) -> zp_core::subagents::SubagentS
 pub fn project_policy(root: &Path, cx: &App) -> PermissionPolicy {
     let state = AppStore::state(cx).project(root);
     let data_dir = cx.try_global::<AppPaths>().and_then(|p| p.data_dir.clone());
-    let settings = ProjectSettings::load(data_dir.as_deref(), root, state.trusted == Some(true));
+    let settings = ProjectSettings::load(data_dir.as_deref(), root, is_trusted(root, cx));
     let mut policy = settings.permission_policy(root, state.permission_mode);
     if let Some(model) = state.review_model {
         policy.review_model = Some(model);
