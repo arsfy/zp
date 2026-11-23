@@ -22,6 +22,7 @@ use zp_core::git::{
 
 use crate::context_menu::ContextMenu;
 use crate::diff_view::DiffItem;
+use crate::store::AppModels;
 use crate::theme::ActiveTheme;
 use crate::ui::tooltip;
 
@@ -36,6 +37,7 @@ const ICON_MINIMIZE: &[u8] = include_bytes!("../../../assets/icons/minimize-2.sv
 const ICON_COMMIT: &[u8] = include_bytes!("../../../assets/icons/git-commit-horizontal.svg");
 const ICON_ARROW_UP: &[u8] = include_bytes!("../../../assets/icons/arrow-up.svg");
 const ICON_CHECK: &[u8] = include_bytes!("../../../assets/icons/check.svg");
+const ICON_STAR: &[u8] = include_bytes!("../../../assets/icons/star.svg");
 /// Height of file and section rows.
 const ROW_HEIGHT: f32 = 26.;
 const ICON_ARROW_DOWN: &[u8] = include_bytes!("../../../assets/icons/arrow-down.svg");
@@ -157,6 +159,8 @@ pub struct GitPanel {
     /// Scroll position of the history list.
     history_scroll: UniformListScrollHandle,
     op_task: Option<Task<()>>,
+    /// The commit message model is writing a message.
+    generating: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -186,6 +190,7 @@ impl GitPanel {
             history_task: None,
             history_scroll: UniformListScrollHandle::new(),
             op_task: None,
+            generating: None,
             _subscriptions: subscriptions,
         }
     }
@@ -479,6 +484,74 @@ impl GitPanel {
             },
             cx,
         );
+    }
+
+    /// Stops waiting for the commit message model.
+    pub fn cancel_commit_message(&mut self, cx: &mut Context<Self>) {
+        // Dropping the task aborts the request.
+        self.generating = None;
+        self.busy = None;
+        self.notice = None;
+        cx.notify();
+    }
+
+    /// Asks the commit message model for a message for what a commit would take, in a
+    /// session that can only read the project, and fills the input with it; the commit
+    /// is still made with the button.
+    pub fn generate_commit_message(&mut self, cx: &mut Context<Self>) {
+        if self.busy.is_some() {
+            return;
+        }
+        let model = match AppModels::commit_model(cx) {
+            Ok(model) => model,
+            Err(error) => {
+                self.notice = Some((error.to_string(), true));
+                cx.notify();
+                return;
+            }
+        };
+        // The reply replaces the draft only while the draft is still what it was.
+        let draft = self.message.read(cx).as_str().to_owned();
+        let models = cx.global::<AppModels>().models.clone();
+        let dir = self.root.clone();
+        let amend = self.options.amend;
+        self.busy = Some(Operation::Other("Writing message…"));
+        self.notice = None;
+        let task = gpui_tokio::Tokio::spawn(cx, async move {
+            zp_core::commit_message::generate_commit_message(models, &dir, &model, amend).await
+        });
+        self.generating = Some(cx.spawn(async move |this, cx| {
+            let result = task.await;
+            let _ = this.update(cx, |this, cx| {
+                this.generating = None;
+                this.busy = None;
+                match result {
+                    Ok(Ok(message)) => {
+                        if this.message.read(cx).as_str() == draft {
+                            this.message
+                                .update(cx, |input, cx| input.emplace(&message, cx));
+                            // The message is the user's now: turning Amend off keeps it.
+                            this.amend_prefill = None;
+                            this.commit_collapsed = false;
+                        } else {
+                            this.notice = Some((
+                                "The message was edited meanwhile; the generated one was \
+                                 dropped."
+                                    .into(),
+                                false,
+                            ));
+                        }
+                    }
+                    Ok(Err(error)) => this.notice = Some((format!("{error:#}"), true)),
+                    Err(error) => {
+                        this.notice =
+                            Some((format!("the request stopped unexpectedly: {error}"), true))
+                    }
+                }
+                cx.notify();
+            });
+        }));
+        cx.notify();
     }
 
     /// Turns Amend on (filling in the last commit's message when the input is empty) or
@@ -1465,7 +1538,9 @@ impl GitPanel {
     /// The commit message (unless collapsed) with the commit controls under it.
     fn render_commit_box(&self, cx: &mut Context<Self>) -> AnyElement {
         let colors = cx.theme().colors.clone();
-        let state = self.control_state(!self.options.amend && self.commit_files().is_empty());
+        let nothing_to_commit = !self.options.amend && self.commit_files().is_empty();
+        let generating = self.generating.is_some();
+        let state = self.control_state(nothing_to_commit);
         let maximized = self.commit_maximized;
         let suggestion = self.suggested_message();
         let placeholder = if suggestion.is_empty() {
@@ -1591,6 +1666,26 @@ impl GitPanel {
                             .when(self.busy_label().is_none() && !options.is_empty(), |this| {
                                 this.child(options.join(" · "))
                             }),
+                    )
+                    .child(
+                        icon_button(
+                            "git-generate-message",
+                            ICON_STAR,
+                            if generating {
+                                "Stop writing the message"
+                            } else {
+                                "Write a commit message with the commit model"
+                            },
+                        )
+                        .when(generating, |this| this.bg(colors.surface_hover))
+                        .when(nothing_to_commit && !generating, |this| this.opacity(0.4))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            if generating {
+                                this.cancel_commit_message(cx);
+                            } else if !nothing_to_commit {
+                                this.generate_commit_message(cx);
+                            }
+                        })),
                     )
                     .child(split_button(
                         "git-commit",

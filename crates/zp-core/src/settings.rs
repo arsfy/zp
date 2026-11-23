@@ -166,6 +166,10 @@ pub struct Settings {
     /// Name conversations with a short model-generated title (default on).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub generate_titles: Option<bool>,
+    /// Model that writes commit messages from the Git panel, as `provider/model`; `None`
+    /// uses the default model.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub commit_model: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub theme: Option<ThemeChoice>,
     /// Which transcript blocks start expanded.

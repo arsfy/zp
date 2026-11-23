@@ -1420,3 +1420,63 @@ fn opening_the_providers_page_retries_failed_keychain_reads(cx: &mut TestAppCont
         .unwrap();
     assert_eq!(credentials.api_key("deepseek").as_deref(), Some("sk-1"));
 }
+
+#[gpui::test]
+fn commit_message_model_is_chosen_on_the_general_page(cx: &mut TestAppContext) {
+    let faux = FauxProvider::default();
+    let data = setup_models(cx, &[&faux], false);
+    let window = settings_window(Page::General, cx);
+    // Unset, the default model writes commit messages.
+    assert_eq!(saved(&data).commit_model, None);
+    assert_eq!(
+        cx.update(|cx| AppModels::commit_model(cx)),
+        Ok(faux.model())
+    );
+
+    window
+        .update(cx, |view, window, cx| {
+            view.open_commit_model_picker(window, cx)
+        })
+        .unwrap();
+    cx.run_until_parked();
+    assert!(
+        window
+            .update(cx, |view, _, _| view.commit_model_picker().is_some())
+            .unwrap()
+    );
+    {
+        let mut visual = VisualTestContext::from_window(window.into(), cx);
+        let option = visual.debug_bounds("review-model-0").unwrap();
+        visual.simulate_click(option.center(), Modifiers::none());
+    }
+    cx.run_until_parked();
+    assert!(
+        window
+            .update(cx, |view, _, _| view.commit_model_picker().is_none())
+            .unwrap()
+    );
+    assert_eq!(saved(&data).commit_model, Some(faux.model().qualified_id()));
+
+    // A model that cannot be used is refused; the default is chosen again explicitly.
+    window
+        .update(cx, |view, _, cx| {
+            view.set_commit_model(Some("nope/nothing"), cx)
+        })
+        .unwrap();
+    let error = window
+        .update(cx, |view, _, _| view.notice().cloned())
+        .unwrap();
+    assert!(matches!(error, Some((text, true)) if text.contains("unavailable commit model")));
+    assert_eq!(saved(&data).commit_model, Some(faux.model().qualified_id()));
+    // A saved model whose provider is gone is reported, not replaced by the default.
+    cx.update(|cx| cx.global_mut::<AppModels>().models = Models::new());
+    let error = cx.update(|cx| AppModels::commit_model(cx)).unwrap_err();
+    assert!(
+        matches!(error, zp_core::commit_message::NoCommitModel::Unavailable(spec) if spec == faux.model().qualified_id())
+    );
+    window
+        .update(cx, |view, _, cx| view.set_commit_model(None, cx))
+        .unwrap();
+    assert_eq!(saved(&data).commit_model, None);
+    assert!(cx.update(|cx| AppModels::commit_model(cx)).is_err());
+}

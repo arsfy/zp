@@ -145,6 +145,8 @@ pub struct SettingsWindow {
     // General
     model_menu_open: bool,
     model_filter: Entity<EditableTextState>,
+    commit_model_picker: Option<Entity<ReviewModelPicker>>,
+    commit_model_subscription: Option<Subscription>,
     // Models
     model_search: Entity<EditableTextState>,
     // Providers
@@ -266,6 +268,8 @@ impl SettingsWindow {
             version_copied: None,
             model_menu_open: false,
             model_filter,
+            commit_model_picker: None,
+            commit_model_subscription: None,
             model_search,
             dialog: None,
             dialog_subscription: None,
@@ -296,6 +300,8 @@ impl SettingsWindow {
             self.dialog_subscription = None;
             self.review_model_picker = None;
             self.review_model_subscription = None;
+            self.commit_model_picker = None;
+            self.commit_model_subscription = None;
             self.jev_form = None;
             self.stop_recording();
         }
@@ -432,6 +438,51 @@ impl SettingsWindow {
     #[cfg(any(test, feature = "visual-tests"))]
     pub(crate) fn review_model_picker(&self) -> Option<Entity<ReviewModelPicker>> {
         self.review_model_picker.clone()
+    }
+
+    /// Opens the model list for the commit message model.
+    pub(crate) fn open_commit_model_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let current = AppSettings::get(cx).commit_model.clone();
+        let picker =
+            cx.new(|cx| ReviewModelPicker::with_title("Commit model", current, window, cx));
+        self.commit_model_subscription = Some(cx.subscribe_in(
+            &picker,
+            window,
+            move |this, _, event: &ReviewModelEvent, window, cx| {
+                if let ReviewModelEvent::Selected(spec) = event {
+                    this.set_commit_model(Some(spec), cx);
+                }
+                this.commit_model_picker = None;
+                this.commit_model_subscription = None;
+                this.focus_handle.focus(window, cx);
+                cx.notify();
+            },
+        ));
+        self.commit_model_picker = Some(picker);
+        cx.notify();
+    }
+
+    /// Saves the model that writes commit messages; `None` uses the default model.
+    pub(crate) fn set_commit_model(&mut self, spec: Option<&str>, cx: &mut Context<Self>) {
+        let models = &cx.global::<AppModels>().models;
+        let result = if spec.is_some_and(|spec| {
+            !models
+                .find(spec)
+                .is_some_and(|model| models.resolve_auth(&model.provider).is_some())
+        }) {
+            Err(anyhow::anyhow!(
+                "unavailable commit model `{}`",
+                spec.unwrap_or_default()
+            ))
+        } else {
+            AppSettings::update(cx, |s| s.commit_model = spec.map(str::to_owned))
+        };
+        self.report(result, cx);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn commit_model_picker(&self) -> Option<Entity<ReviewModelPicker>> {
+        self.commit_model_picker.clone()
     }
 
     /// Saves the allowed commands and directories.
@@ -605,6 +656,27 @@ impl SettingsWindow {
         ];
         let titles = settings.generate_titles.unwrap_or(true);
         let notifications = settings.notifications.unwrap_or(true);
+        let commit_model = settings.commit_model.clone();
+        let models = &cx.global::<AppModels>().models;
+        let commit_model_label = commit_model
+            .as_deref()
+            .map(|spec| {
+                let usable = models
+                    .find(spec)
+                    .is_some_and(|model| models.resolve_auth(&model.provider).is_some());
+                format!(
+                    "{}{}",
+                    crate::ui::model_display_name(spec),
+                    if usable { "" } else { " (unavailable)" }
+                )
+            })
+            .or_else(|| {
+                AppModels::default_model(cx).map(|model| {
+                    let spec = model.qualified_id();
+                    format!("Default: {}", crate::ui::model_display_name(&spec))
+                })
+            })
+            .unwrap_or_else(|| "Default model".to_owned());
         page_body()
             .child(section(
                 "Default model",
@@ -648,6 +720,34 @@ impl SettingsWindow {
                 checkbox("generate-titles", "Name conversations with a model", titles, cx)
                     .on_click(cx.listener(move |this, _, _, cx| this.set_generate_titles(!titles, cx))),
             ))
+            .child(section(
+                "Commit message model",
+                "Writes a commit message for the changes when you press the star in the Git panel.",
+                cx,
+            ))
+            .child(div().flex().items_center().gap_2().child(
+                button(
+                    "commit-model-button",
+                    format!("{} \u{25be}", commit_model_label),
+                    ButtonKind::Normal,
+                    cx,
+                )
+                .debug_selector(|| "commit-model-button".into())
+                .max_w_full()
+                .truncate()
+                .on_click(cx.listener(|this, _, window, cx| this.open_commit_model_picker(window, cx))),
+            ))
+            .children(commit_model.is_some().then(|| {
+                div()
+                    .id("commit-model-default")
+                    .debug_selector(|| "commit-model-default".into())
+                    .text_size(px(11.))
+                    .text_color(colors.text_muted)
+                    .cursor_pointer()
+                    .hover_style(|s| s.text_color(colors.text))
+                    .child("Use default model")
+                    .on_click(cx.listener(|this, _, _, cx| this.set_commit_model(None, cx)))
+            }))
             .child(section(
                 "Notifications",
                 "Tell me when a conversation I'm not looking at finishes or needs an approval.",
@@ -907,6 +1007,7 @@ impl Render for SettingsWindow {
             )
             .children(self.render_provider_dialog(cx))
             .children(self.review_model_picker.clone())
+            .children(self.commit_model_picker.clone())
     }
 }
 

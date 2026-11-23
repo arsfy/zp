@@ -9,6 +9,7 @@ pub mod attachments;
 pub mod changes;
 pub mod checkpoint;
 pub mod coding_session;
+pub mod commit_message;
 pub mod compaction;
 pub mod credentials;
 pub mod diff;

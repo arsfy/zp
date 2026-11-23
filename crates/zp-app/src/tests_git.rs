@@ -4,13 +4,15 @@
 
 use std::path::Path;
 use std::process::Command;
+use std::sync::Arc;
 
 use gpui::{Entity, Modifiers, TestAppContext, VisualTestContext, WindowHandle};
-use zp_ai::FauxProvider;
+use zp_ai::{FauxProvider, FauxResponse, Models};
 use zp_core::git::GitStatus;
 
 use crate::git_panel::{GitPanel, GitTab};
 use crate::project::ProjectWindow;
+use crate::store::{AppModels, AppSettings};
 use crate::tests::project_dir;
 use crate::tests_conversation::{open, setup_models, wait_until};
 
@@ -508,5 +510,172 @@ fn files_too_large_to_compare_open_as_too_large_without_being_read(cx: &mut Test
             ("shrunk.txt".to_owned(), true, false, true, 0),
             ("small.txt".to_owned(), false, true, false, 1),
         ]
+    );
+}
+
+#[gpui::test]
+fn the_star_writes_a_commit_message_into_the_input(cx: &mut TestAppContext) {
+    let faux = FauxProvider::default();
+    let _data = setup_models(cx, &[&faux], false);
+    let (_dir, project) = project_dir();
+    git(&project, &["init", "-q"]);
+    for (key, value) in [
+        ("user.name", "Tester"),
+        ("user.email", "t@example.com"),
+        ("commit.gpgsign", "false"),
+        ("core.autocrlf", "false"),
+    ] {
+        git(&project, &["config", key, value]);
+    }
+    std::fs::write(project.join("main.rs"), "fn main() {}\n").unwrap();
+    git(&project, &["add", "."]);
+    git(&project, &["commit", "-q", "-m", "init"]);
+    std::fs::write(project.join("main.rs"), "fn main() {\n    run();\n}\n").unwrap();
+    faux.push(FauxResponse::text("feat(main): call run\n"));
+
+    let window = open(cx, &project);
+    let panel = window
+        .update(cx, |view, _, cx| {
+            view.changes_panel().read(cx).git().clone()
+        })
+        .unwrap();
+    click(window, "status-changes", cx);
+    settle(&panel, cx, |s| s.unstaged().count() == 1);
+    click(window, "git-generate-message", cx);
+    let message = panel.read_with(cx, |panel, _| panel.message_input());
+    wait_until(cx, |cx| {
+        panel.read_with(cx, |panel, cx| {
+            !panel.is_busy() && !message.read(cx).as_str().is_empty()
+        })
+    });
+    assert_eq!(
+        message.read_with(cx, |input, _| input.as_str().to_owned()),
+        "feat(main): call run"
+    );
+    // The model saw the diff, with the read-only tools only.
+    let requests = faux.requests();
+    assert_eq!(requests.len(), 1);
+    let tools: Vec<String> = requests[0]
+        .tools
+        .iter()
+        .map(|tool| tool.name.clone())
+        .collect();
+    assert_eq!(tools, ["read", "grep", "find", "ls"]);
+    // Nothing was committed: that is still the user's call.
+    panel.read_with(cx, |panel, _| {
+        let status = panel.status().unwrap();
+        assert_eq!(status.last_commit.as_deref(), Some("init"));
+        assert_eq!(status.staged().count(), 0);
+    });
+}
+
+#[gpui::test]
+fn the_star_explains_when_no_model_is_available(cx: &mut TestAppContext) {
+    let faux = FauxProvider::default();
+    let _data = setup_models(cx, &[&faux], false);
+    let (_dir, project) = project_dir();
+    git(&project, &["init", "-q"]);
+    for (key, value) in [
+        ("user.name", "Tester"),
+        ("user.email", "t@example.com"),
+        ("commit.gpgsign", "false"),
+        ("core.autocrlf", "false"),
+    ] {
+        git(&project, &["config", key, value]);
+    }
+    std::fs::write(project.join("main.rs"), "fn main() {}\n").unwrap();
+    git(&project, &["add", "."]);
+    git(&project, &["commit", "-q", "-m", "init"]);
+    std::fs::write(project.join("main.rs"), "fn main() {\n    run();\n}\n").unwrap();
+    let window = open(cx, &project);
+    let panel = window
+        .update(cx, |view, _, cx| {
+            view.changes_panel().read(cx).git().clone()
+        })
+        .unwrap();
+    click(window, "status-changes", cx);
+    settle(&panel, cx, |s| s.unstaged().count() == 1);
+    // No provider is left to answer; a configured model that is gone is named, not replaced.
+    cx.update(|cx| {
+        cx.global_mut::<AppModels>().models = Models::new();
+        AppSettings::update(cx, |settings| {
+            settings.commit_model = Some("faux/faux-1".into());
+        })
+        .unwrap();
+    });
+    click(window, "git-generate-message", cx);
+    let notice = panel
+        .read_with(cx, |panel, _| panel.notice().cloned())
+        .unwrap();
+    assert!(notice.1 && notice.0.contains("`faux/faux-1`"), "{notice:?}");
+    assert!(!panel.read_with(cx, |panel, _| panel.is_busy()));
+    assert_eq!(
+        panel.read_with(cx, |panel, cx| panel
+            .message_input()
+            .read(cx)
+            .as_str()
+            .to_owned()),
+        ""
+    );
+}
+
+#[gpui::test]
+fn a_reply_does_not_overwrite_an_edited_draft_and_waiting_can_be_stopped(cx: &mut TestAppContext) {
+    let faux = FauxProvider::default();
+    let _data = setup_models(cx, &[&faux], false);
+    let (_dir, project) = project_dir();
+    git(&project, &["init", "-q"]);
+    for (key, value) in [
+        ("user.name", "Tester"),
+        ("user.email", "t@example.com"),
+        ("commit.gpgsign", "false"),
+        ("core.autocrlf", "false"),
+    ] {
+        git(&project, &["config", key, value]);
+    }
+    std::fs::write(project.join("main.rs"), "fn main() {}\n").unwrap();
+    git(&project, &["add", "."]);
+    git(&project, &["commit", "-q", "-m", "init"]);
+    std::fs::write(project.join("main.rs"), "fn main() {\n    run();\n}\n").unwrap();
+    faux.push(FauxResponse::text("feat(main): call run"));
+    let window = open(cx, &project);
+    let panel = window
+        .update(cx, |view, _, cx| {
+            view.changes_panel().read(cx).git().clone()
+        })
+        .unwrap();
+    let message = panel.read_with(cx, |panel, _| panel.message_input());
+    click(window, "status-changes", cx);
+    settle(&panel, cx, |s| s.unstaged().count() == 1);
+
+    // The draft typed while the model works is kept.
+    click(window, "git-generate-message", cx);
+    message.update(cx, |input, cx| input.emplace("My own words", cx));
+    wait_until(cx, |cx| !panel.read_with(cx, |panel, _| panel.is_busy()));
+    assert_eq!(
+        message.read_with(cx, |input, _| input.as_str().to_owned()),
+        "My own words"
+    );
+    panel.read_with(cx, |panel, _| {
+        let (text, error) = panel.notice().expect("a notice");
+        assert!(!error && text.contains("edited meanwhile"), "{text}");
+    });
+
+    // The star stops a slow request.
+    let faux = FauxProvider::default().with_chunk_delay(std::time::Duration::from_secs(30));
+    cx.update(|cx| {
+        let app = cx.global_mut::<AppModels>();
+        let mut models = Models::new();
+        models.set_provider(Arc::new(faux.clone()));
+        app.models = models;
+    });
+    faux.push(FauxResponse::text("feat(main): too slow"));
+    click(window, "git-generate-message", cx);
+    wait_until(cx, |cx| panel.read_with(cx, |panel, _| panel.is_busy()));
+    click(window, "git-generate-message", cx);
+    assert!(!panel.read_with(cx, |panel, _| panel.is_busy()));
+    assert_eq!(
+        message.read_with(cx, |input, _| input.as_str().to_owned()),
+        "My own words"
     );
 }

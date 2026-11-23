@@ -18,5 +18,9 @@ caret already was, so positions before the edit are still right.
 The app reads the caret when the text changes, where no window is at hand (`@` completion
 works at the caret, not only at the end of the text).
 
-When upgrading gpui-ce, check whether upstream fixed the layout fallback and offers the selection;
-if so, delete this directory and the `[patch]` entry.
+`EditableTextElement` checks the current layout cache on each measurement. The layout engine
+can measure the field at several widths in one frame. A cache hit must match the document
+currently stored for painting so that redraws keep the same wrapping at the same width.
+
+When upgrading gpui-ce, check whether upstream includes these changes before removing this
+directory and the `[patch]` entry.

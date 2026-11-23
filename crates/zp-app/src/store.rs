@@ -238,6 +238,20 @@ impl AppModels {
         })
     }
 
+    /// The model that writes commit messages from the Git panel: the configured one,
+    /// or the default model when none is configured. A configured model that cannot be
+    /// used is an error, never a silent replacement.
+    pub fn commit_model(cx: &App) -> Result<Model, zp_core::commit_message::NoCommitModel> {
+        let Some(models) = cx.try_global::<Self>().map(|app| &app.models) else {
+            return Err(zp_core::commit_message::NoCommitModel::None);
+        };
+        zp_core::commit_message::commit_model(
+            models,
+            AppSettings::get(cx).commit_model.as_deref(),
+            Self::default_model(cx).as_ref(),
+        )
+    }
+
     /// Remembers an explicit selection or a model used to start a conversation task.
     pub fn remember_model(model: &Model, cx: &mut App) {
         let spec = model.qualified_id();

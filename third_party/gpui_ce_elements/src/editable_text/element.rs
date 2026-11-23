@@ -200,7 +200,7 @@ impl EditableTextActionElement<EditableTextState> for EditableTextElement {
 
 struct PrelayoutState {
     state: Entity<EditableTextState>,
-    prev_layout_state: EditableTextLayoutState,
+    had_layout: bool,
     storage_version: u16,
     show_placeholder: bool,
     text: Option<SharedString>,
@@ -327,7 +327,7 @@ impl Element for EditableTextElement {
 
             let prelayout = PrelayoutState {
                 state: entity.clone(),
-                prev_layout_state: state.layout_data.state,
+                had_layout: state.layout_data.state.size.is_some(),
                 show_placeholder,
                 storage_version: state.version(),
                 text,
@@ -698,10 +698,13 @@ impl PrelayoutState {
                     unicode_bidi,
                 };
 
-                if let Some(size) = self.prev_layout_state.size
+                // The layout engine can measure at several widths in one frame.
+                // Reuse a size only if its document is still the one stored for paint.
+                let previous_layout = self.state.read(cx).layout_data.state;
+                if let Some(size) = previous_layout.size
                     && truncation.width.is_none()
-                    && self.storage_version == self.prev_layout_state.last_seen_storage_version
-                    && self.prev_layout_state.options == options
+                    && self.storage_version == previous_layout.last_seen_storage_version
+                    && previous_layout.options == options
                 {
                     return size;
                 }
@@ -734,10 +737,7 @@ impl PrelayoutState {
                 } else {
                     Point::default()
                 };
-                let initial_scroll = self
-                    .prev_layout_state
-                    .size
-                    .is_none()
+                let initial_scroll = (!self.had_layout)
                     .then_some(document_offset)
                     .filter(|offset| offset.x > Pixels::ZERO);
                 let refresh_for_initial_scroll = initial_scroll.is_some();
