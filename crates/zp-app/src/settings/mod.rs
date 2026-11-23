@@ -625,7 +625,7 @@ impl SettingsWindow {
             )))
             .child(section(
                 "Prompt cache retention",
-                "How long providers keep the reused start of a conversation. Extended asks for 1 hour on Anthropic (2× the input price per cache write), 24 hours on earlier OpenAI models and 12 hours on GPT-5.6 and later (2.5× per write); other endpoints keep their default unless set up for it. Off stops cache writes, so every request pays the full input price: usually more expensive.",
+                "How long providers keep the reused start of a conversation. Extended lasts longer (1 hour on Anthropic, 12–24 hours on OpenAI) at a higher price per cache write; Off skips cache writes, so every request pays the full input price.",
                 cx,
             ))
             .child(div().flex().child(segmented(
