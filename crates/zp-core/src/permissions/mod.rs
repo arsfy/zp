@@ -114,6 +114,8 @@ pub enum AskReason {
     OutsideProject(Vec<PathBuf>),
     /// A destructive or high-risk command.
     Dangerous(String),
+    /// The shell classifier could not determine what would run.
+    UnverifiedShell,
     /// The review model did not approve it.
     Review(String),
     /// The delegation policy asks before sending a task to a child model.
@@ -133,6 +135,7 @@ impl AskReason {
                     .join(", ")
             ),
             Self::Dangerous(why) => format!("Potentially destructive: {why}"),
+            Self::UnverifiedShell => "Shell command could not be verified".to_owned(),
             Self::Review(why) => format!("Review model: {why}"),
             Self::Delegation => {
                 "The task and the files the subagent reads are sent to this model".to_owned()
@@ -431,6 +434,13 @@ impl PermissionPolicy {
                         shell::CommandAssessment::Dangerous(why) => {
                             reasons.push(AskReason::Dangerous(why));
                             // Never approved wholesale.
+                            return Evaluation::Ask {
+                                reasons,
+                                grants: Vec::new(),
+                            };
+                        }
+                        shell::CommandAssessment::Unverified => {
+                            reasons.push(AskReason::UnverifiedShell);
                             return Evaluation::Ask {
                                 reasons,
                                 grants: Vec::new(),
@@ -992,6 +1002,19 @@ mod tests {
                     "{mode:?}: {command}"
                 );
             }
+            if !cfg!(windows) || zp_tools::Shell::detect().name() == "bash" {
+                for command in [
+                    "cd /project && sed -n '286,290p' crates/zp-core/src/permissions/shell.rs",
+                    "sed -n '3p' file.txt",
+                    "sed -n '20,$p' file.txt",
+                ] {
+                    assert_eq!(
+                        policy.evaluate("bash", &json!({"command": command}), &grants),
+                        Evaluation::Allow,
+                        "{mode:?}: {command}"
+                    );
+                }
+            }
             if mode != PermissionMode::FullAuto {
                 for command in [
                     "head file.txt > output.txt",
@@ -1008,6 +1031,38 @@ mod tests {
                         "{mode:?}: {command}"
                     );
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn unverified_shell_syntax_goes_directly_to_the_user() {
+        let dir = tempfile::tempdir().unwrap();
+        let grants = Grants::default();
+        for mode in [
+            PermissionMode::Ask,
+            PermissionMode::AutoEdit,
+            PermissionMode::AutoReview,
+        ] {
+            let policy = PermissionPolicy {
+                mode,
+                root: dir.path().to_owned(),
+                allow_commands: vec!["cat".into(), "wc".into(), "printf".into()],
+                ..Default::default()
+            };
+            for command in [
+                "< note.txt wc -l",
+                "wc -l <(printf hello)",
+                "cat <<EOF\n$(printf hello)\nEOF",
+            ] {
+                assert_eq!(
+                    policy.evaluate("bash", &json!({"command": command}), &grants),
+                    Evaluation::Ask {
+                        reasons: vec![AskReason::UnverifiedShell],
+                        grants: Vec::new(),
+                    },
+                    "{mode:?}: {command}"
+                );
             }
         }
     }
