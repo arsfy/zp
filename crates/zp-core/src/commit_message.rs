@@ -97,12 +97,20 @@ pub fn commit_model(
 /// whatever is staged on top of it.
 pub fn git_buffer(repo: &Path, cwd: &Path, amend: bool) -> String {
     let mut out = String::new();
-    // A `cwd` outside the repository would not narrow anything.
-    let cwd = if cwd.strip_prefix(repo).is_ok() {
-        cwd
-    } else {
-        repo
-    };
+    // `repo` is usually canonical (`repo_root` normalizes it) while `cwd` may still
+    // contain symlinks, so both are compared canonically. A `cwd` outside the
+    // repository would not narrow anything.
+    let canonical_repo = repo.canonicalize().ok();
+    let canonical_cwd = cwd.canonicalize().ok();
+    let cwd = canonical_cwd
+        .as_deref()
+        .filter(|canonical| {
+            canonical_repo
+                .as_deref()
+                .is_some_and(|repo| canonical.starts_with(repo))
+        })
+        .or_else(|| cwd.strip_prefix(repo).is_ok().then_some(cwd))
+        .unwrap_or(repo);
     let staged = crate::git::git(repo, &["diff", "--cached", "--quiet"])
         .is_ok_and(|output| output.status.code() == Some(1));
     // Unstaged changes are not part of an amended commit: only the index is.
@@ -131,8 +139,11 @@ pub fn git_buffer(repo: &Path, cwd: &Path, amend: bool) -> String {
         args.push("--staged");
         section(&mut out, repo, &args, "git diff --staged");
     } else {
-        // Run from `cwd`, so only its files are listed.
-        section(&mut out, cwd, &diff, "git diff");
+        // Run from `cwd` with a pathspec, so only its files are listed: `git diff` alone
+        // shows the whole worktree whatever the current directory is.
+        let mut args = diff.to_vec();
+        args.extend(["--", "."]);
+        section(&mut out, cwd, &args, "git diff");
     }
     out
 }
@@ -382,6 +393,30 @@ mod tests {
         path.to_path_buf()
     }
 
+    /// A repository at `root` with `project/a.txt` and `sibling/b.txt` committed, both
+    /// modified afterwards.
+    fn repo_with_subprojects(root: &Path) -> PathBuf {
+        for dir in ["project", "sibling"] {
+            std::fs::create_dir(root.join(dir)).unwrap();
+        }
+        git(root, &["init", "-q"]);
+        for (key, value) in [
+            ("user.name", "Tester"),
+            ("user.email", "t@example.com"),
+            ("commit.gpgsign", "false"),
+            ("core.autocrlf", "false"),
+        ] {
+            git(root, &["config", key, value]);
+        }
+        std::fs::write(root.join("project/a.txt"), "before\n").unwrap();
+        std::fs::write(root.join("sibling/b.txt"), "before\n").unwrap();
+        git(root, &["add", "."]);
+        git(root, &["commit", "-q", "-m", "feat: base"]);
+        std::fs::write(root.join("project/a.txt"), "after\n").unwrap();
+        std::fs::write(root.join("sibling/b.txt"), "sibling change\n").unwrap();
+        root.to_path_buf()
+    }
+
     fn git(dir: &Path, args: &[&str]) {
         let output = std::process::Command::new("git")
             .arg("-C")
@@ -591,14 +626,37 @@ mod tests {
     #[tokio::test]
     async fn only_the_project_directory_is_described_when_nothing_is_staged() {
         let root = tempfile::tempdir().unwrap();
-        let path = root.path().join("project");
-        std::fs::create_dir(&path).unwrap();
-        let dir = repo_at(&path);
-        let sibling = root.path().join("sibling");
-        std::fs::create_dir(&sibling).unwrap();
-        std::fs::write(path.join("a.txt"), "after\n").unwrap();
-        std::fs::write(sibling.join("b.txt"), "sibling change\n").unwrap();
-        let buffer = git_buffer(&dir, &path, false);
+        let repo = repo_with_subprojects(root.path());
+        let project = root.path().join("project");
+        let buffer = git_buffer(&repo, &project, false);
+        assert!(
+            buffer.contains(" M a.txt"),
+            "paths are relative to the project"
+        );
+        assert!(buffer.contains("+after"), "{buffer}");
+        assert!(!buffer.contains("sibling"), "{buffer}");
+        // From the repository root itself, everything is described.
+        let buffer = git_buffer(&repo, &repo, false);
+        assert!(
+            buffer.contains("+after") && buffer.contains("sibling change"),
+            "{buffer}"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_symlinked_project_directory_still_narrows_the_diff() {
+        let root = tempfile::tempdir().unwrap();
+        let repo = root.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        repo_with_subprojects(&repo);
+        // A link outside the repository requires canonical comparison to narrow the diff.
+        let link = root.path().join("link");
+        std::os::unix::fs::symlink(repo.join("project"), &link).unwrap();
+        let linked_repo = crate::git::repo_root(&link).unwrap();
+        assert_eq!(linked_repo, repo.canonicalize().unwrap());
+        let buffer = git_buffer(&linked_repo, &link, false);
+        assert!(buffer.contains(" M a.txt"), "{buffer}");
         assert!(buffer.contains("+after"), "{buffer}");
         assert!(!buffer.contains("sibling"), "{buffer}");
     }
