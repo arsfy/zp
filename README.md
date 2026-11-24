@@ -10,20 +10,32 @@
     <img alt="License" src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue?style=flat-square">
 </a>
 
-> Note: This is an early-stage project. It may contain various issues and could introduce breaking changes in the future.
+English | [简体中文](README.zh-CN.md) | [繁體中文](README.zh-HK.md)
+
+> Note: This is an early-stage project. It may contain various issues, could introduce breaking changes in the future.
 
 [zp](https://github.com/arsfy/zp) is a lightweight, natively rendered, high-performance GUI harness. It adopts a minimalist Agent design philosophy similar to Pi, combined with a project-oriented design approach and Git management inspired by VS Code / Zed.
 
 *The installation package is about 18–24 MB, and the executable after installation is 30–45 MB.*
 
-<img width="100%" alt="Home" src="https://github.com/user-attachments/assets/0fd8d3b2-3e30-4e5c-9056-8f678ce9f2b9" />
+<img width="100%" alt="Home" src="https://github.com/user-attachments/assets/81ac4837-feef-4730-b309-c15fcebbcd08" />
+
+*Small footprint, low overhead, zero trackers, no bloat—that's the design philosophy behind ZP.*
+
+Now we have:
+
+- **Agent & Tools**: Minimalist built-in toolset (`read`, `write`, `edit`, `bash`, `grep`, `find`, `ls`, `todo`), interactive `ask`, parallel read-only `subagent` workers, and `/plan` mode.
+- **Permissions & Auto-review**: Four permission modes backed by static shell classification, session scratch dirs, and command auto-review via an LLM or TypeSafe Jev.
+- **Sessions & Checkpoints**: Branching session tree, in-flight message queue (`Edit` / `Withdraw` / `Interrupt & Send`), auto-compaction, and per-turn file snapshots & rollback.
+- **Project GUI, Git & Terminal**: Native GPUI interface with `@file` completion, live-streamed & syntax-highlighted diffs, built-in terminal, and a Git panel with AI commit messages.
+- **Extensibility & Providers**: [Agent Skills](https://agentskills.io/specification) (`$skill`), `/template` prompts, MCP (stdio & HTTP), multi-provider API / OAuth login, and a headless CLI (`zp-cli`).
 
 ## Installation
 
 Download ZP from the [Releases](https://github.com/arsfy/zp/releases) page.
 
 - **Stable**: the [latest release](https://github.com/arsfy/zp/releases/latest). Stable versions are tagged `vX.Y.Z`.
-- **Preview**: releases marked **Pre-release** on the Releases page, tagged `vX.Y.Z-preview.N` or `vX.Y.Z-rc.N`. They get new features first and may be less stable.
+- **Preview**: releases marked **Pre-release** on the Releases page, tagged `vX.Y.Z-rc.N`. They get new features first and may be less stable.
 
 ### macOS
 
