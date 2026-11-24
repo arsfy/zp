@@ -170,40 +170,57 @@ fn output_is_searched_once_per_delay_while_typing_searches_at_once(cx: &mut Test
     let _data = setup_models(cx, &[&faux], false);
     let (_dir, project) = project_dir();
     let window = open(cx, &project);
-    cx.dispatch_action(window.into(), crate::actions::ToggleTerminal);
-    cx.run_until_parked();
+
+    // Drive the grid and wakeups from the test so the timer sees only these batches.
+    let (events, received) = futures::channel::mpsc::unbounded();
+    let shell = Shell {
+        term: Arc::new(FairMutex::new(Term::new(
+            Config::default(),
+            &GridSize {
+                columns: 80,
+                lines: 24,
+            },
+            Listener(events.clone()),
+        ))),
+        received,
+        ..Shell::spawn(&project).expect("start the test shell")
+    };
     let terminal = window
-        .update(cx, |project, _, _| project.terminal().unwrap())
+        .update(cx, |_, window, cx| {
+            cx.new(|cx| TerminalView::new(shell, window, cx))
+        })
         .unwrap();
-    wait_for_screen(cx, &terminal, |text| !text.trim().is_empty());
+    let output = |cx: &mut TestAppContext| {
+        terminal.update(cx, |view, _| {
+            let mut parser: Processor = Processor::new();
+            parser.advance(&mut *view.term.lock(), b"zp-output-marker\r\n");
+        });
+        events.unbounded_send(TermEvent::Wakeup).unwrap();
+        cx.run_until_parked();
+    };
     let matches = |cx: &mut TestAppContext| {
         terminal.read_with(cx, |view, _| view.search.as_ref().unwrap().matches.len())
     };
+    output(cx);
     window
         .update(cx, |_, window, cx| {
             terminal.update(cx, |view, cx| view.open_search(window, cx))
         })
         .unwrap();
-    let input = terminal.update(cx, |view, _| {
-        let mut parser: Processor = Processor::new();
-        parser.advance(&mut *view.term.lock(), b"\r\nzp-output-marker\r\n");
-        view.search_input.clone()
-    });
+    let input = terminal.read_with(cx, |view, _| view.search_input.clone());
     input.update(cx, |input, cx| input.emplace("zp-output-marker", cx));
     // Typing searches right away.
     assert_eq!(matches(cx), 1);
-    // New output waits, however often it arrives.
-    terminal.update(cx, |view, cx| {
-        let mut parser: Processor = Processor::new();
-        parser.advance(&mut *view.term.lock(), b"zp-output-marker\r\n");
-        view.schedule_output_search(cx);
-        view.schedule_output_search(cx);
-    });
-    cx.run_until_parked();
+    // Both batches are picked up at the deadline set by the first one.
+    output(cx);
     assert_eq!(matches(cx), 1);
-    cx.executor().advance_clock(search::OUTPUT_SEARCH_DELAY);
+    let half_delay = search::OUTPUT_SEARCH_DELAY / 2;
+    cx.executor().advance_clock(half_delay);
+    output(cx);
+    assert_eq!(matches(cx), 1);
+    cx.executor().advance_clock(half_delay);
     cx.run_until_parked();
-    assert_eq!(matches(cx), 2);
+    assert_eq!(matches(cx), 3);
     assert!(terminal.read_with(cx, |view, _| view.pending_output_search.is_none()));
 }
 
