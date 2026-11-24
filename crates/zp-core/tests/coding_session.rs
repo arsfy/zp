@@ -234,8 +234,10 @@ async fn retry_after_a_failed_response() {
     assert!(coding.prepare_retry().is_err(), "nothing failed yet");
     coding.prompt("hi").await.unwrap();
     assert_eq!(coding.agent().messages().len(), 2);
+    let failed_prompt = coding.context_entry_ids()[0].clone();
     coding.prepare_retry().unwrap();
     assert_eq!(coding.agent().messages().len(), 1);
+    assert_eq!(coding.context_entry_ids()[0], failed_prompt);
     let added = coding.agent().continue_run().await.unwrap();
     assert_eq!(added[0].as_assistant().unwrap().text(), "second try");
     // The request did not include the failed response.
@@ -249,8 +251,81 @@ async fn retry_after_a_failed_response() {
             .filter(|e| e.message().is_some())
             .count(),
         3,
-        "the failed attempt is kept on its own branch"
+        "only the failed response sits on the old branch"
     );
+}
+
+#[tokio::test]
+async fn retry_records_only_its_own_file_changes() {
+    let project = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let manager = SessionManager::new(data.path().join("sessions"));
+    let faux = FauxProvider::default();
+    faux.push(call(
+        "write",
+        json!({"path": "previous.txt", "content": "previous turn"}),
+    ));
+    faux.push(FauxResponse::text("previous turn done"));
+    faux.push(call(
+        "write",
+        json!({"path": "result.txt", "content": "failed attempt"}),
+    ));
+    faux.push(FauxResponse::Error("overloaded".into()));
+    faux.push(call(
+        "write",
+        json!({"path": "result.txt", "content": "retried attempt"}),
+    ));
+    faux.push(FauxResponse::text("retried turn done"));
+    let session = manager.create(project.path());
+    let mut options = CodingSessionOptions::new(models(&faux), project.path(), session);
+    options.model = Some(faux.model());
+    let blobs = BlobStore::in_data_dir(data.path());
+    options.blobs = Some(blobs.clone());
+    let coding = CodingSession::new(options).unwrap();
+
+    coding.prompt("write the first file").await.unwrap();
+    let previous_group = coding.change_log().groups[0].clone();
+    coding.prompt("write the result").await.unwrap();
+    let mut context_before_retry = coding.agent().messages();
+    context_before_retry.pop();
+    let failed_leaf = coding.session().leaf_id().unwrap().to_owned();
+    let failed_log = coding.change_log();
+    assert_eq!(failed_log.groups[1].changes.len(), 1);
+
+    coding.prepare_retry().unwrap();
+    assert_eq!(coding.agent().messages(), context_before_retry);
+    let fresh_log = coding.change_log();
+    assert_eq!(fresh_log.groups[0], previous_group);
+    assert_eq!(fresh_log.groups[1].entry_id, failed_log.groups[1].entry_id);
+    assert_eq!(fresh_log.groups[1].changes, failed_log.groups[1].changes);
+    assert_eq!(fresh_log.groups[2].kind, GroupKind::Retry { attempt: 1 });
+    assert!(fresh_log.groups[2].changes.is_empty());
+
+    coding.agent().continue_run().await.unwrap();
+    let retry_log = coding.change_log();
+    let requests = faux.requests();
+    assert_eq!(requests[4].messages.len(), context_before_retry.len());
+    assert!(matches!(
+        requests[4].messages.last(),
+        Some(Message::ToolResult(_))
+    ));
+    let files = retry_log.files(Scope::Group(2));
+    assert_eq!(files.len(), 1);
+    assert!(files[0].path.ends_with("result.txt"));
+    assert_eq!(files[0].edits, 1);
+    assert_eq!(
+        files[0].start.load(coding.blobs()).unwrap().as_deref(),
+        Some("failed attempt")
+    );
+    assert_eq!(coding.change_log_at(Some(&failed_leaf)), failed_log);
+
+    let session_file = coding.session().file().unwrap().to_path_buf();
+    drop(coding);
+    let session = manager.open(&session_file).unwrap();
+    let mut options = CodingSessionOptions::new(models(&faux), project.path(), session);
+    options.blobs = Some(blobs);
+    let reopened = CodingSession::new(options).unwrap();
+    assert_eq!(reopened.change_log(), retry_log);
 }
 
 #[tokio::test]

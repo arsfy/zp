@@ -399,7 +399,7 @@ impl ConversationView {
                     .py_2()
                     .cursor_pointer()
                     .hover_style(|style| style.bg(colors.surface_hover))
-                    .tooltip(crate::ui::tooltip("View changes in this turn"))
+                    .tooltip(crate::ui::tooltip("View these file changes"))
                     .text_size(px(12.))
                     .child(
                         div()
@@ -426,7 +426,7 @@ impl ConversationView {
                         icon_button(
                             id("turn-changes-revert", row),
                             ICON_REVERT,
-                            "Revert all changes in this turn",
+                            "Revert these file changes",
                             cx,
                         )
                         .debug_selector(|| "turn-changes-revert".into())

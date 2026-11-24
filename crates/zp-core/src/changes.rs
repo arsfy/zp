@@ -1,4 +1,4 @@
-//! The file changes along one branch of a session, grouped by turn (user message), and
+//! The file changes along one branch of a session, grouped by turn or retry, and
 //! what reverting them means.
 
 use std::collections::{HashMap, HashSet};
@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use zp_agent::{AgentMessage, CustomMessage};
 use zp_ai::{Message, UserContent};
-use zp_session::SessionEntry;
+use zp_session::{EntryData, SessionEntry};
 
 use crate::checkpoint::{BlobStore, ContentRef, RecordedChange};
 use crate::restore::FileTarget;
@@ -23,6 +23,11 @@ pub enum GroupKind {
     Turn {
         /// The user's text.
         prompt: String,
+    },
+    /// A run that retried a failed or aborted response.
+    Retry {
+        /// 1-based retry number within the turn.
+        attempt: usize,
     },
     /// Files restored by the user (see [`FILE_RESTORE_TYPE`]).
     Restore {
@@ -70,14 +75,16 @@ impl RevertStatus {
     }
 }
 
-/// The changes made in one turn (or restore).
+/// The changes made in one turn, retry, or restore.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ChangeGroup {
     pub kind: GroupKind,
-    /// The user message (or restore message) entry; `None` for changes before the first
-    /// user message.
+    /// The user message, retry, or restore entry. Changes before the first user message
+    /// may have no starting entry.
     pub entry_id: Option<String>,
-    /// 1-based number among the turns of the branch (restores share the previous one).
+    /// The final assistant entry of this turn or retry on the current branch.
+    pub response_entry_id: Option<String>,
+    /// 1-based number among the turns of the branch (retries and restores share it).
     pub turn: usize,
     pub timestamp: i64,
     pub changes: Vec<ChangeRecord>,
@@ -91,6 +98,7 @@ impl ChangeGroup {
                 let line = prompt.lines().next().unwrap_or_default().trim();
                 format!("Turn {}: {line}", self.turn)
             }
+            GroupKind::Retry { attempt } => format!("Turn {} retry {}", self.turn, attempt),
             GroupKind::Restore { description } => description.clone(),
         }
     }
@@ -218,26 +226,49 @@ impl ChangeLog {
     pub fn from_path(path: &[&SessionEntry]) -> Self {
         let mut log = Self::default();
         let mut turns = 0;
+        let mut retries = 0;
+        let mut response_group = None;
         for entry in path {
+            if matches!(entry.data, EntryData::Retry) {
+                retries += 1;
+                response_group = Some(log.groups.len());
+                log.groups.push(ChangeGroup {
+                    kind: GroupKind::Retry { attempt: retries },
+                    entry_id: Some(entry.id.clone()),
+                    response_entry_id: None,
+                    turn: turns,
+                    timestamp: entry.timestamp,
+                    changes: Vec::new(),
+                });
+                continue;
+            }
             let Some(message) = entry.message() else {
                 continue;
             };
             match message {
                 AgentMessage::Llm(Message::User(user)) => {
                     turns += 1;
+                    retries = 0;
                     let prompt = user
                         .content
                         .iter()
                         .filter_map(UserContent::as_text)
                         .collect::<Vec<_>>()
                         .join("\n");
+                    response_group = Some(log.groups.len());
                     log.groups.push(ChangeGroup {
                         kind: GroupKind::Turn { prompt },
                         entry_id: Some(entry.id.clone()),
+                        response_entry_id: None,
                         turn: turns,
                         timestamp: entry.timestamp,
                         changes: Vec::new(),
                     });
+                }
+                AgentMessage::Llm(Message::Assistant(_)) => {
+                    if let Some(index) = response_group {
+                        log.groups[index].response_entry_id = Some(entry.id.clone());
+                    }
                 }
                 AgentMessage::Llm(Message::ToolResult(result)) if !result.is_error => {
                     let Some(change) = result
@@ -253,6 +284,7 @@ impl ChangeLog {
                                 prompt: String::new(),
                             },
                             entry_id: None,
+                            response_entry_id: None,
                             turn: 0,
                             timestamp: entry.timestamp,
                             changes: Vec::new(),
@@ -315,6 +347,7 @@ impl ChangeLog {
                             description: details.description,
                         },
                         entry_id: Some(entry.id.clone()),
+                        response_entry_id: None,
                         turn: turns,
                         timestamp: entry.timestamp,
                         changes,

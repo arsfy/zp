@@ -68,13 +68,9 @@ impl ConversationView {
         log
     }
 
-    /// Net changes for the answer ending at `row`, cached to avoid reading blobs on repaint.
+    /// Net changes for the turn or retry ending at `row`, cached across repaints.
     pub(crate) fn turn_changes_for_row(&self, row: usize) -> Option<Rc<TurnChanges>> {
         if !matches!(self.transcript.rows().get(row), Some(Row::Assistant { .. }))
-            || matches!(
-                self.transcript.rows().get(row + 1),
-                Some(Row::Assistant { .. })
-            )
             || (self.is_busy() && row + 1 == self.transcript.len())
         {
             return None;
@@ -88,15 +84,12 @@ impl ConversationView {
     }
 
     fn compute_turn_changes(&self, row: usize) -> Option<TurnChanges> {
-        let user_row = self.transcript.rows()[..=row]
-            .iter()
-            .rposition(|row| matches!(row, Row::User { .. }))?;
-        let entry = self.entry_for_row(user_row)?;
+        let entry = self.entry_for_row(row)?;
         let log = self.change_log();
         let group = log
             .groups
             .iter()
-            .position(|group| group.entry_id.as_deref() == Some(&entry))?;
+            .position(|group| group.response_entry_id.as_deref() == Some(&entry))?;
         let files = log.files(Scope::Group(group));
         let blobs = self.blobs()?;
         let mut changes = TurnChanges {
@@ -126,7 +119,7 @@ impl ConversationView {
         (!changes.files.is_empty()).then_some(changes)
     }
 
-    /// Opens the whole turn's diff with the selected file shown first.
+    /// Opens the change group's diff with the selected file shown first.
     pub(super) fn open_turn_diff(&self, scope: Scope, path: Option<&Path>, cx: &mut Context<Self>) {
         let items = self.diff_items(scope, cx);
         let index = match path {
@@ -311,14 +304,21 @@ impl ConversationView {
         };
         let description = match scope {
             Scope::Session => format!("Reverted {what}"),
-            Scope::Group(index) => match log.groups.get(index) {
-                Some(group) if matches!(group.kind, GroupKind::Restore { .. }) => {
-                    format!("Undid a restore of {what}")
+            Scope::Group(index) => {
+                let Some(group) = log.groups.get(index) else {
+                    return;
+                };
+                match group.kind {
+                    GroupKind::Restore { .. } => format!("Undid a restore of {what}"),
+                    GroupKind::Retry { attempt } => {
+                        format!("Reverted {what} in retry {attempt} of turn {}", group.turn)
+                    }
+                    GroupKind::Turn { .. } if path.is_some() => {
+                        format!("Reverted {what} in turn {}", group.turn)
+                    }
+                    GroupKind::Turn { .. } => format!("Reverted turn {}", group.turn),
                 }
-                Some(group) if path.is_some() => format!("Reverted {what} in turn {}", group.turn),
-                Some(group) => format!("Reverted turn {}", group.turn),
-                None => return,
-            },
+            }
         };
         let sources = log.revert_sources(scope, path.as_deref());
         self.run_restore(
@@ -343,7 +343,13 @@ impl ConversationView {
         let Some(group) = log.groups.get(index) else {
             return;
         };
-        let description = format!("Restored the checkpoint before turn {}", group.turn.max(1));
+        let description = match group.kind {
+            GroupKind::Retry { attempt } => format!(
+                "Restored the checkpoint before retry {attempt} of turn {}",
+                group.turn
+            ),
+            _ => format!("Restored the checkpoint before turn {}", group.turn.max(1)),
+        };
         let targets = log.checkpoint_targets(index);
         let sources = (index..log.groups.len())
             .flat_map(|index| log.revert_sources(Scope::Group(index), None))

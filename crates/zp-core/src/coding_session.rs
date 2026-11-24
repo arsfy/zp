@@ -911,9 +911,8 @@ impl CodingSession {
         self.session().context_entry_ids_at(None)
     }
 
-    /// Rewinds past a failed or aborted last response so that
-    /// [`Agent::continue_run`] asks again. The failed response stays in the session file
-    /// on an abandoned branch.
+    /// Rewinds the failed or aborted response so [`Agent::continue_run`] can resume
+    /// from the same context, then starts a new file change group for the retry.
     pub fn prepare_retry(&self) -> anyhow::Result<()> {
         if self.agent.is_streaming() {
             bail!("cannot retry while the agent is running");
@@ -921,20 +920,29 @@ impl CodingSession {
         let messages = {
             let mut session = self.session();
             let path = session.branch_path(None);
-            let failed = path
+            let parent = path
                 .iter()
                 .rev()
-                .find_map(|entry| Some((entry, entry.message()?)))
+                .find_map(|entry| Some((*entry, entry.message()?)))
                 .filter(|(_, message)| {
-                    message.as_assistant().is_some_and(|m| {
-                        matches!(m.stop_reason, StopReason::Error | StopReason::Aborted)
+                    message.as_assistant().is_some_and(|message| {
+                        matches!(message.stop_reason, StopReason::Error | StopReason::Aborted)
                     })
                 })
-                .map(|(entry, _)| entry.parent_id.clone());
-            match failed {
-                Some(Some(parent)) => session.branch(&parent)?,
-                Some(None) => session.reset_leaf(),
-                None => bail!("the last response did not fail"),
+                .context("the last response did not fail")?
+                .0
+                .parent_id
+                .clone();
+            let previous_leaf = session.leaf_id().map(str::to_owned);
+            match parent {
+                Some(parent) => session.branch(&parent)?,
+                None => session.reset_leaf(),
+            }
+            if let Err(error) = session.append(EntryData::Retry) {
+                if let Some(previous_leaf) = previous_leaf {
+                    session.branch(&previous_leaf)?;
+                }
+                return Err(error);
             }
             session.context().messages
         };

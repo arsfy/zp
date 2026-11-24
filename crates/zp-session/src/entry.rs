@@ -78,6 +78,8 @@ pub enum EntryData {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         elapsed_seconds: Option<u64>,
     },
+    /// A retry starts a new file change group on the current turn.
+    Retry,
     /// The model was switched.
     ModelChange {
         /// Provider id.
@@ -131,6 +133,7 @@ impl SessionEntry {
     pub fn kind(&self) -> &'static str {
         match self.data {
             EntryData::Message { .. } => "message",
+            EntryData::Retry => "retry",
             EntryData::ModelChange { .. } => "model_change",
             EntryData::ThinkingLevelChange { .. } => "thinking_level_change",
             EntryData::SessionInfo { .. } => "session_info",

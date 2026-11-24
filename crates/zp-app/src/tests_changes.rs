@@ -249,6 +249,51 @@ fn turn_footer_counts_net_changes_opens_diffs_and_reverts_the_turn(cx: &mut Test
 }
 
 #[gpui::test]
+fn retry_shows_separate_file_changes_in_the_same_conversation(cx: &mut TestAppContext) {
+    let faux = FauxProvider::default();
+    faux.push(write("first.txt", "saved before the error\n"));
+    faux.push(FauxResponse::Error("overloaded".into()));
+    faux.push(write("second.txt", "saved during retry\n"));
+    faux.push(FauxResponse::text("Both files are ready."));
+    let _data = setup_models(cx, &[&faux], false);
+    let (_dir, project) = project_dir();
+    let window = open(cx, &project);
+    let conversation = active(window, cx);
+    send(window, "write both files", cx);
+    idle(&conversation, 3, cx);
+    click(window, "response-error-retry", cx);
+    idle(&conversation, 4, cx);
+
+    let retry_group = conversation.read_with(cx, |view, _| {
+        let first = view.turn_changes_for_row(1).unwrap();
+        assert_eq!(first.files.len(), 1);
+        assert!(first.files[0].path.ends_with("first.txt"));
+        assert!(view.turn_changes_for_row(2).is_none());
+        let retry = view.turn_changes_for_row(3).unwrap();
+        assert_eq!(retry.files.len(), 1);
+        assert!(retry.files[0].path.ends_with("second.txt"));
+        retry.group
+    });
+    let panel = panel(window, cx);
+    panel.update(cx, |panel, cx| panel.set_mode(ChangesMode::Turns, cx));
+    assert_eq!(
+        group_labels(&panel, cx),
+        ["Turn 1 retry 1", "Turn 1: write both files"]
+    );
+    with_window(window, cx, |_, window, cx| {
+        conversation.update(cx, |view, cx| {
+            view.revert(Scope::Group(retry_group), None, window, cx);
+        });
+    });
+    cx.simulate_prompt_answer("Revert");
+    wait_until(cx, |_| read(&project, "second.txt").is_none());
+    assert_eq!(
+        read(&project, "first.txt").as_deref(),
+        Some("saved before the error\n")
+    );
+}
+
+#[gpui::test]
 fn turn_file_list_expands_and_opens_the_selected_diff(cx: &mut TestAppContext) {
     let faux = FauxProvider::default();
     let paths = [
