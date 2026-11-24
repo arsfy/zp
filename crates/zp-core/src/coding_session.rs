@@ -762,14 +762,20 @@ impl CodingSession {
     /// Replaces the tools (e.g. MCP servers connected) and updates the system prompt;
     /// `ask` stays when there is an asker.
     pub fn set_tools(&self, tools: Vec<Arc<dyn AgentTool>>) {
-        let mut inputs = self.tool_inputs.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut inputs = self
+            .tool_inputs
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         inputs.tools = tools;
         self.apply_tools(&inputs);
     }
 
     /// Restricts future runs to planning or restores their normal tools.
     pub fn set_plan_mode(&self, enabled: bool) {
-        let mut inputs = self.tool_inputs.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut inputs = self
+            .tool_inputs
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         if inputs.planning != enabled {
             inputs.planning = enabled;
             self.apply_tools(&inputs);
@@ -779,7 +785,10 @@ impl CodingSession {
     /// Applies a new policy to future runs.
     pub fn set_subagents(&self, settings: SubagentSettings) {
         let enabled = settings.is_usable();
-        let mut inputs = self.tool_inputs.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut inputs = self
+            .tool_inputs
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         let current = &mut inputs.subagent;
         if (enabled
             && current

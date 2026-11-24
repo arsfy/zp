@@ -96,7 +96,9 @@ impl IgnoreRules {
                 let _ = exclude_builder.add(exclude);
             }
         }
-        let exclude = exclude_builder.build().unwrap_or_else(|_| Gitignore::empty());
+        let exclude = exclude_builder
+            .build()
+            .unwrap_or_else(|_| Gitignore::empty());
         let (global, _) = GitignoreBuilder::new(repo_root).build_global();
 
         let tracked_ignored: Vec<PathBuf> = tracked_ignored_files(project).into_iter().collect();

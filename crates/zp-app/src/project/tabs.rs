@@ -122,7 +122,9 @@ impl ProjectWindow {
                         let view = conversation.read(cx);
                         let body = match view.failure() {
                             Some(error) => format!("Failed: {}", zp_tools::shorten(&error, 120)),
-                            None if view.has_plan_for_review() => "Plan ready for review".to_owned(),
+                            None if view.has_plan_for_review() => {
+                                "Plan ready for review".to_owned()
+                            }
                             None => "Finished".to_owned(),
                         };
                         this.notify_background(conversation, body, window, cx);

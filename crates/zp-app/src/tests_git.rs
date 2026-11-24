@@ -127,9 +127,7 @@ fn visible_git_panel_refreshes_after_external_file_changes(cx: &mut TestAppConte
     // External branch switch and commit update History and the window's branch.
     click(window, "git-tab-history", cx);
     wait_until(cx, |cx| {
-        panel.read_with(cx, |panel, _| {
-            panel.history().is_some_and(|h| h.len() == 1)
-        })
+        panel.read_with(cx, |panel, _| panel.history().is_some_and(|h| h.len() == 1))
     });
     git(&project, &["switch", "-q", "-c", "ext-branch"]);
     git(&project, &["commit", "-qm", "external commit"]);
@@ -139,9 +137,9 @@ fn visible_git_panel_refreshes_after_external_file_changes(cx: &mut TestAppConte
     });
     wait_until(cx, |cx| {
         panel.read_with(cx, |panel, _| {
-            panel.history().is_some_and(|h| {
-                h.len() == 2 && h[0].summary == "external commit"
-            })
+            panel
+                .history()
+                .is_some_and(|h| h.len() == 2 && h[0].summary == "external commit")
         })
     });
 
