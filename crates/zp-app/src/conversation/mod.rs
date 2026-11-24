@@ -16,7 +16,7 @@ pub mod transcript;
 pub mod tree;
 
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
@@ -41,7 +41,7 @@ use crate::diff_view::DiffItem;
 use crate::markdown::{Block, parse};
 use crate::review_model_picker::ReviewModelPicker;
 use crate::selectable_text::TextSelection;
-use crate::store::{AppModels, AppPaths};
+use crate::store::{AppModels, AppPaths, AppStore};
 
 /// Minimum time between applying event batches.
 const FRAME_INTERVAL: Duration = Duration::from_millis(33);
@@ -245,7 +245,7 @@ pub struct ConversationView {
     /// Whether the task list above the composer shows every item.
     todos_open: bool,
     /// Task updates the user hid from the composer.
-    dismissed_todo_calls: HashSet<String>,
+    dismissed_todo_calls: BTreeSet<String>,
     /// The sent message being edited, if any.
     editing: Option<MessageEdit>,
     /// Measured height of the floating composer.
@@ -308,6 +308,12 @@ impl ConversationView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        let dismissed_todo_calls = AppStore::state(cx)
+            .projects
+            .get(&root)
+            .and_then(|project| project.dismissed_todo_calls.get(session.id()))
+            .cloned()
+            .unwrap_or_default();
         let composer = cx.new(|cx| EditableTextState::new(StringStorage::default(), cx));
         let focus_handle = cx.focus_handle();
         let model_filter = cx.new(|cx| EditableTextState::new(StringStorage::default(), cx));
@@ -371,7 +377,7 @@ impl ConversationView {
             reviewing: HashSet::new(),
             questions: Vec::new(),
             todos_open: false,
-            dismissed_todo_calls: HashSet::new(),
+            dismissed_todo_calls,
             editing: None,
             composer_height: Rc::default(),
             composer_input_width: Rc::default(),

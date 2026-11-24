@@ -9,6 +9,7 @@ use zp_core::permissions::PermissionMode;
 use crate::conversation::ConversationView;
 use crate::conversation::transcript::ToolStatus;
 use crate::project::ProjectWindow;
+use crate::store::AppStore;
 use crate::tests::project_dir;
 use crate::tests_conversation::{
     active, idle, open, send, set_permission_mode, setup_models, wait_until,
@@ -165,7 +166,7 @@ fn todo_and_ask_run_without_approval_and_answers_reach_the_agent(cx: &mut TestAp
 }
 
 #[gpui::test]
-fn completed_tasks_stay_until_hidden_and_new_tasks_reappear(cx: &mut TestAppContext) {
+fn completed_tasks_stay_hidden_after_restart_and_new_tasks_reappear(cx: &mut TestAppContext) {
     let faux = FauxProvider::default();
     faux.push(FauxResponse::tool_call(
         "todo",
@@ -178,11 +179,11 @@ fn completed_tasks_stay_until_hidden_and_new_tasks_reappear(cx: &mut TestAppCont
         json!({"todos": [{"content": "Start the next task", "status": "in_progress"}]}),
     ));
     faux.push(FauxResponse::text("Started"));
-    let _data = setup_models(cx, &[&faux], false);
+    let data = setup_models(cx, &[&faux], false);
     let (_dir, project) = project_dir();
     let window = open(cx, &project);
     let conversation = active(window, cx);
-    let visible = |selector, cx: &mut TestAppContext| {
+    let visible = |window: WindowHandle<ProjectWindow>, selector, cx: &mut TestAppContext| {
         VisualTestContext::from_window(window.into(), cx)
             .debug_bounds(selector)
             .is_some()
@@ -190,19 +191,37 @@ fn completed_tasks_stay_until_hidden_and_new_tasks_reappear(cx: &mut TestAppCont
 
     send(window, "Finish the first task", cx);
     idle(&conversation, 3, cx);
-    assert!(visible("todo-panel", cx));
+    assert!(visible(window, "todo-panel", cx));
     click(window, "hide-completed-tasks", cx);
     cx.run_until_parked();
-    assert!(!visible("todo-panel", cx));
+    assert!(!visible(window, "todo-panel", cx));
+
+    let session = conversation
+        .read_with(cx, |view, _| view.session_file())
+        .unwrap();
+    cx.update(AppStore::flush);
+    window
+        .update(cx, |_, window, _| window.remove_window())
+        .unwrap();
+    cx.run_until_parked();
+    cx.update(|cx| AppStore::init(Some(zp_core::paths::state_file(data.path())), cx));
+
+    let window = open(cx, &project);
+    let conversation = active(window, cx);
+    conversation.read_with(cx, |view, _| {
+        assert_eq!(view.session_file().as_deref(), Some(session.as_path()));
+        assert!(view.current_todos().is_none());
+    });
+    assert!(!visible(window, "todo-panel", cx));
 
     send(window, "Confirm the first task is done", cx);
     idle(&conversation, 5, cx);
-    assert!(!visible("todo-panel", cx));
+    assert!(!visible(window, "todo-panel", cx));
 
     send(window, "Start the next task", cx);
     idle(&conversation, 8, cx);
-    assert!(visible("todo-panel", cx));
-    assert!(!visible("hide-completed-tasks", cx));
+    assert!(visible(window, "todo-panel", cx));
+    assert!(!visible(window, "hide-completed-tasks", cx));
 }
 
 #[gpui::test]

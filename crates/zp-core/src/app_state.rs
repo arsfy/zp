@@ -106,6 +106,9 @@ pub struct ProjectUiState {
     /// Session IDs hidden from this project's sidebar.
     #[serde(skip_serializing_if = "BTreeSet::is_empty")]
     pub hidden_sessions: BTreeSet<String>,
+    /// Completed task lists hidden from the composer, by session ID and tool call ID.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub dismissed_todo_calls: BTreeMap<String, BTreeSet<String>>,
     /// Index of the active tab.
     pub active_tab: usize,
     /// Whether the user trusts the project; `None` until asked.

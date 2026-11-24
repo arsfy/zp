@@ -14,6 +14,7 @@ use super::disclosure::collapsible;
 use super::render::icon_button;
 use super::{COMPOSER_CARD_RADIUS, ConversationEvent, ConversationView};
 use crate::approvals::PendingQuestions;
+use crate::store::AppStore;
 use crate::theme::ActiveTheme;
 use crate::ui::{disclosure_icon, ui_font};
 
@@ -407,6 +408,26 @@ impl ConversationView {
         (!list.todos.is_empty()).then_some((call_id, list))
     }
 
+    fn dismiss_todos(&mut self, call_id: &str, cx: &mut Context<Self>) {
+        self.dismissed_todo_calls.insert(call_id.to_owned());
+        self.todos_open = false;
+        let session_id = self.coding.as_ref().and_then(|coding| {
+            let session = coding.session();
+            session.is_persisted().then(|| session.id().to_owned())
+        });
+        if let Some(session_id) = session_id {
+            AppStore::update(cx, |state| {
+                state
+                    .project_mut(&self.root)
+                    .dismissed_todo_calls
+                    .entry(session_id)
+                    .or_default()
+                    .insert(call_id.to_owned());
+            });
+        }
+        cx.notify();
+    }
+
     /// The current task list above the composer: one line, or every item when opened.
     pub(super) fn render_todo_panel(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let (call_id, list) = self.current_todos()?;
@@ -478,9 +499,7 @@ impl ConversationView {
                             .aria_label("Hide completed tasks")
                             .on_click(cx.listener(
                                 move |this, _, _, cx| {
-                                    this.dismissed_todo_calls.insert(call_id.clone());
-                                    this.todos_open = false;
-                                    cx.notify();
+                                    this.dismiss_todos(&call_id, cx);
                                 },
                             )),
                         )
