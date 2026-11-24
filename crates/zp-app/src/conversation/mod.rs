@@ -10,6 +10,7 @@ mod files;
 mod permissions;
 mod progress;
 mod questions;
+mod queued;
 mod render;
 mod temp_files;
 pub mod transcript;
@@ -253,6 +254,11 @@ pub struct ConversationView {
     dismissed_todo_calls: BTreeSet<String>,
     /// The sent message being edited, if any.
     editing: Option<MessageEdit>,
+    queued_prompts: Vec<queued::QueuedPrompt>,
+    queued_edit: Option<queued::QueuedEdit>,
+    send_next: Option<zp_agent::SteeringId>,
+    /// Whether a completed run may immediately start the next waiting prompt.
+    continue_queued: bool,
     /// Measured height of the floating composer.
     composer_height: Rc<std::cell::Cell<f32>>,
     /// Measured width of the composer's text field.
@@ -386,6 +392,10 @@ impl ConversationView {
             todos_open: false,
             dismissed_todo_calls,
             editing: None,
+            queued_prompts: Vec::new(),
+            queued_edit: None,
+            send_next: None,
+            continue_queued: false,
             composer_height: Rc::default(),
             composer_input_width: Rc::default(),
             copied_row: None,
@@ -581,6 +591,13 @@ impl ConversationView {
         let mut changes = Changes::default();
         let mut compacted = false;
         for ReceivedEvent { at, event, timing } in &events {
+            if matches!(event, AgentEvent::AgentStart)
+                && self.send_next.is_some()
+                && let Some(coding) = &self.coding
+            {
+                // A click can arrive before the running task acquires its agent guard.
+                coding.agent().abort();
+            }
             self.track_temp_paths(event);
             if let AgentEvent::ContextCompacting { .. } = event {
                 self.auto_compacting = true;
@@ -633,6 +650,7 @@ impl ConversationView {
             self.change_log_cache.borrow_mut().take();
             cx.emit(ConversationEvent::FilesChanged);
         }
+        self.prune_queued_prompts();
         self.schedule_collapses(cx);
         if changes.finished && self.running {
             self.finish_run(cx);
@@ -1043,8 +1061,12 @@ impl ConversationView {
 
     /// Stops the running agent, if any.
     pub fn abort(&mut self, cx: &mut Context<Self>) {
+        self.continue_queued = false;
         if let Some(coding) = &self.coding {
             coding.agent().abort();
+            if let Some(id) = self.send_next.take() {
+                coding.agent().hold_steering(id, false);
+            }
         }
         cx.notify();
     }
@@ -1587,16 +1609,20 @@ impl ConversationView {
         self.remember_prompt(&text);
         self.picker = None;
         cx.emit(ConversationEvent::Activity);
-        let text = coding.expand_input(&text);
-        let (message, notes) =
-            zp_core::attachments::build_message(&text, &self.root, &self.attachments);
-        self.attachments.clear();
+        let expanded = coding.expand_input(&text);
+        let images = std::mem::take(&mut self.attachments);
+        let (message, notes) = zp_core::attachments::build_message(&expanded, &self.root, &images);
         if !notes.is_empty() {
             self.info = Some(notes.join("\n"));
         }
-        if self.running {
-            // Typed while working: delivered after the current tool calls finish.
-            coding.agent().steer(message);
+        if self.running || !coding.agent().steering_ids().is_empty() {
+            let id = coding.agent().enqueue_steering(message);
+            self.queued_prompts
+                .push(queued::QueuedPrompt { id, text, images });
+            if !self.running {
+                self.continue_queued = true;
+                self.resume_queued(cx);
+            }
             cx.notify();
             return;
         }
@@ -1626,6 +1652,7 @@ impl ConversationView {
             AppModels::remember_model(&model, cx);
         }
         self.running = true;
+        self.continue_queued = true;
         self.start_temp_tracking();
         self.ttft = None;
         self.tokens_per_second = None;
@@ -1643,6 +1670,12 @@ impl ConversationView {
                 // streamed content; only runs that never started end here.
                 let error = match result {
                     Ok(Ok(_)) => return,
+                    Ok(Err(zp_agent::AgentError::SteeringMessageUnavailable)) => {
+                        if this.running {
+                            this.finish_run(cx);
+                        }
+                        return;
+                    }
                     Ok(Err(error)) => error.to_string(),
                     Err(error) => format!("the run stopped unexpectedly: {error}"),
                 };
@@ -1668,11 +1701,19 @@ impl ConversationView {
         self.clear_questions();
         self.invalidate_files();
         let failed = self.has_failed();
+        if failed {
+            self.continue_queued = false;
+        }
         self.stop_status_updates(cx);
         cx.emit(ConversationEvent::StatusChanged);
         cx.emit(ConversationEvent::RunFinished);
         if !failed {
             self.request_title(cx);
+        }
+        if let Some(id) = self.send_next.take() {
+            self.start_queued(id, cx);
+        } else {
+            self.resume_queued(cx);
         }
         cx.notify();
     }
@@ -1739,7 +1780,7 @@ impl ConversationView {
             return;
         }
         match &self.coding {
-            Some(coding) if self.running => coding.agent().abort(),
+            Some(_) if self.running => self.abort(cx),
             _ => cx.propagate(),
         }
     }

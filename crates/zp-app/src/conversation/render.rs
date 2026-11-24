@@ -678,17 +678,24 @@ impl ConversationView {
         }
         .map(|label| {
             div()
+                .debug_selector(move || format!("message-time-{ix}").into())
                 .text_size(px(11.))
                 .text_color(cx.theme().colors.text_muted)
                 .whitespace_nowrap()
                 .child(label)
         });
         if show_progress {
+            // Keep the timestamp in a standard-height slot beside the taller indicator.
             return Some(
                 slot.h(px(38.))
+                    .items_start()
                     .justify_between()
                     .child(self.progress.clone())
-                    .children(label)
+                    .children(
+                        label.map(|label| {
+                            div().h(px(ACTION_SIZE)).flex().items_center().child(label)
+                        }),
+                    )
                     .into_any_element(),
             );
         }
@@ -865,7 +872,12 @@ impl ConversationView {
                         .child(format!("{images} image(s) attached")),
                 )
             });
-        div().flex().justify_end().child(bubble).into_any_element()
+        div()
+            .debug_selector(move || format!("user-message-{row}").into())
+            .flex()
+            .justify_end()
+            .child(bubble)
+            .into_any_element()
     }
 
     fn render_assistant(&self, row: usize, cx: &mut Context<Self>) -> AnyElement {
@@ -1948,14 +1960,186 @@ impl ConversationView {
         .into_any_element()
     }
 
+    fn render_queued_prompts(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if self.queued_prompts.is_empty() {
+            return None;
+        }
+        let muted = cx.theme().colors.text_muted;
+        Some(
+            div()
+                .id("queued-prompts")
+                .debug_selector(|| "queued-prompts".into())
+                .flex()
+                .flex_col()
+                .gap_0p5()
+                .max_h(px(220.))
+                .overflow_y_scroll()
+                .child(
+                    div()
+                        .text_size(px(11.))
+                        .text_color(muted)
+                        .child("Queued messages"),
+                )
+                .children(
+                    self.queued_prompts
+                        .iter()
+                        .enumerate()
+                        .map(|(index, prompt)| self.render_queued_prompt(index, prompt, cx)),
+                )
+                .into_any_element(),
+        )
+    }
+
+    fn render_queued_prompt(
+        &self,
+        index: usize,
+        prompt: &super::queued::QueuedPrompt,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let colors = cx.theme().colors.clone();
+        let queued_id = prompt.id;
+        let row = div().min_w_0().flex_shrink_0().text_size(px(12.));
+        let actions = div().flex().flex_shrink_0().items_center().gap_1();
+        let attachments = prompt
+            .images
+            .iter()
+            .map(|image| image.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let withdraw = ghost_button(id("queue-withdraw", index), "Withdraw", cx)
+            .debug_selector(move || format!("queue-withdraw-{index}").into())
+            .on_click(
+                cx.listener(move |this, _, window, cx| this.withdraw_queued(queued_id, window, cx)),
+            );
+        if let Some(edit) = self
+            .queued_edit
+            .as_ref()
+            .filter(|edit| edit.id == queued_id)
+        {
+            row.flex()
+                .flex_col()
+                .gap_0p5()
+                .key_context("MessageEditor")
+                .on_action(
+                    cx.listener(|this, _: &crate::actions::SubmitEdit, window, cx| {
+                        this.save_queued_edit(window, cx);
+                    }),
+                )
+                .on_action(
+                    cx.listener(|this, _: &crate::actions::CancelEdit, window, cx| {
+                        this.cancel_queued_edit(window, cx);
+                    }),
+                )
+                .child(
+                    text_area("queued-message-editor")
+                        .state(edit.input.downgrade())
+                        .placeholder("Edit queued message…")
+                        .caret_color(rgb_to_hsla(colors.text))
+                        .selection_color(rgb_to_hsla(colors.accent).opacity(0.35))
+                        .w_full()
+                        .min_h(px(28.))
+                        .max_h(px(120.))
+                        .overflow_y_scroll(),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .truncate()
+                                .text_color(colors.text_muted)
+                                .child(attachments),
+                        )
+                        .child(
+                            actions
+                                .child(withdraw)
+                                .child(ghost_button("queue-cancel-edit", "Cancel", cx).on_click(
+                                    cx.listener(|this, _, window, cx| {
+                                        this.cancel_queued_edit(window, cx)
+                                    }),
+                                ))
+                                .child(
+                                    ghost_button("queue-save-edit", "Save", cx)
+                                        .debug_selector(|| "queue-save-edit".into())
+                                        .text_color(colors.accent)
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            this.save_queued_edit(window, cx)
+                                        })),
+                                ),
+                        ),
+                )
+        } else {
+            let send_label = if self.running {
+                "Interrupt & Send"
+            } else {
+                "Send Now"
+            };
+            let mut preview = prompt.text.split_whitespace().collect::<Vec<_>>().join(" ");
+            if !attachments.is_empty() {
+                if !preview.is_empty() {
+                    preview.push_str(" · ");
+                }
+                preview.push_str(&attachments.split_whitespace().collect::<Vec<_>>().join(" "));
+            }
+            row.flex()
+                .items_center()
+                .gap_2()
+                .child(
+                    div()
+                        .debug_selector(move || format!("queue-preview-{index}").into())
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .child(preview),
+                )
+                .child(
+                    actions
+                        .when(self.send_next.is_none(), |actions| {
+                            actions.child(
+                                ghost_button(id("queue-send-now", index), send_label, cx)
+                                    .debug_selector(move || {
+                                        format!("queue-send-now-{index}").into()
+                                    })
+                                    .text_color(colors.accent)
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.send_queued_now(queued_id, cx)
+                                    })),
+                            )
+                        })
+                        .when(
+                            self.queued_edit.is_none() && self.send_next != Some(queued_id),
+                            |actions| {
+                                actions.child(
+                                    ghost_button(id("queue-edit", index), "Edit", cx)
+                                        .debug_selector(move || {
+                                            format!("queue-edit-{index}").into()
+                                        })
+                                        .on_click(cx.listener(move |this, _, window, cx| {
+                                            this.edit_queued(queued_id, window, cx)
+                                        })),
+                                )
+                            },
+                        )
+                        .when(self.send_next == Some(queued_id), |actions| {
+                            actions
+                                .child(div().text_color(colors.text_muted).child("Sending next…"))
+                        })
+                        .child(withdraw),
+                )
+        }
+    }
+
     fn render_composer(&self, cx: &mut Context<Self>) -> AnyElement {
         let colors = cx.theme().colors.clone();
-        let Some(coding) = &self.coding else {
+        if self.coding.is_none() {
             return div().into_any_element();
-        };
+        }
         let model = self.model();
         let thinking = self.effective_thinking();
-        let queued = coding.agent().steering_queue().len();
         let none_available = self.model_choices(cx).is_empty();
         // The session's model may belong to a provider without a key.
         let model_label = match &model {
@@ -2010,27 +2194,35 @@ impl ConversationView {
                 )
         };
 
-        let action = if self.running {
-            ghost_button("stop", "Stop", cx)
-                .text_color(colors.error)
-                .on_click(cx.listener(|this, _, window, cx| {
-                    this.stop(&crate::actions::StopRun, window, cx)
-                }))
-        } else {
-            div()
-                .id("send")
-                .px_3()
-                .py_0p5()
-                .rounded(px(4.))
-                .text_size(px(12.))
-                .bg(colors.accent)
-                .text_color(colors.accent_text)
-                .cursor_pointer()
-                .child("Send")
-                .on_click(cx.listener(|this, _, window, cx| {
-                    this.send(&crate::actions::SendMessage, window, cx)
-                }))
-        };
+        let action = div()
+            .flex()
+            .items_center()
+            .gap_1()
+            .when(self.running, |actions| {
+                actions.child(
+                    ghost_button("stop", "Stop", cx)
+                        .text_color(colors.error)
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.stop(&crate::actions::StopRun, window, cx)
+                        })),
+                )
+            })
+            .child(
+                div()
+                    .id("send")
+                    .debug_selector(|| "send-message".into())
+                    .px_3()
+                    .py_0p5()
+                    .rounded(px(4.))
+                    .text_size(px(12.))
+                    .bg(colors.accent)
+                    .text_color(colors.accent_text)
+                    .cursor_pointer()
+                    .child(if self.running { "Queue" } else { "Send" })
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.send(&crate::actions::SendMessage, window, cx)
+                    })),
+            );
 
         let todos = self.render_todo_panel(cx);
         let notes = div()
@@ -2154,16 +2346,7 @@ impl ConversationView {
                             .child("Compacting the conversation…"),
                     )
                 })
-                .when(queued > 0, |this| {
-                    this.child(
-                        div()
-                            .text_size(px(12.))
-                            .text_color(colors.text_muted)
-                            .child(format!(
-                                "{queued} queued message(s) — sent after the current step"
-                            )),
-                    )
-                })
+                .children(self.render_queued_prompts(cx))
 ;
         let input_width = self.composer_input_width.clone();
         let view = cx.entity().downgrade();
@@ -2252,7 +2435,7 @@ impl ConversationView {
                 text_area("composer-input")
                     .state(self.composer.downgrade())
                     .placeholder(if self.running {
-                        "Steer the agent… (sent after the current step)"
+                        "Queue a message… (sent after the current step)"
                     } else {
                         "Message ZP… (/ for commands, @ to attach files)"
                     })
@@ -2799,6 +2982,61 @@ mod tests {
                 Some(expected),
             );
         }
+    }
+
+    #[gpui::test]
+    fn first_user_message_time_stays_aligned_until_thinking_starts(cx: &mut TestAppContext) {
+        let faux = FauxProvider::default();
+        let _data = setup_models(cx, &[&faux], false);
+        let (_dir, project) = project_dir();
+        let window = open(cx, &project);
+        let conversation = active(window, cx);
+        let offset = |cx: &mut TestAppContext| {
+            cx.run_until_parked();
+            let mut visual = VisualTestContext::from_window(window.into(), cx);
+            let message = visual.debug_bounds("user-message-0").unwrap();
+            let time = visual.debug_bounds("message-time-0").unwrap();
+            time.top() - message.bottom()
+        };
+        let at = Instant::now();
+        conversation.update(cx, |view, cx| {
+            view.running = true;
+            view.apply_events(
+                vec![ReceivedEvent::new(
+                    at,
+                    AgentEvent::MessageEnd {
+                        message: AgentMessage::user("Hello"),
+                    },
+                )],
+                cx,
+            );
+        });
+        let waiting = offset(cx);
+
+        conversation.update(cx, |view, cx| {
+            let message = AssistantMessage::empty("faux", "faux", "faux-1");
+            view.apply_events(
+                vec![
+                    ReceivedEvent::new(
+                        at,
+                        AgentEvent::MessageStart {
+                            message: message.into(),
+                        },
+                    ),
+                    ReceivedEvent::new(
+                        at,
+                        AgentEvent::MessageUpdate {
+                            event: AssistantMessageEvent::ThinkingStart {
+                                index: 0,
+                                redacted: false,
+                            },
+                        },
+                    ),
+                ],
+                cx,
+            );
+        });
+        assert_eq!(waiting, offset(cx));
     }
 
     #[gpui::test]

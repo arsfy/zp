@@ -42,6 +42,10 @@ pub enum QueueMode {
     OneAtATime,
 }
 
+/// Identifies one steering message until the agent takes it from the queue.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SteeringId(u64);
+
 /// Why a call was rejected.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AgentError {
@@ -53,6 +57,8 @@ pub enum AgentError {
     NothingToContinue,
     /// `continue_run` was called after an assistant message with nothing queued.
     CannotContinueFromAssistant,
+    /// The requested steering message was already taken or removed.
+    SteeringMessageUnavailable,
     /// No model is selected.
     NoModel,
 }
@@ -67,6 +73,7 @@ impl fmt::Display for AgentError {
                 "cannot continue after an assistant message without queued messages"
             }
             Self::NoModel => "no model is selected",
+            Self::SteeringMessageUnavailable => "the queued message is no longer available",
         })
     }
 }
@@ -230,8 +237,15 @@ struct Settings {
 }
 
 struct Queue {
-    messages: VecDeque<AgentMessage>,
+    messages: VecDeque<QueuedMessage>,
     mode: QueueMode,
+    next_id: u64,
+}
+
+struct QueuedMessage {
+    id: SteeringId,
+    message: AgentMessage,
+    held: bool,
 }
 
 impl Queue {
@@ -239,14 +253,41 @@ impl Queue {
         Self {
             messages: VecDeque::new(),
             mode,
+            next_id: 0,
         }
     }
 
+    fn push(&mut self, message: AgentMessage) -> SteeringId {
+        let id = SteeringId(self.next_id);
+        self.next_id += 1;
+        self.messages.push_back(QueuedMessage {
+            id,
+            message,
+            held: false,
+        });
+        id
+    }
+
+    fn take(&mut self, id: SteeringId) -> Option<AgentMessage> {
+        let index = self.messages.iter().position(|entry| entry.id == id)?;
+        self.messages.remove(index).map(|entry| entry.message)
+    }
+
     fn drain(&mut self) -> Vec<AgentMessage> {
-        match self.mode {
-            QueueMode::All => self.messages.drain(..).collect(),
-            QueueMode::OneAtATime => self.messages.pop_front().into_iter().collect(),
-        }
+        let limit = match self.mode {
+            QueueMode::All => usize::MAX,
+            QueueMode::OneAtATime => 1,
+        };
+        let count = self
+            .messages
+            .iter()
+            .take(limit)
+            .take_while(|entry| !entry.held)
+            .count();
+        self.messages
+            .drain(..count)
+            .map(|entry| entry.message)
+            .collect()
     }
 }
 
@@ -574,18 +615,17 @@ impl Agent {
 
     /// Queues a message to insert after the current turn's tool calls finish.
     pub fn steer(&self, message: impl Into<AgentMessage>) {
-        lock(&self.shared.queues)
-            .steering
-            .messages
-            .push_back(message.into());
+        self.enqueue_steering(message);
+    }
+
+    /// Queues a steering message and returns its identifier for subsequent edits.
+    pub fn enqueue_steering(&self, message: impl Into<AgentMessage>) -> SteeringId {
+        lock(&self.shared.queues).steering.push(message.into())
     }
 
     /// Queues a message to process once the agent would otherwise stop.
     pub fn follow_up(&self, message: impl Into<AgentMessage>) {
-        lock(&self.shared.queues)
-            .follow_up
-            .messages
-            .push_back(message.into());
+        lock(&self.shared.queues).follow_up.push(message.into());
     }
 
     /// Queued steering messages, oldest first.
@@ -594,8 +634,80 @@ impl Agent {
             .steering
             .messages
             .iter()
-            .cloned()
+            .map(|entry| entry.message.clone())
             .collect()
+    }
+
+    /// Identifiers of the steering messages still waiting, in queue order.
+    pub fn steering_ids(&self) -> Vec<SteeringId> {
+        lock(&self.shared.queues)
+            .steering
+            .messages
+            .iter()
+            .map(|entry| entry.id)
+            .collect()
+    }
+
+    /// Holds a message in place until it can be edited or sent. A held message also
+    /// keeps later messages in order. Returns false once the agent has taken it.
+    pub fn hold_steering(&self, id: SteeringId, held: bool) -> bool {
+        let mut queues = lock(&self.shared.queues);
+        let Some(entry) = queues
+            .steering
+            .messages
+            .iter_mut()
+            .find(|entry| entry.id == id)
+        else {
+            return false;
+        };
+        entry.held = held;
+        true
+    }
+
+    /// Holds the selected message at the front so the current run cannot take it or
+    /// later messages while winding down for an interruption.
+    pub fn prioritize_steering(&self, id: SteeringId) -> bool {
+        let mut queues = lock(&self.shared.queues);
+        let messages = &mut queues.steering.messages;
+        let Some(index) = messages.iter().position(|entry| entry.id == id) else {
+            return false;
+        };
+        let mut entry = messages.remove(index).expect("the entry is still queued");
+        entry.held = true;
+        messages.push_front(entry);
+        true
+    }
+
+    /// Replaces a waiting message in place and releases its hold.
+    pub fn replace_steering(&self, id: SteeringId, message: AgentMessage) -> bool {
+        let mut queues = lock(&self.shared.queues);
+        let Some(entry) = queues
+            .steering
+            .messages
+            .iter_mut()
+            .find(|entry| entry.id == id)
+        else {
+            return false;
+        };
+        entry.message = message;
+        entry.held = false;
+        true
+    }
+
+    /// Withdraws a message if it is still queued.
+    pub fn remove_steering(&self, id: SteeringId) -> bool {
+        lock(&self.shared.queues).steering.take(id).is_some()
+    }
+
+    /// Starts a run with the selected steering message. Other queued messages wait
+    /// for subsequent turns even if this message was held or behind them.
+    pub async fn prompt_steering(&self, id: SteeringId) -> Result<Vec<AgentMessage>, AgentError> {
+        let guard = self.begin_run(CancellationToken::new())?;
+        let message = lock(&self.shared.queues)
+            .steering
+            .take(id)
+            .ok_or(AgentError::SteeringMessageUnavailable)?;
+        Ok(self.execute(guard, vec![message], true).await)
     }
 
     /// Queued follow-up messages, oldest first.
@@ -604,7 +716,7 @@ impl Agent {
             .follow_up
             .messages
             .iter()
-            .cloned()
+            .map(|entry| entry.message.clone())
             .collect()
     }
 

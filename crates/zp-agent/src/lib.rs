@@ -21,8 +21,8 @@ mod schema;
 mod tool;
 
 pub use agent::{
-    Agent, AgentError, AgentEvents, AgentOptions, AgentState, PromptInput, QueueMode, Subscription,
-    stream_fn,
+    Agent, AgentError, AgentEvents, AgentOptions, AgentState, PromptInput, QueueMode, SteeringId,
+    Subscription, stream_fn,
 };
 pub use agent_loop::StreamFn;
 pub use event::AgentEvent;

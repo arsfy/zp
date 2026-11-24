@@ -51,6 +51,122 @@ fn click(window: WindowHandle<ProjectWindow>, selector: &'static str, cx: &mut T
     visual.simulate_click(bounds.center(), Modifiers::none());
 }
 
+fn request_prompts(faux: &FauxProvider) -> Vec<String> {
+    faux.requests()
+        .iter()
+        .filter_map(|request| {
+            request
+                .messages
+                .iter()
+                .rev()
+                .find_map(|message| match message {
+                    zp_ai::Message::User(user) => Some(
+                        user.content
+                            .iter()
+                            .filter_map(UserContent::as_text)
+                            .collect(),
+                    ),
+                    _ => None,
+                })
+        })
+        .collect()
+}
+
+#[gpui::test]
+fn queued_messages_can_be_edited_and_withdrawn_before_delivery(cx: &mut TestAppContext) {
+    let faux = FauxProvider::default();
+    faux.push(FauxResponse::tool_call(
+        "ask",
+        json!({"questions": [
+            {"question": "Continue?", "options": [{"label": "Yes"}]}
+        ]}),
+    ));
+    faux.push(FauxResponse::text("First reply complete."));
+    faux.push(FauxResponse::text("Edited prompt received."));
+    let _data = setup_models(cx, &[&faux], false);
+    let (_dir, project) = project_dir();
+    let window = open(cx, &project);
+    let conversation = active(window, cx);
+    send(window, "first", cx);
+    wait_for_questions(&conversation, cx);
+
+    let long_prompt = format!("edit this\n{}", "another word ".repeat(80).trim_end());
+    for text in [long_prompt.as_str(), "take this back"] {
+        conversation.update(cx, |view, cx| view.set_draft(text, cx));
+        click(window, "send-message", cx);
+    }
+    cx.run_until_parked();
+    let mut visual = VisualTestContext::from_window(window.into(), cx);
+    let long_preview = visual.debug_bounds("queue-preview-0").unwrap();
+    let short_preview = visual.debug_bounds("queue-preview-1").unwrap();
+    assert_eq!(long_preview.size.height, short_preview.size.height);
+
+    conversation.update(cx, |view, cx| view.set_draft("current draft", cx));
+    click(window, "queue-edit-1", cx);
+    cx.simulate_input(window.into(), " after editing");
+    click(window, "queue-withdraw-1", cx);
+    assert_eq!(
+        conversation.read_with(cx, |view, cx| view.draft(cx)),
+        "current draft\n\ntake this back after editing"
+    );
+
+    click(window, "queue-edit-0", cx);
+    cx.simulate_input(window.into(), " before sending");
+    click(window, "question-option-0-0", cx);
+    wait_until(cx, |cx| {
+        !conversation.read_with(cx, |view, _| view.is_running()) && faux.requests().len() == 2
+    });
+    assert_eq!(request_prompts(&faux), ["first", "first"]);
+
+    click(window, "queue-save-edit", cx);
+    wait_until(cx, |cx| {
+        !conversation.read_with(cx, |view, _| view.is_running()) && faux.requests().len() == 3
+    });
+    assert_eq!(
+        request_prompts(&faux),
+        ["first", "first", &format!("{long_prompt} before sending")]
+    );
+    assert_eq!(
+        conversation.read_with(cx, |view, cx| view.draft(cx)),
+        "current draft\n\ntake this back after editing"
+    );
+    assert!(
+        VisualTestContext::from_window(window.into(), cx)
+            .debug_bounds("queued-prompts")
+            .is_none()
+    );
+}
+
+#[gpui::test]
+fn interrupt_and_send_prioritizes_the_selected_queued_message(cx: &mut TestAppContext) {
+    let faux = FauxProvider::default();
+    faux.push(FauxResponse::blocks(vec![FauxBlock::WaitForCancellation]));
+    faux.push(FauxResponse::text("Urgent reply."));
+    faux.push(FauxResponse::text("Earlier reply."));
+    let _data = setup_models(cx, &[&faux], false);
+    let (_dir, project) = project_dir();
+    let window = open(cx, &project);
+    let conversation = active(window, cx);
+    send(window, "interrupt this", cx);
+    wait_until(cx, |_| faux.requests().len() == 1);
+    send(window, "earlier", cx);
+    send(window, "urgent", cx);
+
+    click(window, "queue-send-now-1", cx);
+    wait_until(cx, |cx| {
+        !conversation.read_with(cx, |view, _| view.is_running()) && faux.requests().len() == 3
+    });
+    assert_eq!(
+        request_prompts(&faux),
+        ["interrupt this", "urgent", "earlier"]
+    );
+    assert!(
+        VisualTestContext::from_window(window.into(), cx)
+            .debug_bounds("queued-prompts")
+            .is_none()
+    );
+}
+
 #[gpui::test]
 fn file_tools_show_read_code_and_edit_content_while_it_streams(cx: &mut TestAppContext) {
     let faux = FauxProvider::default().with_chunk_delay(std::time::Duration::from_millis(200));
