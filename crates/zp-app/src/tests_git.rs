@@ -735,9 +735,12 @@ fn a_reply_does_not_overwrite_an_edited_draft_and_waiting_can_be_stopped(cx: &mu
     click(window, "status-changes", cx);
     settle(&panel, cx, |s| s.unstaged().count() == 1);
 
-    // The draft typed while the model works is kept.
-    click(window, "git-generate-message", cx);
-    message.update(cx, |input, cx| input.emplace("My own words", cx));
+    // Edit in the same UI update so an immediate model reply cannot land first.
+    panel.update(cx, |panel, cx| {
+        panel.generate_commit_message(cx);
+        assert!(panel.is_busy());
+        message.update(cx, |input, cx| input.emplace("My own words", cx));
+    });
     wait_until(cx, |cx| !panel.read_with(cx, |panel, _| panel.is_busy()));
     assert_eq!(
         message.read_with(cx, |input, _| input.as_str().to_owned()),
@@ -759,7 +762,7 @@ fn a_reply_does_not_overwrite_an_edited_draft_and_waiting_can_be_stopped(cx: &mu
     // External edits while generating a message are not dropped when waiting stops.
     faux.push(FauxResponse::text("feat(main): too slow"));
     click(window, "git-generate-message", cx);
-    wait_until(cx, |cx| panel.read_with(cx, |panel, _| panel.is_busy()));
+    wait_until(cx, |_| !faux.requests().is_empty());
     std::fs::write(project.join("extra.rs"), "pub fn extra() {}\n").unwrap();
     panel.update(cx, |panel, cx| panel.refresh(cx));
     click(window, "git-generate-message", cx);
