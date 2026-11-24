@@ -47,6 +47,7 @@ fn commands_templates_and_skills(cx: &mut TestAppContext) {
     let faux = FauxProvider::default();
     faux.push(FauxResponse::text("reviewed"));
     faux.push(FauxResponse::text("used the skill"));
+    faux.push(FauxResponse::text("used the referenced skill"));
     let data = setup_models(cx, &[&faux], false);
     write(
         data.path().join("prompts/review.md"),
@@ -96,6 +97,32 @@ fn commands_templates_and_skills(cx: &mut TestAppContext) {
     let text = text_of(&last_prompt(&faux));
     assert!(text.starts_with("<skill name=\"release\""), "{text}");
     assert!(text.ends_with("Run the release checklist.\n</skill>\n\nnow"));
+
+    // A skill reference completes at the caret and leaves the rest of the draft intact.
+    set_draft(window, "Use  on this build", cx);
+    conversation.update(cx, |view, cx| {
+        view.composer_input()
+            .update(cx, |input, cx| input.move_to(4, cx));
+    });
+    cx.simulate_input(window.into(), "$rele");
+    cx.run_until_parked();
+    conversation.read_with(cx, |view, _| {
+        let completion = view.completion().unwrap();
+        assert_eq!(completion.kind, CompletionKind::Skill);
+        assert_eq!(completion.items[0].label, "$release");
+    });
+    cx.dispatch_action(window.into(), crate::actions::AcceptCompletion);
+    cx.run_until_parked();
+    assert_eq!(
+        conversation.read_with(cx, |v, cx| v.draft(cx)),
+        "Use $release on this build"
+    );
+    assert!(conversation.read_with(cx, |v, _| v.completion().is_none()));
+    cx.dispatch_action(window.into(), crate::actions::SendMessage);
+    idle(&conversation, 6, cx);
+    let text = text_of(&last_prompt(&faux));
+    assert!(text.starts_with("<skill name=\"release\""), "{text}");
+    assert!(text.ends_with("Run the release checklist.\n</skill>\n\nUse $release on this build"));
 
     // Built-in commands run locally.
     let requests = faux.requests().len();

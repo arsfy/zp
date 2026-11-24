@@ -800,7 +800,7 @@ impl CodingSession {
         }
     }
 
-    /// Expands a `/template` or `/skill:name` command; other input is returned as is.
+    /// Expands prompt commands and `$skill` references; other input is returned as is.
     pub fn expand_input(&self, input: &str) -> String {
         self.resources()
             .expand(input.trim_start())

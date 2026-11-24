@@ -7,12 +7,13 @@
 //!   `SKILL.md` (frontmatter `name`, `description`) under `~/.zp/skills/`,
 //!   `~/.agents/skills/`, `~/.codex/skills/` and `~/.claude/skills/`, and the same
 //!   directories in projects. Pi directories are not scanned. The system prompt lists
-//!   them; `/skill:name args` loads one explicitly. Duplicate names keep the first match,
-//!   preferring project skills over user skills and ZP over the other locations.
+//!   them. `$name` in a prompt or `/skill:name args` loads one explicitly. Duplicate names
+//!   keep the first match, preferring project skills over user skills and ZP over other locations.
 //!
 //! Project resources are only loaded for trusted projects.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 
 /// Where a resource comes from.
@@ -40,7 +41,7 @@ pub struct Skill {
     pub description: String,
     /// The `SKILL.md` file.
     pub path: PathBuf,
-    /// Hidden from the model's list; only `/skill:name` loads it.
+    /// Hidden from the model's list; `$name` and `/skill:name` can load it explicitly.
     pub disable_model_invocation: bool,
     pub source: Source,
 }
@@ -241,12 +242,63 @@ pub fn substitute_args(content: &str, args: &[String]) -> String {
 fn valid_skill_name(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= 64
-        && name
-            .chars()
-            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+        && name.chars().all(skill_name_char)
         && !name.starts_with('-')
         && !name.ends_with('-')
         && !name.contains("--")
+}
+
+fn skill_name_char(c: char) -> bool {
+    c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-'
+}
+
+fn skill_reference_end(c: char) -> bool {
+    c.is_whitespace()
+        || matches!(
+            c,
+            ',' | ';'
+                | ':'
+                | ')'
+                | ']'
+                | '!'
+                | '?'
+                | '，'
+                | '、'
+                | '；'
+                | '：'
+                | '）'
+                | '】'
+                | '。'
+                | '！'
+                | '？'
+        )
+}
+
+fn skill_references(input: &str) -> impl Iterator<Item = (Range<usize>, &str)> {
+    input.match_indices('$').filter_map(|(start, _)| {
+        if input[..start].chars().next_back().is_some_and(|c| {
+            !c.is_whitespace() && !matches!(c, '(' | '[' | ',' | '（' | '【' | '，' | '、')
+        }) {
+            return None;
+        }
+        let rest = &input[start + 1..];
+        let len = rest.find(|c| !skill_name_char(c)).unwrap_or(rest.len());
+        let end = &rest[len..];
+        let boundary = end.is_empty()
+            || end.starts_with(skill_reference_end)
+            || end.strip_prefix('.').is_some_and(|after| {
+                after.is_empty() || after.starts_with('.') || after.starts_with(skill_reference_end)
+            });
+        boundary.then_some((start..start + 1 + len, &rest[..len]))
+    })
+}
+
+/// The range of a `$skill` reference at `caret` and the partial name before the caret.
+pub fn skill_reference_at(input: &str, caret: usize) -> Option<(Range<usize>, &str)> {
+    let (range, _) =
+        skill_references(input).find(|(range, _)| range.start < caret && caret <= range.end)?;
+    let query = input.get(range.start + 1..caret)?;
+    Some((range, query))
 }
 
 impl Resources {
@@ -408,31 +460,55 @@ impl Resources {
         self.skills.iter().find(|s| s.name == name)
     }
 
-    /// Expands `/skill:name args` and `/template args`; `None` when `input` is neither.
+    /// Expands prompt commands and includes each skill referenced explicitly in `input`.
+    /// Returns `None` if there is nothing to expand.
     pub fn expand(&self, input: &str) -> Option<String> {
-        let command = input.strip_prefix('/')?;
-        let (name, args) = command
-            .split_once(char::is_whitespace)
-            .map_or((command, ""), |(n, a)| (n, a.trim()));
-        if let Some(skill_name) = name.strip_prefix("skill:") {
-            let skill = self.skill(skill_name)?;
-            let text = std::fs::read_to_string(&skill.path).ok()?;
-            let (_, body) = parse_frontmatter(&text);
-            let block = format!(
-                "<skill name=\"{}\" location=\"{}\">\nReferences are relative to {}.\n\n{}\n</skill>",
-                skill.name,
-                skill.path.display(),
-                skill.base_dir().display(),
-                body.trim()
-            );
-            return Some(if args.is_empty() {
-                block
-            } else {
-                format!("{block}\n\n{args}")
-            });
+        let mut prompt = None;
+        let mut skill_blocks = Vec::new();
+        let mut seen = BTreeSet::new();
+        if let Some(command) = input.strip_prefix('/') {
+            let (name, args) = command
+                .split_once(char::is_whitespace)
+                .map_or((command, ""), |(n, a)| (n, a.trim()));
+            if let Some(name) = name.strip_prefix("skill:") {
+                if let Some(block) = self.skill_block(name) {
+                    seen.insert(name);
+                    skill_blocks.push(block);
+                    prompt = Some(args.to_owned());
+                }
+            } else if let Some(template) = self.template(name) {
+                prompt = Some(substitute_args(&template.body, &parse_command_args(args)));
+            }
         }
-        let template = self.template(name)?;
-        Some(substitute_args(&template.body, &parse_command_args(args)))
+        for (_, name) in skill_references(input) {
+            if !name.is_empty()
+                && seen.insert(name)
+                && let Some(block) = self.skill_block(name)
+            {
+                skill_blocks.push(block);
+            }
+        }
+        if skill_blocks.is_empty() {
+            return prompt;
+        }
+        let prompt = prompt.unwrap_or_else(|| input.to_owned());
+        if !prompt.is_empty() {
+            skill_blocks.push(prompt);
+        }
+        Some(skill_blocks.join("\n\n"))
+    }
+
+    fn skill_block(&self, name: &str) -> Option<String> {
+        let skill = self.skill(name)?;
+        let text = std::fs::read_to_string(&skill.path).ok()?;
+        let (_, body) = parse_frontmatter(&text);
+        Some(format!(
+            "<skill name=\"{}\" location=\"{}\">\nReferences are relative to {}.\n\n{}\n</skill>",
+            skill.name,
+            skill.path.display(),
+            skill.base_dir().display(),
+            body.trim()
+        ))
     }
 
     /// The skills section of the system prompt (empty without skills).
@@ -717,10 +793,46 @@ mod tests {
             data.path().join("skills").join("pdf").display()
         )));
 
+        let input = "请用 $pdf-tools，结合 ($hidden) 再检查 $pdf-tools。";
+        let expanded = untrusted.expand(input).unwrap();
+        assert!(expanded.starts_with("<skill name=\"pdf-tools\""));
+        assert!(expanded.contains("<skill name=\"hidden\""));
+        assert_eq!(expanded.matches("<skill name=\"pdf-tools\"").count(), 1);
+        assert!(expanded.ends_with(input));
+        assert_eq!(untrusted.expand("$deploy"), None);
+        assert!(trusted.expand("$deploy").unwrap().contains("\nSteps\n"));
+        assert!(
+            untrusted
+                .expand("/review $pdf-tools")
+                .unwrap()
+                .ends_with("Review. Focus on $pdf-tools.")
+        );
+        for literal in [
+            r"\$pdf-tools",
+            "$pdf-tools.txt",
+            "$pdf-tools_backup",
+            "$HOME",
+            "prefix$pdf-tools",
+            "${pdf-tools}",
+        ] {
+            assert_eq!(untrusted.expand(literal), None, "{literal}");
+        }
+
         let prompt = trusted.skills_prompt();
         assert!(prompt.contains("<name>pdf-tools</name>"));
         assert!(prompt.contains("<description>Deploy &lt;the&gt; app</description>"));
         assert!(!prompt.contains("hidden"));
         assert_eq!(Resources::default().skills_prompt(), "");
+    }
+
+    #[test]
+    fn skill_completion_replaces_the_reference_at_the_caret() {
+        let input = "执行 ($pdf-draft)，然后继续";
+        let caret = input.find("-draft").unwrap();
+        let (range, query) = skill_reference_at(input, caret).unwrap();
+        assert_eq!(&input[range], "$pdf-draft");
+        assert_eq!(query, "pdf");
+        assert_eq!(skill_reference_at("$", 1), Some((0..1, "")));
+        assert_eq!(skill_reference_at(input, input.len()), None);
     }
 }

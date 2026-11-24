@@ -1,6 +1,5 @@
-//! The composer's extras: `/` commands (built-in, prompt templates, skills), `@file`
-//! completion, image attachments (paste and drop), and compaction (manual and
-//! automatic).
+//! The composer's extras: `/` commands, `$skill` and `@file` completions, image
+//! attachments (paste and drop), and compaction (manual and automatic).
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -14,6 +13,7 @@ use zp_core::attachments::{
     ImageAttachment, PathEntry, complete_path, image_mime, reference, reference_at,
 };
 use zp_core::permissions::PermissionMode;
+use zp_core::resources::skill_reference_at;
 
 use super::{ConversationEvent, ConversationView};
 
@@ -130,6 +130,7 @@ impl CompletionItem {
 pub enum CompletionKind {
     Command,
     File,
+    Skill,
     /// The choices of `/model`, `/thinking` or `/permissions`.
     Option,
 }
@@ -302,8 +303,41 @@ impl ConversationView {
             let items = self.option_items(name, query.trim(), cx);
             return (!items.is_empty()).then_some((CompletionKind::Option, items));
         }
-        // `@path` at the caret, also in the middle of the text.
         let caret = self.composer.read(cx).selected_range().end;
+        if let Some((range, query)) = skill_reference_at(draft, caret) {
+            let resources = self.coding.as_ref()?.resources();
+            let (before, after) = (&draft[..range.start], &draft[range.end..]);
+            let separator = if after.is_empty() { " " } else { "" };
+            let follow_space = after
+                .chars()
+                .next()
+                .filter(|c| c.is_whitespace())
+                .map_or(0, char::len_utf8);
+            let matches = resources.skills.iter().filter(|skill| {
+                skill.name != query
+                    && (skill.name.starts_with(query)
+                        || (query.len() >= 3 && skill.name.contains(query)))
+            });
+            let items: Vec<_> = resources
+                .skill(query)
+                .into_iter()
+                .chain(matches)
+                .take(MENU_ITEMS)
+                .map(|skill| {
+                    let label = format!("${}", skill.name);
+                    let text = format!("{before}{label}{separator}{after}");
+                    let caret = before.len() + label.len() + separator.len() + follow_space;
+                    CompletionItem {
+                        label,
+                        detail: skill.description.clone(),
+                        action: CompletionAction::Insert { text, caret },
+                        current: false,
+                    }
+                })
+                .collect();
+            return (!items.is_empty()).then_some((CompletionKind::Skill, items));
+        }
+        // `@path` at the caret, also in the middle of the text.
         let at = reference_at(draft, caret)?;
         let entries = self.project_entries(cx)?;
         let (before, after) = (&draft[..at.range.start], &draft[at.range.end..]);
@@ -549,6 +583,9 @@ impl ConversationView {
                 return true;
             }
         };
+        if completion.kind == CompletionKind::Skill {
+            self.suppress_completion = Some(text.clone());
+        }
         self.composer.update(cx, |composer, cx| {
             composer.emplace(&text, cx);
             composer.move_to(caret, cx);
@@ -556,7 +593,9 @@ impl ConversationView {
         self.focus_composer(window, cx);
         // The text changed before the caret moved: look again from the caret (a folder
         // keeps the menu open on its contents).
-        self.update_completion(cx);
+        if completion.kind != CompletionKind::Skill {
+            self.update_completion(cx);
+        }
         cx.notify();
         true
     }
@@ -624,7 +663,10 @@ impl ConversationView {
                 if !names.is_empty() {
                     lines.push(format!("Templates and skills: {}", names.join(", ")));
                 }
-                lines.push("Type @ to attach a file; paste or drop images to attach them.".into());
+                lines.push(
+                    "Type $ to reference a skill, @ to attach a file, or paste or drop images."
+                        .into(),
+                );
                 self.info = Some(lines.join("\n"));
             }
             _ => return false,

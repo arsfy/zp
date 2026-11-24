@@ -2437,7 +2437,7 @@ impl ConversationView {
                     .placeholder(if self.running {
                         "Queue a message… (sent after the current step)"
                     } else {
-                        "Message ZP… (/ for commands, @ to attach files)"
+                        "Message ZP… (/ commands, $ skills, @ files)"
                     })
                     .placeholder_color(rgb_to_hsla(colors.text_muted))
                     .caret_color(rgb_to_hsla(colors.text))
@@ -2868,7 +2868,7 @@ impl ConversationView {
             .into_any_element()
     }
 
-    /// The `/` or `@` completion menu above the composer.
+    /// The command, skill or file completion menu above the composer.
     fn render_completion(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let completion = self.completion.as_ref()?;
         let colors = cx.theme().colors.clone();
@@ -2934,6 +2934,9 @@ impl ConversationView {
                             }
                             super::composer::CompletionKind::File => {
                                 "↑↓ to choose · Tab or Enter to insert (a folder opens) · Esc to close"
+                            }
+                            super::composer::CompletionKind::Skill => {
+                                "↑↓ to choose · Tab or Enter to insert · Esc to close"
                             }
                             super::composer::CompletionKind::Option => {
                                 "Type to filter · ↑↓ to choose · Tab or Enter to select · Esc to close"

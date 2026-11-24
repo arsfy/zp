@@ -81,7 +81,7 @@ pub(crate) struct RunArgs {
     #[arg(long)]
     trust: bool,
     /// The prompt. Read from stdin when piped; omit on a terminal for interactive mode.
-    /// `@path` attaches a file; `/template args` and `/skill:name` expand.
+    /// `@path` attaches a file, `$name` or `/skill:name` loads a skill, and `/template args` expands a template.
     prompt: Vec<String>,
 }
 
@@ -566,7 +566,8 @@ fn command_line(
              /session               show session details\n\
              /tools                 list enabled tools\n\
              /compact [focus]       summarize older messages\n\
-             /<template> [args]     run a prompt template; /skill:<name> loads a skill\n\
+             /<template> [args]     run a prompt template\n\
+             $<name> or /skill:<name>  load a skill\n\
              /exit                  quit"
         ),
         "model" if argument.is_empty() => eprintln!(
