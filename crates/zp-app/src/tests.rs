@@ -315,7 +315,9 @@ fn open_folder_focuses_a_project_that_is_already_open(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
-fn keyboard_toggles_panels_and_persists_layout(cx: &mut TestAppContext) {
+fn status_button_and_keyboard_toggle_panels_and_persist_layout(cx: &mut TestAppContext) {
+    use gpui::{Modifiers, VisualTestContext};
+
     let data = setup(cx, None);
     let (_dir, project) = project_dir();
     let window = cx
@@ -329,7 +331,18 @@ fn keyboard_toggles_panels_and_persists_layout(cx: &mut TestAppContext) {
     };
     assert!(layout(cx).sidebar_visible && !layout(cx).right_panel_visible);
 
+    let click_sessions = |cx: &mut TestAppContext| {
+        let mut visual = VisualTestContext::from_window(window.into(), cx);
+        let bounds = visual.debug_bounds("status-sessions").unwrap();
+        visual.simulate_click(bounds.center(), Modifiers::none());
+        cx.run_until_parked();
+    };
     cx.simulate_keystrokes(window.into(), "secondary-b");
+    cx.run_until_parked();
+    assert!(!layout(cx).sidebar_visible);
+    click_sessions(cx);
+    assert!(layout(cx).sidebar_visible);
+    click_sessions(cx);
     cx.simulate_keystrokes(window.into(), "secondary-alt-b");
     cx.run_until_parked();
     assert!(!layout(cx).sidebar_visible && layout(cx).right_panel_visible);

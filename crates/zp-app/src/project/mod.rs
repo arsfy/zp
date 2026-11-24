@@ -744,6 +744,47 @@ impl ProjectWindow {
             .child(crate::ui::title_bar_controls(cx))
     }
 
+    fn render_sidebar_button(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let colors = &cx.theme().colors;
+        let open = self.layout.sidebar_visible;
+        let icon = if open {
+            colors.accent
+        } else {
+            colors.text_muted
+        };
+        let hover = colors.surface_hover;
+        div()
+            .id("status-sessions")
+            .debug_selector(|| "status-sessions".into())
+            .role(gpui::accesskit::Role::Button)
+            .aria_label("Session list")
+            .aria_expanded(open)
+            .size(px(20.))
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded(px(4.))
+            .cursor_pointer()
+            .hover_style(move |s| s.bg(hover))
+            .tooltip(crate::ui::tooltip(if open {
+                "Hide Session List"
+            } else {
+                "Show Session List"
+            }))
+            .child(
+                div()
+                    .w(px(13.))
+                    .h(px(11.))
+                    .rounded(px(2.))
+                    .border_1()
+                    .border_color(icon)
+                    .child(div().w(px(4.)).h_full().border_r_1().border_color(icon)),
+            )
+            .on_click(
+                cx.listener(|this, _, window, cx| this.toggle_sidebar(&ToggleSidebar, window, cx)),
+            )
+    }
+
     fn render_status_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = cx.theme().colors.clone();
         let status = self.active_conversation().map(|c| c.read(cx).status());
@@ -838,6 +879,7 @@ impl ProjectWindow {
                             .flex_shrink_0()
                             .items_center()
                             .gap_1()
+                            .child(self.render_sidebar_button(cx))
                             .child(self.render_terminal_button(cx))
                             .child(
                                 div()
