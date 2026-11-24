@@ -12,6 +12,7 @@ use crate::workspace::{self, Workspaces};
 
 /// Initializes the app with a temp data directory, optionally seeded with `state`.
 pub(crate) fn setup(cx: &mut TestAppContext, state: Option<AppState>) -> TempDir {
+    cx.executor().allow_parking();
     let data = tempfile::tempdir().unwrap();
     if let Some(state) = state {
         state

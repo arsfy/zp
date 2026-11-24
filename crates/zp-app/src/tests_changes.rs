@@ -1036,6 +1036,7 @@ fn diff_view_scrolls_sideways_and_copies_selected_lines(cx: &mut TestAppContext)
     .unwrap();
 
     let window = open(cx, &project);
+    click(window, "status-changes", cx);
     let git_panel = panel(window, cx).read_with(cx, |panel, _| panel.git().clone());
     wait_until(cx, |cx| {
         git_panel.read_with(cx, |git, _| git.status().is_some())

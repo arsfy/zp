@@ -127,6 +127,7 @@ impl ProjectWindow {
                         this.notify_background(conversation, body, window, cx);
                         this.save_tabs(cx);
                         this.load_sessions(cx);
+                        this.refresh_branch(window, cx);
                     }
                     ConversationEvent::SessionCreated | ConversationEvent::TitleChanged => {
                         this.load_sessions(cx)

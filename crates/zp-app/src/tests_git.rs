@@ -68,6 +68,94 @@ fn staged(panel: &Entity<GitPanel>, cx: &mut TestAppContext) -> Vec<String> {
 }
 
 #[gpui::test]
+fn visible_git_panel_refreshes_after_external_file_changes(cx: &mut TestAppContext) {
+    let _data = setup_models(cx, &[&FauxProvider::default()], false);
+    let (_dir, project) = project_dir();
+    git(&project, &["init", "-q"]);
+    git(&project, &["config", "user.name", "Tester"]);
+    git(&project, &["config", "user.email", "t@example.com"]);
+    git(&project, &["config", "commit.gpgsign", "false"]);
+    git(&project, &["config", "core.autocrlf", "false"]);
+    std::fs::write(project.join(".gitignore"), "/target/\n").unwrap();
+    let tracked = project.join("tracked.txt");
+    std::fs::write(&tracked, "original\n").unwrap();
+    git(&project, &["add", "."]);
+    git(&project, &["commit", "-qm", "init"]);
+
+    let window = open(cx, &project);
+    let panel = window
+        .update(cx, |view, _, cx| {
+            view.changes_panel().read(cx).git().clone()
+        })
+        .unwrap();
+    assert!(
+        panel.read_with(cx, |panel, _| panel.status().is_none()),
+        "hidden Git panel does not load status until shown"
+    );
+    click(window, "status-changes", cx);
+    settle(&panel, cx, |s| s.files.is_empty());
+
+    // Ignored build output stays ignored; worktree edits refresh.
+    std::fs::create_dir_all(project.join("target/debug")).unwrap();
+    std::fs::write(project.join("target/debug/out.o"), "artifact\n").unwrap();
+    let new_file = project.join("new.txt");
+    std::fs::write(&new_file, "new file\n").unwrap();
+    std::fs::write(&tracked, "changed\n").unwrap();
+    settle(&panel, cx, |s| {
+        s.files.len() == 2
+            && s.files[0].repo_path == "new.txt"
+            && s.files[0].is_untracked()
+            && s.files[1].repo_path == "tracked.txt"
+            && s.files[1].unstaged_stats == (1, 1)
+    });
+
+    std::fs::write(&tracked, "changed\nsecond line\n").unwrap();
+    settle(&panel, cx, |s| {
+        s.files.len() == 2 && s.files[1].unstaged_stats == (2, 1)
+    });
+
+    std::fs::remove_file(&new_file).unwrap();
+    settle(&panel, cx, |s| {
+        s.files.len() == 1 && s.files[0].unstaged_stats == (2, 1)
+    });
+
+    git(&project, &["add", "tracked.txt"]);
+    settle(&panel, cx, |s| {
+        s.staged().count() == 1 && s.unstaged().count() == 0
+    });
+
+    // External branch switch and commit update History and the window's branch.
+    click(window, "git-tab-history", cx);
+    wait_until(cx, |cx| {
+        panel.read_with(cx, |panel, _| {
+            panel.history().is_some_and(|h| h.len() == 1)
+        })
+    });
+    git(&project, &["switch", "-q", "-c", "ext-branch"]);
+    git(&project, &["commit", "-qm", "external commit"]);
+    settle(&panel, cx, |s| {
+        s.branch.as_deref() == Some("ext-branch")
+            && s.last_commit.as_deref() == Some("external commit")
+    });
+    wait_until(cx, |cx| {
+        panel.read_with(cx, |panel, _| {
+            panel.history().is_some_and(|h| {
+                h.len() == 2 && h[0].summary == "external commit"
+            })
+        })
+    });
+
+    // Hiding the panel stops live watching; showing it again resyncs.
+    panel.update(cx, |panel, cx| panel.set_tab(GitTab::Changes, cx));
+    click(window, "status-changes", cx);
+    std::fs::write(&tracked, "while hidden\n").unwrap();
+    click(window, "status-changes", cx);
+    settle(&panel, cx, |s| {
+        s.unstaged().count() == 1 && s.files[0].unstaged_stats == (1, 2)
+    });
+}
+
+#[gpui::test]
 fn staging_keeps_controls_and_file_rows_in_place(cx: &mut TestAppContext) {
     let _data = setup_models(cx, &[&FauxProvider::default()], false);
     let (_dir, project) = project_dir();
@@ -474,6 +562,7 @@ fn files_too_large_to_compare_open_as_too_large_without_being_read(cx: &mut Test
             view.changes_panel().read(cx).git().clone()
         })
         .unwrap();
+    click(window, "status-changes", cx);
     settle(&panel, cx, |s| s.files.len() == 3);
     panel.update(cx, |panel, cx| panel.open_all(cx));
     wait_until(cx, |cx| {
@@ -669,11 +758,15 @@ fn a_reply_does_not_overwrite_an_edited_draft_and_waiting_can_be_stopped(cx: &mu
         models.set_provider(Arc::new(faux.clone()));
         app.models = models;
     });
+    // External edits while generating a message are not dropped when waiting stops.
     faux.push(FauxResponse::text("feat(main): too slow"));
     click(window, "git-generate-message", cx);
     wait_until(cx, |cx| panel.read_with(cx, |panel, _| panel.is_busy()));
+    std::fs::write(project.join("extra.rs"), "pub fn extra() {}\n").unwrap();
+    panel.update(cx, |panel, cx| panel.refresh(cx));
     click(window, "git-generate-message", cx);
     assert!(!panel.read_with(cx, |panel, _| panel.is_busy()));
+    settle(&panel, cx, |s| s.unstaged().count() == 2);
     assert_eq!(
         message.read_with(cx, |input, _| input.as_str().to_owned()),
         "My own words"

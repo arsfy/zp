@@ -4,7 +4,7 @@
 mod log;
 mod ops;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -213,6 +213,33 @@ pub fn repo_root(dir: &Path) -> Option<PathBuf> {
     Some(crate::project::normalize_project_path(&root).unwrap_or(root))
 }
 
+/// Tracked files under `dir` whose paths match `.gitignore` / exclude rules (`git add -f`),
+/// resolved to absolute paths under the repository root.
+pub fn tracked_ignored_files(dir: &Path) -> HashSet<PathBuf> {
+    let Some(root) = repo_root(dir) else {
+        return HashSet::new();
+    };
+    let Ok(text) = git_ok(
+        dir,
+        &[
+            "ls-files",
+            "-z",
+            "--cached",
+            "--ignored",
+            "--exclude-standard",
+            "--full-name",
+            "--",
+            ".",
+        ],
+    ) else {
+        return HashSet::new();
+    };
+    text.split('\0')
+        .filter(|path| !path.is_empty())
+        .map(|path| root.join(path))
+        .collect()
+}
+
 /// Lines added and removed per path, from `git diff --numstat -z`.
 fn numstat(dir: &Path, cached: bool) -> anyhow::Result<HashMap<String, (usize, usize)>> {
     let mut args = vec!["diff", "--numstat", "-z", "-M"];
@@ -281,8 +308,16 @@ pub fn status(dir: &Path) -> anyhow::Result<Option<GitStatus>> {
         ],
     )?;
     let mut status = parse_status(&root, &text);
-    let staged = numstat(dir, true)?;
-    let unstaged = numstat(dir, false)?;
+    let staged = if status.staged().next().is_some() {
+        numstat(dir, true)?
+    } else {
+        HashMap::new()
+    };
+    let unstaged = if status.unstaged().any(|file| !file.is_untracked()) {
+        numstat(dir, false)?
+    } else {
+        HashMap::new()
+    };
     for file in &mut status.files {
         if file.staged.is_some() {
             file.staged_stats = staged.get(&file.repo_path).copied().unwrap_or_default();

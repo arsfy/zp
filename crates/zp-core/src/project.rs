@@ -58,7 +58,7 @@ pub fn tilde_path(path: &Path) -> String {
 /// The checked-out branch of the git repository containing `dir` (or a short commit id
 /// when detached). `None` outside a repository.
 pub fn git_branch(dir: &Path) -> Option<String> {
-    let git_dir = find_git_dir(dir)?;
+    let git_dir = git_dir(dir)?;
     let head = std::fs::read_to_string(git_dir.join("HEAD")).ok()?;
     let head = head.trim();
     match head.strip_prefix("ref:") {
@@ -80,7 +80,7 @@ pub fn git_branch(dir: &Path) -> Option<String> {
 
 /// The git directory for `dir`: `.git` itself, or the target of a `.git` file (worktrees
 /// and submodules).
-fn find_git_dir(dir: &Path) -> Option<PathBuf> {
+pub fn git_dir(dir: &Path) -> Option<PathBuf> {
     for ancestor in dir.ancestors() {
         let dot_git = ancestor.join(".git");
         if dot_git.is_dir() {

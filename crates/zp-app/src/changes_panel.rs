@@ -71,6 +71,7 @@ pub enum ChangesPanelEvent {
 pub struct ChangesPanel {
     root: PathBuf,
     mode: ChangesMode,
+    visible: bool,
     conversation: Option<Entity<ConversationView>>,
     files: Vec<FileRow>,
     groups: Vec<GroupRow>,
@@ -94,6 +95,7 @@ impl ChangesPanel {
         Self {
             root,
             mode: ChangesMode::Git,
+            visible: false,
             conversation: None,
             files: Vec::new(),
             groups: Vec::new(),
@@ -122,8 +124,8 @@ impl ChangesPanel {
             cx.subscribe(conversation, |this, _, event, cx| match event {
                 ConversationEvent::FilesChanged | ConversationEvent::RunFinished => {
                     this.refresh(cx);
-                    if this.mode == ChangesMode::Git {
-                        this.refresh_git(cx);
+                    if this.visible && this.mode == ChangesMode::Git {
+                        this.git.update(cx, |git, cx| git.refresh(cx));
                     }
                 }
                 ConversationEvent::StatusChanged => cx.notify(),
@@ -138,16 +140,23 @@ impl ChangesPanel {
         self.mode
     }
 
+    pub fn set_visible(&mut self, visible: bool, cx: &mut Context<Self>) {
+        self.visible = visible;
+        self.update_git_visibility(cx);
+    }
+
+    fn update_git_visibility(&self, cx: &mut Context<Self>) {
+        let visible = self.visible && self.mode == ChangesMode::Git;
+        self.git.update(cx, |git, cx| git.set_visible(visible, cx));
+    }
+
     pub fn set_mode(&mut self, mode: ChangesMode, cx: &mut Context<Self>) {
         self.mode = mode;
-        match mode {
-            ChangesMode::Git => self.refresh_git(cx),
+        self.update_git_visibility(cx);
+        if mode == ChangesMode::Turns {
             // Only computed while shown (see `refresh`).
-            ChangesMode::Turns => {
-                let (log, blobs) = self.change_log(cx);
-                self.groups = self.group_rows(&log, blobs.as_ref());
-            }
-            ChangesMode::Session => {}
+            let (log, blobs) = self.change_log(cx);
+            self.groups = self.group_rows(&log, blobs.as_ref());
         }
         cx.notify();
     }
@@ -253,7 +262,7 @@ impl ChangesPanel {
 
     /// Reloads the Git view.
     pub fn refresh_git(&mut self, cx: &mut Context<Self>) {
-        self.git.update(cx, |git, cx| git.refresh(cx));
+        self.git.update(cx, |git, cx| git.refresh_repository(cx));
     }
 
     fn running(&self, cx: &App) -> bool {

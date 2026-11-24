@@ -2,6 +2,8 @@
 //! commit message and commit, the branch picker, push / pull / fetch, undoing the last
 //! commit, and the history with each commit's diff.
 
+mod watch;
+
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -64,6 +66,7 @@ pub enum Side {
     Unstaged,
 }
 
+#[derive(PartialEq, Eq)]
 enum Load {
     Loading,
     NotRepository,
@@ -154,8 +157,13 @@ pub struct GitPanel {
     commit_maximized: bool,
     menu: Option<OpenMenu>,
     branch_picker: Option<BranchPicker>,
+    watch_task: Option<Task<()>>,
     status_task: Option<Task<()>>,
+    status_refresh_pending: bool,
     history_task: Option<Task<()>>,
+    history_refresh_pending: bool,
+    refresh_seq: u64,
+    history_seq: u64,
     /// Scroll position of the history list.
     history_scroll: UniformListScrollHandle,
     op_task: Option<Task<()>>,
@@ -186,8 +194,13 @@ impl GitPanel {
             commit_maximized: false,
             menu: None,
             branch_picker: None,
+            watch_task: None,
             status_task: None,
+            status_refresh_pending: false,
             history_task: None,
+            history_refresh_pending: false,
+            refresh_seq: 0,
+            history_seq: 0,
             history_scroll: UniformListScrollHandle::new(),
             op_task: None,
             generating: None,
@@ -323,8 +336,45 @@ impl GitPanel {
 
     // ----- loading ---------------------------------------------------------------------
 
-    /// Reloads the status (and the history when it is shown) in the background.
+    /// Watches the worktree and Git metadata while the Git view is visible.
+    pub fn set_visible(&mut self, visible: bool, cx: &mut Context<Self>) {
+        if visible == self.watch_task.is_some() {
+            return;
+        }
+        self.watch_task = visible.then(|| {
+            let (changes, mut changed) = tokio::sync::mpsc::channel(1);
+            let executor = cx.background_executor().clone();
+            let monitor =
+                executor.spawn(watch::monitor(self.root.clone(), executor.clone(), changes));
+            cx.spawn(async move |this, cx| {
+                let _monitor = monitor;
+                while let Some(change) = changed.recv().await {
+                    if this
+                        .update(cx, |this, cx| {
+                            if change == watch::Change::Status {
+                                this.refresh(cx);
+                            } else {
+                                this.refresh_repository(cx);
+                            }
+                        })
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            })
+        });
+    }
+
+    /// Reloads status in the background, keeping one follow-up for changes during a load
+    /// or an active operation.
     pub fn refresh(&mut self, cx: &mut Context<Self>) {
+        if self.busy.is_some() || self.status_task.is_some() {
+            self.status_refresh_pending = true;
+            return;
+        }
+        self.refresh_seq += 1;
+        let status_seq = self.refresh_seq;
         let root = self.root.clone();
         let status = cx
             .background_executor()
@@ -332,20 +382,65 @@ impl GitPanel {
         self.status_task = Some(cx.spawn(async move |this, cx| {
             let result = status.await;
             let _ = this.update(cx, |this, cx| {
-                this.status = match result {
+                this.status_task = None;
+                if this.busy.is_some() {
+                    this.status_refresh_pending = true;
+                    return;
+                }
+                let refresh_again = std::mem::take(&mut this.status_refresh_pending);
+                let status = match result {
                     Ok(Some(status)) => Load::Loaded(status),
                     Ok(None) => Load::NotRepository,
                     Err(error) => Load::Failed(format!("{error:#}")),
                 };
-                cx.notify();
+                if status != this.status {
+                    let revision_changed = match (&this.status, &status) {
+                        (Load::Loaded(old), Load::Loaded(new)) => {
+                            old.root != new.root || old.head != new.head || old.branch != new.branch
+                        }
+                        (Load::Loaded(_) | Load::Failed(_), Load::NotRepository)
+                        | (_, Load::Loaded(_)) => true,
+                        _ => false,
+                    };
+                    this.status = status;
+                    if revision_changed {
+                        if this.history_seq < status_seq {
+                            this.refresh_loaded_history(cx);
+                        }
+                        cx.emit(GitPanelEvent::RepositoryChanged);
+                    }
+                    cx.notify();
+                }
+                if refresh_again {
+                    this.refresh(cx);
+                }
             });
         }));
-        if self.history.is_some() || self.tab == GitTab::History {
-            self.load_history(cx);
+    }
+
+    /// Also reloads history when the History tab is shown (or invalidates cached history).
+    pub fn refresh_repository(&mut self, cx: &mut Context<Self>) {
+        self.refresh(cx);
+        self.refresh_loaded_history(cx);
+    }
+
+    fn refresh_loaded_history(&mut self, cx: &mut Context<Self>) {
+        if self.tab != GitTab::History {
+            self.history = None;
+            self.history_task = None;
+            self.history_refresh_pending = false;
+            return;
         }
+        self.load_history(cx);
     }
 
     fn load_history(&mut self, cx: &mut Context<Self>) {
+        if self.busy.is_some() || self.history_task.is_some() {
+            self.history_refresh_pending = true;
+            return;
+        }
+        self.refresh_seq += 1;
+        self.history_seq = self.refresh_seq;
         let root = self.root.clone();
         let task = cx.background_executor().spawn(async move {
             let root = zp_core::git::repo_root(&root).unwrap_or(root);
@@ -354,6 +449,17 @@ impl GitPanel {
         self.history_task = Some(cx.spawn(async move |this, cx| {
             let result = task.await;
             let _ = this.update(cx, |this, cx| {
+                this.history_task = None;
+                if this.tab != GitTab::History {
+                    this.history = None;
+                    this.history_refresh_pending = false;
+                    return;
+                }
+                if this.busy.is_some() {
+                    this.history_refresh_pending = true;
+                    return;
+                }
+                let refresh_again = std::mem::take(&mut this.history_refresh_pending);
                 match result {
                     Ok(commits) => this.history = Some(commits),
                     Err(error) => {
@@ -362,6 +468,9 @@ impl GitPanel {
                     }
                 }
                 cx.notify();
+                if refresh_again {
+                    this.load_history(cx);
+                }
             });
         }));
     }
@@ -370,8 +479,22 @@ impl GitPanel {
         self.tab = tab;
         if tab == GitTab::History {
             self.load_history(cx);
+        } else {
+            self.history = None;
+            self.history_task = None;
+            self.history_refresh_pending = false;
         }
         cx.notify();
+    }
+
+    fn finish_busy(&mut self, cx: &mut Context<Self>) {
+        self.busy = None;
+        if std::mem::take(&mut self.status_refresh_pending) {
+            self.refresh(cx);
+        }
+        if std::mem::take(&mut self.history_refresh_pending) {
+            self.refresh_loaded_history(cx);
+        }
     }
 
     // ----- operations ------------------------------------------------------------------
@@ -398,12 +521,18 @@ impl GitPanel {
             let result = task.await;
             let _ = this.update(cx, |this, cx| {
                 this.busy = None;
+                let reload_history = std::mem::take(&mut this.history_refresh_pending)
+                    || !matches!(operation, Operation::Staging);
+                this.status_refresh_pending = false;
                 match result {
                     Ok(()) => on_success(this, cx),
                     Err(error) => this.notice = Some((format!("{error:#}"), true)),
                 }
-                this.refresh(cx);
-                cx.emit(GitPanelEvent::RepositoryChanged);
+                if reload_history {
+                    this.refresh_repository(cx);
+                } else {
+                    this.refresh(cx);
+                }
                 cx.notify();
             });
         }));
@@ -490,8 +619,8 @@ impl GitPanel {
     pub fn cancel_commit_message(&mut self, cx: &mut Context<Self>) {
         // Dropping the task aborts the request.
         self.generating = None;
-        self.busy = None;
         self.notice = None;
+        self.finish_busy(cx);
         cx.notify();
     }
 
@@ -524,7 +653,7 @@ impl GitPanel {
             let result = task.await;
             let _ = this.update(cx, |this, cx| {
                 this.generating = None;
-                this.busy = None;
+                this.finish_busy(cx);
                 match result {
                     Ok(Ok(message)) => {
                         if this.message.read(cx).as_str() == draft {

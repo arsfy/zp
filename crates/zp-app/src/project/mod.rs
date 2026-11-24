@@ -365,7 +365,11 @@ impl ProjectWindow {
         if this.layout.terminal_visible {
             this.ensure_terminal(window, cx);
         }
-        this.refresh(window, cx);
+        this.refresh_branch(window, cx);
+        this.load_sessions(cx);
+        this.changes.update(cx, |panel, cx| {
+            panel.set_visible(this.layout.right_panel_visible, cx)
+        });
         this
     }
 
@@ -417,7 +421,7 @@ impl ProjectWindow {
     fn refresh(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.refresh_branch(window, cx);
         self.load_sessions(cx);
-        if self.changes.read(cx).mode() == ChangesMode::Git {
+        if self.layout.right_panel_visible && self.changes.read(cx).mode() == ChangesMode::Git {
             self.changes.update(cx, |panel, cx| panel.refresh_git(cx));
         }
         cx.notify();
@@ -491,6 +495,9 @@ impl ProjectWindow {
 
     fn toggle_right_panel(&mut self, _: &ToggleRightPanel, _: &mut Window, cx: &mut Context<Self>) {
         self.layout.right_panel_visible = !self.layout.right_panel_visible;
+        self.changes.update(cx, |panel, cx| {
+            panel.set_visible(self.layout.right_panel_visible, cx)
+        });
         self.save_layout(cx);
         cx.notify();
     }
