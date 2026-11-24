@@ -1,4 +1,34 @@
-## v0.1.1-rc.1 23 Nov 2026
+## v0.1.1-rc.2 24 Nov 2026
+
+#### Plan mode
+
+- `/plan` (or `/plan <goal>`) switches the conversation to read-only **Plan** mode: the agent can inspect the project (`read`, `grep`, `find`, `ls`) and clarify choices with `ask`, without editing files, running commands or starting subagents. Close the **Plan** chip in the composer to leave it.
+- Calling `submit_plan` ends the run, renders the plan as Markdown, saves it under `plans/` in the data folder and asks what to do next: **Execute** implements it in the current conversation, **Clear Context & Execute** runs it in a new tab with the same model and thinking level, **Show Markdown File** reveals the saved file and **Cancel** exits Plan mode.
+
+#### Conversation
+
+- Typing `$` completes skills at the caret anywhere in a message. Referencing `$name` in a prompt (including inside `/template` arguments and in `zp-cli run`) loads that skill's instructions once, alongside `/skill:name`.
+- While the agent is working, **Queue** stays beside **Stop** and waiting messages are listed above the composer with their attached images. Each queued message can be edited in place (**Edit**, holding it and any messages behind it in order), returned to the draft with its images (**Withdraw**) or sent immediately (**Interrupt & Send** while running, **Send Now** once idle).
+- Open `edit` and `write` tool cards show read/write progress and preview the streamed text (or the original block while its replacement streams in or is removed) until the final diff is ready. Finished `read` cards and the full-size diff view (unified and side by side) syntax-highlight code up to 256 KB.
+- Retrying a failed or aborted response records its file changes as a separate group (`Turn N retry M`) with its own changes summary, diff, revert and checkpoint restore, instead of combining them with earlier attempts in the turn.
+- Closing a completed task list above the composer is remembered per session across restarts.
+
+#### Git
+
+- The star button in the Git panel's commit box writes a commit message from what would be committed — the staged diff, the tracked changes under the project folder when nothing is staged (including through symlinked project paths) or the last commit and staged changes when **Amend** is on — in a short-lived read-only session. Choose a dedicated model in **Settings → General → Commit message model** (`commitModel`) or keep the default model; an unavailable configured model is reported as an error instead of sending the diff elsewhere.
+- While the Git panel is visible, ZP watches the worktree and Git metadata (including linked worktrees and submodules, respecting `.gitignore` and exclude rules unless a file is force-tracked) and refreshes status or history automatically as files, the index, `HEAD` or refs change.
+
+#### Permissions
+
+- Each session gets a private scratch directory (when `permissions.tempDirectories` is enabled, as by default), shared with the model for session-specific temporary files and removed when the session closes. Verified `rm` of literal paths inside it runs without asking even in **Ask** mode, and symlink checks prevent removals from escaping allowed roots or deleting a root itself.
+- The shell classifier parses heredocs (`<<`, `<<-`, quoted and unquoted delimiters), compound statements (`if`, `for`, `while`, `until`, `case`, subshells, functions, `{ … }`, arithmetic) and read-only `sed -n` line ranges (`Np`, `N,Mp`). In **Auto-approve edits** and **Auto-review**, `cat` writes to literal paths in the project (such as from a heredoc) run without asking; shell syntax whose effect cannot be verified always asks you directly.
+- **Auto-review** with Jev asks separate questions for six concrete hazards (writing outside the project, reading credentials, sending project data out, changing a remote service, changing the system and losing data Git cannot restore), explicit user constraints and whether the command serves the task or is routine work, naming the specific doubts when handing a call to you.
+
+#### Interface
+
+- The status bar shows time to first token (`TTFT`) for each model request alongside output speed, and includes a button next to the terminal toggle to show or hide the session list sidebar.
+
+## v0.1.1-rc.1 23 Nov 2026 `2aca234`
 
 #### Providers and models
 

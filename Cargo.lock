@@ -8852,7 +8852,7 @@ checksum = "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b"
 
 [[package]]
 name = "zp-agent"
-version = "0.1.1-rc.1"
+version = "0.1.1-rc.2"
 dependencies = [
  "anyhow",
  "futures",
@@ -8866,7 +8866,7 @@ dependencies = [
 
 [[package]]
 name = "zp-ai"
-version = "0.1.1-rc.1"
+version = "0.1.1-rc.2"
 dependencies = [
  "base64 0.23.1",
  "futures",
@@ -8882,7 +8882,7 @@ dependencies = [
 
 [[package]]
 name = "zp-app"
-version = "0.1.1-rc.1"
+version = "0.1.1-rc.2"
 dependencies = [
  "alacritty_terminal",
  "anyhow",
@@ -8918,7 +8918,7 @@ dependencies = [
 
 [[package]]
 name = "zp-cli"
-version = "0.1.1-rc.1"
+version = "0.1.1-rc.2"
 dependencies = [
  "anyhow",
  "clap",
@@ -8936,7 +8936,7 @@ dependencies = [
 
 [[package]]
 name = "zp-core"
-version = "0.1.1-rc.1"
+version = "0.1.1-rc.2"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -8965,7 +8965,7 @@ dependencies = [
 
 [[package]]
 name = "zp-mcp"
-version = "0.1.1-rc.1"
+version = "0.1.1-rc.2"
 dependencies = [
  "anyhow",
  "dirs 7.0.0",
@@ -8984,7 +8984,7 @@ dependencies = [
 
 [[package]]
 name = "zp-session"
-version = "0.1.1-rc.1"
+version = "0.1.1-rc.2"
 dependencies = [
  "anyhow",
  "serde",
@@ -8998,7 +8998,7 @@ dependencies = [
 
 [[package]]
 name = "zp-tools"
-version = "0.1.1-rc.1"
+version = "0.1.1-rc.2"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
