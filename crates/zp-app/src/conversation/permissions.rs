@@ -79,9 +79,9 @@ impl ConversationView {
         self.approvals.iter().map(|approval| &approval.request)
     }
 
-    /// Whether the conversation waits for the user (an approval or a question).
+    /// Whether the conversation waits for a decision or answer from the user.
     pub fn needs_attention(&self) -> bool {
-        !self.approvals.is_empty() || !self.questions.is_empty()
+        !self.approvals.is_empty() || !self.questions.is_empty() || self.has_plan_for_review()
     }
 
     /// The mode of this conversation's permission checks.

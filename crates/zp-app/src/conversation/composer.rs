@@ -31,7 +31,12 @@ pub struct BuiltinCommand {
     pub description: &'static str,
 }
 
-pub const BUILTIN_COMMANDS: [BuiltinCommand; 10] = [
+pub const BUILTIN_COMMANDS: [BuiltinCommand; 11] = [
+    BuiltinCommand {
+        name: "plan",
+        args: "[goal]",
+        description: "Enter read-only Plan mode",
+    },
     BuiltinCommand {
         name: "compact",
         args: "[focus]",

@@ -20,6 +20,7 @@ use crate::changes::{ChangeLog, RestoreSource, restore_message_with_sources};
 use crate::checkpoint::{BlobStore, RecordedChange, store_tool_change};
 use crate::compaction::{self, CompactionSettings};
 use crate::permissions::{PermissionGate, PermissionPolicy};
+use crate::plan::{self, SubmitPlan};
 use crate::resources::Resources;
 use crate::subagents::{self, SubagentSettings, SubagentTool};
 use crate::system_prompt::{SystemPromptOptions, build_system_prompt, load_context_files};
@@ -40,6 +41,7 @@ pub struct CodingHooks {
     /// Resolves the model of a call (for auto-review).
     pub models: Models,
     pub(crate) subagent: Option<Arc<SubagentTool>>,
+    planning: bool,
     compaction: CompactionState,
 }
 
@@ -84,6 +86,13 @@ impl AgentHooks for CodingHooks {
         cancel: &'a CancellationToken,
     ) -> BoxFuture<'a, ToolCallDecision> {
         Box::pin(async move {
+            if self.planning && call.tool_call.name == plan::SUBMIT_PLAN {
+                return if call.assistant_message.tool_calls().count() == 1 {
+                    ToolCallDecision::Allow
+                } else {
+                    ToolCallDecision::block("Call submit_plan by itself when the plan is ready.")
+                };
+            }
             if call.tool_call.name == subagents::TOOL_NAME
                 && let Some(subagent) = &self.subagent
             {
@@ -317,9 +326,15 @@ pub struct CodingSession {
     blobs: BlobStore,
     permissions: Option<Arc<PermissionGate>>,
     asker: Option<Arc<dyn zp_tools::Asker>>,
-    subagent: Mutex<Option<Arc<SubagentTool>>>,
+    tool_inputs: Mutex<ToolInputs>,
     compaction: CompactionState,
     _persistence: Subscription,
+}
+
+struct ToolInputs {
+    tools: Vec<Arc<dyn AgentTool>>,
+    subagent: Option<Arc<SubagentTool>>,
+    planning: bool,
 }
 
 #[derive(Clone)]
@@ -427,7 +442,7 @@ fn with_session_tools(
     {
         tools.push(Arc::new(zp_tools::AskTool::new(asker.clone())));
     }
-    tools.retain(|tool| tool.name() != subagents::TOOL_NAME);
+    tools.retain(|tool| !matches!(tool.name(), subagents::TOOL_NAME | plan::SUBMIT_PLAN));
     if let Some(subagent) = subagent {
         tools.push(subagent.clone());
     }
@@ -440,6 +455,7 @@ impl CodingHooks {
         permissions: Option<&Arc<PermissionGate>>,
         models: &Models,
         subagent: Option<&Arc<SubagentTool>>,
+        planning: bool,
         compaction: &CompactionState,
     ) -> Arc<Self> {
         Arc::new(Self {
@@ -447,6 +463,7 @@ impl CodingHooks {
             permissions: permissions.cloned(),
             models: models.clone(),
             subagent: subagent.cloned(),
+            planning,
             compaction: compaction.clone(),
         })
     }
@@ -529,16 +546,13 @@ impl CodingSession {
                 permissions.clone(),
             ))
         });
-        let tools = with_session_tools(
-            tools.unwrap_or_else(|| zp_tools::coding_tools(&cwd)),
-            asker.as_ref(),
-            subagent.as_ref(),
-        );
+        let tools = tools.unwrap_or_else(|| zp_tools::coding_tools(&cwd));
+        let enabled_tools = with_session_tools(tools.clone(), asker.as_ref(), subagent.as_ref());
         let context_files = context_files(&cwd, global_context_dir.as_deref(), trusted);
         let skills = resources.skills_prompt();
         let system_prompt = build_system_prompt(&SystemPromptOptions {
             cwd: &cwd,
-            tools: &tools,
+            tools: &enabled_tools,
             context_files: &context_files,
             custom_prompt: custom_system_prompt.as_deref(),
             append: append_system_prompt.as_deref(),
@@ -558,13 +572,14 @@ impl CodingSession {
         let mut agent_options = AgentOptions::with_models(models.clone(), model);
         agent_options.thinking_level = thinking;
         agent_options.system_prompt = Some(system_prompt.clone());
-        agent_options.tools = tools;
+        agent_options.tools = enabled_tools;
         agent_options.messages = context.messages;
         agent_options.hooks = CodingHooks::new(
             &blobs,
             permissions.as_ref(),
             &models,
             subagent.as_ref(),
+            false,
             &compaction,
         );
         agent_options.request_options = StreamOptions {
@@ -605,7 +620,11 @@ impl CodingSession {
             blobs,
             permissions,
             asker,
-            subagent: Mutex::new(subagent),
+            tool_inputs: Mutex::new(ToolInputs {
+                tools,
+                subagent,
+                planning: false,
+            }),
             compaction,
             _persistence: persistence,
         })
@@ -743,20 +762,25 @@ impl CodingSession {
     /// Replaces the tools (e.g. MCP servers connected) and updates the system prompt;
     /// `ask` stays when there is an asker.
     pub fn set_tools(&self, tools: Vec<Arc<dyn AgentTool>>) {
-        let subagent = self.subagent.lock().unwrap_or_else(PoisonError::into_inner);
-        self.agent.set_tools(with_session_tools(
-            tools,
-            self.asker.as_ref(),
-            subagent.as_ref(),
-        ));
-        drop(subagent);
-        self.rebuild_system_prompt();
+        let mut inputs = self.tool_inputs.lock().unwrap_or_else(PoisonError::into_inner);
+        inputs.tools = tools;
+        self.apply_tools(&inputs);
+    }
+
+    /// Restricts future runs to planning or restores their normal tools.
+    pub fn set_plan_mode(&self, enabled: bool) {
+        let mut inputs = self.tool_inputs.lock().unwrap_or_else(PoisonError::into_inner);
+        if inputs.planning != enabled {
+            inputs.planning = enabled;
+            self.apply_tools(&inputs);
+        }
     }
 
     /// Applies a new policy to future runs.
     pub fn set_subagents(&self, settings: SubagentSettings) {
         let enabled = settings.is_usable();
-        let mut current = self.subagent.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut inputs = self.tool_inputs.lock().unwrap_or_else(PoisonError::into_inner);
+        let current = &mut inputs.subagent;
         if (enabled
             && current
                 .as_ref()
@@ -773,27 +797,41 @@ impl CodingSession {
                 self.permissions.clone(),
             ))
         });
-        let tools = with_session_tools(self.agent.tools(), self.asker.as_ref(), current.as_ref());
+        self.apply_tools(&inputs);
+    }
+
+    fn apply_tools(&self, inputs: &ToolInputs) {
+        let subagent = inputs.subagent.as_ref().filter(|_| !inputs.planning);
+        let base = if inputs.planning {
+            zp_tools::read_only_tools(&self.cwd)
+        } else {
+            inputs.tools.clone()
+        };
+        let mut tools = with_session_tools(base, self.asker.as_ref(), subagent);
+        if inputs.planning {
+            tools.push(Arc::new(SubmitPlan));
+        }
         self.agent.set_tools_and_hooks(
             tools,
             CodingHooks::new(
                 &self.blobs,
                 self.permissions.as_ref(),
                 &self.models,
-                current.as_ref(),
+                subagent,
+                inputs.planning,
                 &self.compaction,
             ),
         );
-        drop(current);
         self.rebuild_system_prompt();
     }
 
     /// Cancels a queued or running subagent.
     pub fn cancel_subagent(&self, call_id: &str) {
         if let Some(tool) = self
-            .subagent
+            .tool_inputs
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
+            .subagent
             .as_ref()
         {
             tool.cancel(call_id);
@@ -819,7 +857,7 @@ impl CodingSession {
             inputs.trusted,
         );
         let skills = inputs.resources.skills_prompt();
-        let prompt = build_system_prompt(&SystemPromptOptions {
+        let mut prompt = build_system_prompt(&SystemPromptOptions {
             cwd: &self.cwd,
             tools: &tools,
             context_files: &files,
@@ -832,6 +870,11 @@ impl CodingSession {
                 .and_then(PermissionGate::scratch_directory)
                 .as_deref(),
         });
+        if tools.iter().any(|tool| tool.name() == plan::SUBMIT_PLAN) {
+            prompt.push_str("\n\n<plan_mode>\n");
+            prompt.push_str(plan::INSTRUCTIONS);
+            prompt.push_str("\n</plan_mode>");
+        }
         drop(inputs);
         self.agent.set_system_prompt(Some(prompt.clone()));
         *self

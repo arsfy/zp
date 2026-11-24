@@ -1023,7 +1023,7 @@ fn session_manager(cx: &App) -> Option<SessionManager> {
 }
 
 /// A new session for `root`, saved under the data directory (in memory without one).
-fn new_session(root: &Path, cx: &App) -> Session {
+pub(crate) fn new_session(root: &Path, cx: &App) -> Session {
     match session_manager(cx) {
         Some(manager) => manager.create(root),
         None => Session::in_memory(root),

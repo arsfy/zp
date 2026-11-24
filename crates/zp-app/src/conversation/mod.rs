@@ -8,6 +8,7 @@ pub mod composer;
 mod disclosure;
 mod files;
 mod permissions;
+mod plan;
 mod progress;
 mod questions;
 mod queued;
@@ -107,6 +108,11 @@ pub enum ConversationEvent {
     Activity,
     /// A fork of this conversation should open in a new tab.
     Forked(SessionHandoff),
+    /// Starts the approved plan in a new conversation.
+    ExecutePlanFresh {
+        session: SessionHandoff,
+        prompt: String,
+    },
     /// Files were changed (by a tool or a restore), or another branch is shown.
     FilesChanged,
     /// A user-confirmed restore finished; a diff can return to the conversation.
@@ -200,6 +206,7 @@ pub struct ConversationView {
     transcript: Transcript,
     list_state: ListState,
     running: bool,
+    plan: plan::PlanMode,
     /// Error from the last attempt to start a run.
     run_error: Option<String>,
     composer: Entity<EditableTextState>,
@@ -361,6 +368,7 @@ impl ConversationView {
             transcript: Transcript::default(),
             list_state: ListState::new(0, ListAlignment::Top, px(1000.)),
             running: false,
+            plan: plan::PlanMode::Off,
             run_error: None,
             composer,
             prompt_history: Vec::new(),
@@ -592,7 +600,7 @@ impl ConversationView {
         let mut compacted = false;
         for ReceivedEvent { at, event, timing } in &events {
             if matches!(event, AgentEvent::AgentStart)
-                && self.send_next.is_some()
+                && (self.send_next.is_some() || self.plan.is_closing())
                 && let Some(coding) = &self.coding
             {
                 // A click can arrive before the running task acquires its agent guard.
@@ -627,6 +635,9 @@ impl ConversationView {
                 changes.usage = true;
             }
             self.transcript.apply(event, *timing, &mut changes);
+            if let AgentEvent::AgentEnd { messages } = event {
+                self.collect_plan(messages, cx);
+            }
         }
         for &row in changes.dirty.iter().filter(|&&row| row < old_len) {
             self.list_state.remeasure_items(row..row + 1);
@@ -1209,7 +1220,7 @@ impl ConversationView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.is_busy() {
+        if self.is_busy() || self.has_plan_for_review() {
             return;
         }
         let Some(transcript::Row::User { text, .. }) = self.transcript.rows().get(row).cloned()
@@ -1260,7 +1271,7 @@ impl ConversationView {
             return;
         };
         let text = edit.input.read(cx).as_str().trim().to_owned();
-        if text.is_empty() || self.is_busy() {
+        if text.is_empty() || self.is_busy() || self.has_plan_for_review() {
             return;
         }
         let row = edit.row;
@@ -1565,7 +1576,7 @@ impl ConversationView {
             return;
         }
         self.completion = None;
-        let text = raw.trim().to_owned();
+        let mut text = raw.trim().to_owned();
         if (text.is_empty() && self.attachments.is_empty()) || self.compacting {
             return;
         }
@@ -1575,27 +1586,35 @@ impl ConversationView {
         self.info = None;
         self.needs_key = None;
         self.needs_model = false;
-        // `/model`, `/thinking` and `/permissions` without an argument list their
-        // choices in the completion menu.
-        if !self.running && self.open_command_options(&text, window, cx) {
-            return;
+        if let Some(goal) = plan::command_goal(&text) {
+            if !self.enable_plan(cx) {
+                return;
+            }
+            text = goal.to_owned();
+            self.set_draft(&text, cx);
+            if text.is_empty() {
+                self.focus_composer(window, cx);
+                return;
+            }
+        } else if !self.running {
+            // `/model`, `/thinking` and `/permissions` without an argument list their
+            // choices in the completion menu.
+            if self.open_command_options(&text, window, cx) {
+                return;
+            }
+            if self.run_builtin(&text, window, cx) {
+                self.composer
+                    .update(cx, |composer, cx| composer.emplace("", cx));
+                return;
+            }
         }
-        if !self.running && self.run_builtin(&text, window, cx) {
-            self.composer
-                .update(cx, |composer, cx| composer.emplace("", cx));
+        if self.plan.blocks_prompt(self.running) {
             return;
         }
         // No model yet, or no key for its provider: keep the draft and ask for one.
-        let Some(model) = coding.agent().model() else {
-            self.needs_model = true;
-            cx.notify();
+        let Some(model) = self.model_for_send(cx) else {
             return;
         };
-        if !AppModels::has_credentials(&model.provider, cx) {
-            self.needs_key = Some(model.provider);
-            cx.notify();
-            return;
-        }
         if !self.attachments.is_empty() && !model.supports_images() {
             self.run_error = Some(format!(
                 "{} does not accept images; remove them or pick another model",
@@ -1630,6 +1649,22 @@ impl ConversationView {
             coding.prompt(zp_agent::PromptInput(vec![message])).await
         });
         self.focus_composer(window, cx);
+    }
+
+    fn model_for_send(&mut self, cx: &mut Context<Self>) -> Option<Model> {
+        match self.model() {
+            Some(model) if AppModels::has_credentials(&model.provider, cx) => Some(model),
+            Some(model) => {
+                self.needs_key = Some(model.provider);
+                cx.notify();
+                None
+            }
+            None => {
+                self.needs_model = true;
+                cx.notify();
+                None
+            }
+        }
     }
 
     fn start_run<F, Fut>(&mut self, cx: &mut Context<Self>, run: F)
@@ -1691,6 +1726,9 @@ impl ConversationView {
     /// Marks the run as over once its last event has been shown.
     fn finish_run(&mut self, cx: &mut Context<Self>) {
         self.running = false;
+        if self.plan.is_closing() {
+            self.leave_plan();
+        }
         self.finish_temp_tracking();
         // A compaction cancelled with the run ends without an event.
         self.auto_compacting = false;
@@ -1854,7 +1892,7 @@ impl ConversationView {
         let Some(coding) = self.coding.clone() else {
             return;
         };
-        if self.running || self.compacting {
+        if self.running || self.compacting || self.plan.blocks_prompt(false) {
             return;
         }
         if let Err(error) = coding.prepare_retry() {

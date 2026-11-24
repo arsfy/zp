@@ -255,7 +255,7 @@ pub(super) fn icon_button(
         .child(svg().data(icon).size(px(13.)).text_color(colors.text_muted))
 }
 
-fn ghost_button(
+pub(super) fn ghost_button(
     element_id: impl Into<ElementId>,
     label: impl Into<SharedString>,
     cx: &App,
@@ -909,7 +909,22 @@ impl ConversationView {
                     self.transcript.thinking_is_running(row, block),
                     cx,
                 )),
-                AssistantContent::ToolCall(call) => column.child(self.render_tool(row, call, cx)),
+                AssistantContent::ToolCall(call) => {
+                    let plan = self.transcript.tool(&call.id).filter(|state| {
+                        call.name == zp_core::plan::SUBMIT_PLAN && state.status == ToolStatus::Done
+                    });
+                    if let Some(plan) = plan {
+                        let blocks = self.parsed_markdown(&plan.output, false);
+                        let mut ids = IdGen::new(
+                            format!("plan-md-{row}-{block}"),
+                            (row, block),
+                            self.text_selection.clone(),
+                        );
+                        column.child(render_markdown(&blocks, &style, &mut ids))
+                    } else {
+                        column.child(self.render_tool(row, call, cx))
+                    }
+                }
             };
         }
         if !streaming && matches!(message.stop_reason, StopReason::Error | StopReason::Aborted) {
@@ -2207,22 +2222,24 @@ impl ConversationView {
                         })),
                 )
             })
-            .child(
-                div()
-                    .id("send")
-                    .debug_selector(|| "send-message".into())
-                    .px_3()
-                    .py_0p5()
-                    .rounded(px(4.))
-                    .text_size(px(12.))
-                    .bg(colors.accent)
-                    .text_color(colors.accent_text)
-                    .cursor_pointer()
-                    .child(if self.running { "Queue" } else { "Send" })
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.send(&crate::actions::SendMessage, window, cx)
-                    })),
-            );
+            .when(!self.plan.blocks_prompt(self.running), |actions| {
+                actions.child(
+                    div()
+                        .id("send")
+                        .debug_selector(|| "send-message".into())
+                        .px_3()
+                        .py_0p5()
+                        .rounded(px(4.))
+                        .text_size(px(12.))
+                        .bg(colors.accent)
+                        .text_color(colors.accent_text)
+                        .cursor_pointer()
+                        .child(if self.running { "Queue" } else { "Send" })
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.send(&crate::actions::SendMessage, window, cx)
+                        })),
+                )
+            });
 
         let todos = self.render_todo_panel(cx);
         let notes = div()
@@ -2347,7 +2364,7 @@ impl ConversationView {
                     )
                 })
                 .children(self.render_queued_prompts(cx))
-;
+                .children(self.render_plan_review(cx));
         let input_width = self.composer_input_width.clone();
         let view = cx.entity().downgrade();
         let measure_input = canvas(
@@ -2434,7 +2451,15 @@ impl ConversationView {
             .child(
                 text_area("composer-input")
                     .state(self.composer.downgrade())
-                    .placeholder(if self.running {
+                    .placeholder(if self.plan.is_closing() {
+                        "Stopping planning…"
+                    } else if self.has_plan_for_review() {
+                        "Choose what to do with the plan…"
+                    } else if self.plan.is_enabled() && self.running {
+                        "Planning…"
+                    } else if self.plan.is_enabled() {
+                        "Describe what to plan…"
+                    } else if self.running {
                         "Queue a message… (sent after the current step)"
                     } else {
                         "Message ZP… (/ commands, $ skills, @ files)"
@@ -2477,6 +2502,9 @@ impl ConversationView {
                         self.permission_mode().label().to_owned(),
                         cx,
                     ))
+                    .when(self.plan.is_enabled(), |this| {
+                        this.child(self.render_plan_chip(cx))
+                    })
                     .child(div().flex_1())
                     .child(
                         div()
@@ -2485,6 +2513,8 @@ impl ConversationView {
                             .text_color(colors.text_muted)
                             .child(if self.running {
                                 "Esc to stop".to_owned()
+                            } else if self.plan.blocks_prompt(false) {
+                                String::new()
                             } else {
                                 match crate::actions::shortcut_keys("zp::SendMessage", cx) {
                                     Some(keys) if keys == KEY_SEND => format!(

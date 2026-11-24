@@ -12,7 +12,7 @@ use crate::project::ProjectWindow;
 use crate::store::AppStore;
 use crate::tests::project_dir;
 use crate::tests_conversation::{
-    active, idle, open, send, set_permission_mode, setup_models, wait_until,
+    active, idle, open, send, set_permission_mode, setup_models, tab_count, wait_until,
 };
 
 /// Text of the agent's tool results, in order.
@@ -70,6 +70,141 @@ fn request_prompts(faux: &FauxProvider) -> Vec<String> {
                 })
         })
         .collect()
+}
+
+#[gpui::test]
+fn plan_mode_reviews_markdown_before_implementation(cx: &mut TestAppContext) {
+    const PLAN: &str = "# Improve the parser\n\n1. Update the parser.\n2. Run its tests.";
+    let faux = FauxProvider::default();
+    let data = setup_models(cx, &[&faux], false);
+    let (_dir, project) = project_dir();
+    let window = open(cx, &project);
+    let conversation = active(window, cx);
+    let submit_plan = || FauxResponse::tool_call("submit_plan", json!({"markdown": PLAN}));
+    let model_tools =
+        |cx: &mut TestAppContext| conversation.read_with(cx, |view, _| view.tool_names());
+
+    send(window, "/plan", cx);
+    assert!(model_tools(cx).iter().any(|name| name == "submit_plan"));
+    assert!(faux.requests().is_empty());
+    click(window, "close-plan", cx);
+    assert!(model_tools(cx).iter().any(|name| name == "write"));
+
+    // Even with Full Auto permissions, a planning run cannot write to the workspace.
+    faux.push(FauxResponse::tool_call(
+        "write",
+        json!({"path": "unexpected.txt", "content": "unexpected"}),
+    ));
+    faux.push(submit_plan());
+    send(window, "/plan Investigate the parser", cx);
+    wait_until(cx, |cx| {
+        VisualTestContext::from_window(window.into(), cx)
+            .debug_bounds("plan-review")
+            .is_some()
+    });
+    assert!(!project.join("unexpected.txt").exists());
+    assert_eq!(
+        tool_results(&conversation, cx),
+        ["Tool write not found", PLAN]
+    );
+    let requests = faux.requests();
+    assert_eq!(requests.len(), 2);
+    let (_, plan_prompt) = requests[0]
+        .system_prompt
+        .as_deref()
+        .unwrap()
+        .rsplit_once("\n\n<plan_mode>\n")
+        .expect("the system prompt includes Plan mode instructions");
+    assert_eq!(
+        plan_prompt,
+        concat!(
+            "The user enabled Plan mode. Investigate and design the requested change without implementing it. ",
+            "Use the read-only tools to inspect relevant files, and use ask to resolve decisions that materially change the plan. ",
+            "Use the user's language. When the plan is ready, call submit_plan by itself with the full Markdown document. ",
+            "Include the goal, the proposed steps and affected areas, and how to verify the result. ",
+            "Include any decisions or assumptions the implementer needs, so the plan can be executed in a fresh session. ",
+            "The app will ask the user what to do next.\n</plan_mode>",
+        )
+    );
+    assert_eq!(
+        requests[0]
+            .tools
+            .iter()
+            .map(|tool| tool.name.as_str())
+            .collect::<Vec<_>>(),
+        ["read", "grep", "find", "ls", "ask", "submit_plan"]
+    );
+    let files: Vec<_> = std::fs::read_dir(data.path().join("plans"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect();
+    assert_eq!(files.len(), 1);
+    assert_eq!(files[0].extension().unwrap(), "md");
+    assert_eq!(
+        std::fs::read_to_string(&files[0]).unwrap(),
+        format!("{PLAN}\n")
+    );
+
+    // Normal sends wait for a decision and leave the draft intact.
+    send(window, "draft for later", cx);
+    assert_eq!(faux.requests().len(), 2);
+    faux.push(FauxResponse::text("Implemented"));
+    click(window, "execute-plan", cx);
+    wait_until(cx, |cx| {
+        faux.requests().len() == 3 && !conversation.read_with(cx, |view, _| view.is_running())
+    });
+    assert_eq!(tab_count(window, cx), 1);
+    assert_eq!(
+        conversation.read_with(cx, |view, cx| view.draft(cx)),
+        "draft for later"
+    );
+    assert!(model_tools(cx).iter().any(|name| name == "write"));
+    let requests = faux.requests();
+    let implementation = &requests[2];
+    let prompts: Vec<String> = implementation
+        .messages
+        .iter()
+        .filter_map(|message| match message {
+            zp_ai::Message::User(user) => Some(
+                user.content
+                    .iter()
+                    .filter_map(UserContent::as_text)
+                    .collect(),
+            ),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(prompts[0], "Investigate the parser");
+    assert!(prompts[1].ends_with(PLAN));
+
+    faux.push(submit_plan());
+    send(window, "/plan Revisit the parser", cx);
+    click(window, "cancel-plan", cx);
+    cx.run_until_parked();
+    assert_eq!(faux.requests().len(), 4);
+    assert!(model_tools(cx).iter().any(|name| name == "write"));
+
+    faux.push(submit_plan());
+    faux.push(FauxResponse::text("Implemented in a fresh conversation"));
+    send(window, "/plan Make a fresh plan", cx);
+    click(window, "execute-plan-fresh", cx);
+    let fresh = active(window, cx);
+    assert_ne!(fresh, conversation);
+    idle(&fresh, 2, cx);
+    assert_eq!(tab_count(window, cx), 2);
+    let requests = faux.requests();
+    let implementation = &requests[5];
+    let [zp_ai::Message::User(user)] = implementation.messages.as_slice() else {
+        panic!("expected the approved plan to be the entire conversation");
+    };
+    assert!(
+        user.content
+            .iter()
+            .filter_map(UserContent::as_text)
+            .collect::<String>()
+            .ends_with(PLAN)
+    );
+    assert!(implementation.tools.iter().any(|tool| tool.name == "write"));
 }
 
 #[gpui::test]

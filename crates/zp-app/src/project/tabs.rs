@@ -122,6 +122,7 @@ impl ProjectWindow {
                         let view = conversation.read(cx);
                         let body = match view.failure() {
                             Some(error) => format!("Failed: {}", zp_tools::shorten(&error, 120)),
+                            None if view.has_plan_for_review() => "Plan ready for review".to_owned(),
                             None => "Finished".to_owned(),
                         };
                         this.notify_background(conversation, body, window, cx);
@@ -142,6 +143,14 @@ impl ProjectWindow {
                         if let Some(session) = handoff.borrow_mut().take() {
                             this.add_tab(session, false, window, cx);
                             this.load_sessions(cx);
+                        }
+                    }
+                    ConversationEvent::ExecutePlanFresh { session, prompt } => {
+                        if let Some(session) = session.borrow_mut().take() {
+                            let index = this.add_tab(session, false, window, cx);
+                            this.tabs[index].conversation.update(cx, |view, cx| {
+                                view.execute_approved_plan(prompt.clone(), window, cx);
+                            });
                         }
                     }
                     ConversationEvent::FilesChanged => {}

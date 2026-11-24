@@ -19,6 +19,7 @@ pub mod logging;
 pub mod model_catalog;
 pub mod paths;
 pub mod permissions;
+pub mod plan;
 pub mod project;
 pub mod providers;
 pub mod resources;
