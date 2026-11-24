@@ -889,6 +889,44 @@ impl SettingsWindow {
                     )
                 });
 
+            let heading = div()
+                .flex()
+                .items_baseline()
+                .gap_2()
+                .child(
+                    div()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .child(provider.name().to_owned()),
+                )
+                .child(
+                    div()
+                        .text_size(px(12.))
+                        .text_color(colors.text_muted)
+                        .child(id.clone()),
+                )
+                .when(is_custom, |this| {
+                    this.child(
+                        div()
+                            .px_1()
+                            .rounded(px(3.))
+                            .text_size(px(10.))
+                            .bg(colors.code_background)
+                            .text_color(colors.text_muted)
+                            .child("custom"),
+                    )
+                })
+                .child(div().flex_1())
+                .child(
+                    div()
+                        .text_size(px(12.))
+                        .text_color(if has_key {
+                            colors.success
+                        } else {
+                            colors.text_muted
+                        })
+                        .child(key_text),
+                );
+
             body = body.child(
                 div()
                     .flex()
@@ -899,49 +937,12 @@ impl SettingsWindow {
                     .border_1()
                     .border_color(colors.border)
                     .child(
-                        div()
-                            .flex()
-                            .items_baseline()
-                            .gap_2()
-                            .child(
-                                div()
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .child(provider.name().to_owned()),
-                            )
-                            .child(
-                                div()
-                                    .text_size(px(12.))
-                                    .text_color(colors.text_muted)
-                                    .child(id.clone()),
-                            )
-                            .when(is_custom, |this| {
-                                this.child(
-                                    div()
-                                        .px_1()
-                                        .rounded(px(3.))
-                                        .text_size(px(10.))
-                                        .bg(colors.code_background)
-                                        .text_color(colors.text_muted)
-                                        .child("custom"),
-                                )
-                            })
-                            .child(div().flex_1())
-                            .child(
-                                div()
-                                    .text_size(px(12.))
-                                    .text_color(if has_key {
-                                        colors.success
-                                    } else {
-                                        colors.text_muted
-                                    })
-                                    .child(key_text),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(12.))
-                            .text_color(colors.text_muted)
-                            .child(models_text),
+                        div().flex().flex_col().gap_0p5().child(heading).child(
+                            div()
+                                .text_size(px(12.))
+                                .text_color(colors.text_muted)
+                                .child(models_text),
+                        ),
                     )
                     .when_some(failure, |this, error| {
                         this.child(
