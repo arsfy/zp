@@ -907,6 +907,7 @@ impl SettingsWindow {
                 .when(is_custom, |this| {
                     this.child(
                         div()
+                            .self_center()
                             .px_1()
                             .rounded(px(3.))
                             .text_size(px(10.))
