@@ -678,7 +678,7 @@ impl ConversationView {
         }
         .map(|label| {
             div()
-                .debug_selector(move || format!("message-time-{ix}").into())
+                .debug_selector(move || format!("message-time-{ix}"))
                 .text_size(px(11.))
                 .text_color(cx.theme().colors.text_muted)
                 .whitespace_nowrap()
@@ -873,7 +873,7 @@ impl ConversationView {
                 )
             });
         div()
-            .debug_selector(move || format!("user-message-{row}").into())
+            .debug_selector(move || format!("user-message-{row}"))
             .flex()
             .justify_end()
             .child(bubble)
@@ -2022,7 +2022,7 @@ impl ConversationView {
             .collect::<Vec<_>>()
             .join(", ");
         let withdraw = ghost_button(id("queue-withdraw", index), "Withdraw", cx)
-            .debug_selector(move || format!("queue-withdraw-{index}").into())
+            .debug_selector(move || format!("queue-withdraw-{index}"))
             .on_click(
                 cx.listener(move |this, _, window, cx| this.withdraw_queued(queued_id, window, cx)),
             );
@@ -2105,7 +2105,7 @@ impl ConversationView {
                 .gap_2()
                 .child(
                     div()
-                        .debug_selector(move || format!("queue-preview-{index}").into())
+                        .debug_selector(move || format!("queue-preview-{index}"))
                         .flex_1()
                         .min_w_0()
                         .truncate()
@@ -2116,9 +2116,7 @@ impl ConversationView {
                         .when(self.send_next.is_none(), |actions| {
                             actions.child(
                                 ghost_button(id("queue-send-now", index), send_label, cx)
-                                    .debug_selector(move || {
-                                        format!("queue-send-now-{index}").into()
-                                    })
+                                    .debug_selector(move || format!("queue-send-now-{index}"))
                                     .text_color(colors.accent)
                                     .on_click(cx.listener(move |this, _, _, cx| {
                                         this.send_queued_now(queued_id, cx)
@@ -2130,9 +2128,7 @@ impl ConversationView {
                             |actions| {
                                 actions.child(
                                     ghost_button(id("queue-edit", index), "Edit", cx)
-                                        .debug_selector(move || {
-                                            format!("queue-edit-{index}").into()
-                                        })
+                                        .debug_selector(move || format!("queue-edit-{index}"))
                                         .on_click(cx.listener(move |this, _, window, cx| {
                                             this.edit_queued(queued_id, window, cx)
                                         })),
