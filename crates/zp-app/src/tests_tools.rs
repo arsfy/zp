@@ -1,4 +1,4 @@
-//! The `ask` and `todo` tools in the app: question cards, answers sent back to the
+//! Tool cards in the app: file previews, question cards, answers sent back to the
 //! agent, and the task list above the composer.
 
 use gpui::{Entity, Modifiers, TestAppContext, VisualTestContext, WindowHandle};
@@ -7,6 +7,7 @@ use zp_ai::{FauxBlock, FauxProvider, FauxResponse, UserContent};
 use zp_core::permissions::PermissionMode;
 
 use crate::conversation::ConversationView;
+use crate::conversation::transcript::ToolStatus;
 use crate::project::ProjectWindow;
 use crate::tests::project_dir;
 use crate::tests_conversation::{
@@ -47,6 +48,49 @@ fn click(window: WindowHandle<ProjectWindow>, selector: &'static str, cx: &mut T
     let mut visual = VisualTestContext::from_window(window.into(), cx);
     let bounds = visual.debug_bounds(selector).unwrap();
     visual.simulate_click(bounds.center(), Modifiers::none());
+}
+
+#[gpui::test]
+fn file_tools_show_read_code_and_edit_content_while_it_streams(cx: &mut TestAppContext) {
+    let faux = FauxProvider::default().with_chunk_delay(std::time::Duration::from_millis(200));
+    let before = "fn version() -> u32 { 1 }\n";
+    let after = "fn version() -> u32 { 2 }\n";
+    faux.push(FauxResponse::tool_call("read", json!({"path": "demo.rs"})));
+    faux.push(FauxResponse::tool_call(
+        "edit",
+        json!({"path": "demo.rs", "edits": [{"oldText": before, "newText": after}]}),
+    ));
+    faux.push(FauxResponse::text("Updated the file."));
+    let _data = setup_models(cx, &[&faux], false);
+    let (_dir, project) = project_dir();
+    let file = project.join("demo.rs");
+    std::fs::write(&file, before).unwrap();
+    let window = open(cx, &project);
+    let conversation = active(window, cx);
+    send(window, "Read the source and bump the version", cx);
+
+    wait_until(cx, |cx| {
+        conversation.read_with(cx, |view, _| {
+            view.transcript()
+                .tool("faux_call_0")
+                .is_some_and(|tool| tool.status == ToolStatus::Done)
+        })
+    });
+    conversation.update(cx, |view, cx| view.toggle_tool("faux_call_0", 1, false, cx));
+    wait_until(cx, |cx| {
+        VisualTestContext::from_window(window.into(), cx)
+            .debug_bounds("tool-read-output")
+            .is_some()
+    });
+    wait_until(cx, |cx| {
+        conversation.read_with(cx, |view, _| view.transcript().is_streaming(2))
+            && VisualTestContext::from_window(window.into(), cx)
+                .debug_bounds("tool-live-file-content")
+                .is_some()
+    });
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), before);
+    idle(&conversation, 4, cx);
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), after);
 }
 
 #[gpui::test]

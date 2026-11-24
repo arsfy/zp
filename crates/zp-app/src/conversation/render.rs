@@ -1,5 +1,6 @@
 //! Rendering of the conversation: transcript rows, tool cards and the composer.
 
+use std::borrow::Cow;
 use std::sync::LazyLock;
 use std::time::Duration;
 
@@ -7,11 +8,12 @@ use chrono::{DateTime, Datelike as _, Local, TimeZone as _};
 use gpui::{
     Anchor, Animation, AnimationExt as _, AnyElement, App, ClipboardItem, ColorExt as _, Context,
     DispatchPhase, Div, ElementId, FontWeight, IntoElement, MouseButton, Render, Rgba,
-    SharedString, Window, anchored, canvas, deferred, div, ease_out_quint, linear_color_stop,
-    linear_gradient, list, point, prelude::*, px, relative, rgb_to_hsla, svg,
+    SharedString, StyledText, Window, anchored, canvas, deferred, div, ease_out_quint,
+    linear_color_stop, linear_gradient, list, point, prelude::*, px, relative, rgb_to_hsla, svg,
 };
 use gpui_elements::editable_text::{text_area, text_input};
 use regex::{Captures, Regex};
+use serde_json::Value;
 use zp_ai::{AssistantContent, StopReason, ToolCall};
 use zp_core::changes::{RevertStatus, Scope};
 use zp_core::checkpoint::RecordedChange;
@@ -39,8 +41,63 @@ use zp_core::subagents::Status as SubagentStatus;
 const CONTENT_WIDTH: f32 = 820.0;
 /// Lines of tool output shown in an expanded card.
 const OUTPUT_PREVIEW_LINES: usize = 30;
+/// Limits the work of drawing a streamed file preview, including long single lines.
+const LIVE_FILE_PREVIEW_BYTES: usize = 8 * 1024;
 /// Lines of a subagent's conclusion shown before "Show all".
 const SUBAGENT_PREVIEW_LINES: usize = 24;
+
+fn styled_file_text(call: &ToolCall, text: String, dark: bool) -> StyledText {
+    let path = call.arguments["path"].as_str();
+    let highlights = crate::markdown::highlight::highlight(path, &text, dark);
+    let styled = StyledText::new(text);
+    match highlights {
+        Some(highlights) => styled.with_highlights(highlights.iter().cloned()),
+        None => styled,
+    }
+}
+
+/// Text the model has sent so far, including the original block while it is still
+/// supplying the replacement or when the edit removes it.
+fn live_file_text(call: &ToolCall) -> Option<(Cow<'_, str>, bool)> {
+    if call.name == "write" {
+        return call.arguments["content"]
+            .as_str()
+            .map(|text| (text.into(), false));
+    }
+    fn replacement(edits: &Value) -> Option<(&str, bool)> {
+        let edit = edits
+            .as_array()
+            .and_then(|edits| edits.last())
+            .unwrap_or(edits);
+        edit["newText"]
+            .as_str()
+            .filter(|text| !text.is_empty())
+            .map(|text| (text, false))
+            .or_else(|| edit["oldText"].as_str().map(|text| (text, true)))
+    }
+    let edits = &call.arguments["edits"];
+    if let Some(json) = edits.as_str() {
+        let parsed = zp_ai::partial_json::parse_partial_json(json);
+        if let Some((text, original)) = parsed.as_ref().and_then(replacement) {
+            return Some((text.to_owned().into(), original));
+        }
+    }
+    replacement(edits)
+        .or_else(|| replacement(&call.arguments))
+        .map(|(text, original)| (text.into(), original))
+}
+
+fn live_preview_tail(text: &str) -> (&str, bool) {
+    let start = text.ceil_char_boundary(text.len().saturating_sub(LIVE_FILE_PREVIEW_BYTES));
+    let text = &text[start..];
+    if let Some(earlier) = text
+        .rsplitn(OUTPUT_PREVIEW_LINES + 1, '\n')
+        .nth(OUTPUT_PREVIEW_LINES)
+    {
+        return (&text[earlier.len() + 1..], true);
+    }
+    (text, start > 0)
+}
 
 /// What a finished subagent took: time, model requests, tokens and cost, leaving out
 /// what is zero.
@@ -1279,6 +1336,13 @@ impl ConversationView {
         if let Some(change) = change {
             return Some(self.render_inline_diff(&call.id, change, cx));
         }
+        if !waiting
+            && matches!(call.name.as_str(), "edit" | "write")
+            && (status == Some(ToolStatus::Running) || status.is_none() && self.is_busy())
+        {
+            let progress = state.map(|state| state.output.as_str()).unwrap_or_default();
+            return Some(Self::render_live_file_change(call, progress, cx));
+        }
         let details = state
             .filter(|state| state.status == ToolStatus::Done && !asking)
             .and_then(|state| state.details.as_ref())
@@ -1313,6 +1377,12 @@ impl ConversationView {
             };
             let shown = expand_tabs(&shown, tab_width).into_owned();
             let empty = shown.trim().is_empty();
+            let read_output = call.name == "read" && status == Some(ToolStatus::Done);
+            let (before, after) = match call.name.as_str() {
+                "bash" => (note, None),
+                "read" => (None, note),
+                _ => (None, None),
+            };
             div()
                 .px_3()
                 .py_2()
@@ -1321,7 +1391,7 @@ impl ConversationView {
                 .bg(colors.code_background)
                 .font_family(mono)
                 .text_size(px(12.))
-                .when_some(note.filter(|_| call.name == "bash"), |this, note| {
+                .when_some(before, |this, note| {
                     this.child(div().text_color(colors.text_muted).child(note))
                 })
                 .child(if empty {
@@ -1332,6 +1402,10 @@ impl ConversationView {
                             "(no output)"
                         },
                     )
+                } else if read_output {
+                    div()
+                        .debug_selector(|| "tool-read-output".into())
+                        .child(styled_file_text(call, shown, cx.theme().is_dark))
                 } else {
                     div()
                         .when(matches!(status, Some(ToolStatus::Error)), |this| {
@@ -1339,8 +1413,49 @@ impl ConversationView {
                         })
                         .child(shown)
                 })
+                .when_some(after, |this, note| {
+                    this.child(div().text_color(colors.text_muted).child(note))
+                })
                 .into_any_element()
         })
+    }
+
+    fn render_live_file_change(call: &ToolCall, progress: &str, cx: &App) -> AnyElement {
+        let theme = cx.theme();
+        let colors = &theme.colors;
+        let status = if !progress.is_empty() {
+            progress
+        } else if call.name == "edit" {
+            "Preparing edit…"
+        } else {
+            "Preparing write…"
+        };
+        let preview = live_file_text(call).filter(|(text, _)| !text.is_empty());
+        div()
+            .px_3()
+            .py_2()
+            .border_t_1()
+            .border_color(colors.border)
+            .bg(colors.code_background)
+            .font_family(theme.metrics.mono_font.clone())
+            .text_size(px(12.))
+            .child(div().text_color(colors.text_muted).child(status.to_owned()))
+            .when_some(preview, |body, (text, original)| {
+                let (shown, clipped) = live_preview_tail(&text);
+                body.child(
+                    div()
+                        .debug_selector(|| "tool-live-file-content".into())
+                        .pt_1()
+                        .when(original, |code| {
+                            code.child(div().text_color(colors.text_muted).child("Original text"))
+                        })
+                        .when(clipped, |code| {
+                            code.child(div().text_color(colors.text_muted).child("…"))
+                        })
+                        .child(expand_tabs(shown, TAB_WIDTH).into_owned()),
+                )
+            })
+            .into_any_element()
     }
 
     /// A subagent's card: its model and progress while it works; then what the run took

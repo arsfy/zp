@@ -97,14 +97,17 @@ async fn read_edit_test_then_resume() {
         std::fs::read_to_string(cwd.join("add.sh")).unwrap(),
         "echo $((2+3))\n"
     );
-    assert!(
-        updates
-            .lock()
-            .unwrap()
-            .iter()
-            .any(|u| u.contains("running")),
-        "bash streams progress"
-    );
+    {
+        let updates = updates.lock().unwrap();
+        assert!(
+            updates.iter().any(|u| u.contains("running")),
+            "bash streams progress"
+        );
+        assert!(
+            updates.iter().any(|u| u.starts_with("Writing add.sh (")),
+            "edit reports the actual write"
+        );
+    }
 
     // The request carried the system prompt with project context and every tool.
     let request = &faux.requests()[0];

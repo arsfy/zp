@@ -91,6 +91,10 @@ impl AgentTool for WriteTool {
                     .await
                     .with_context(|| format!("Could not create {}", display(&self.cwd, dir)))?;
             }
+            ctx.update(AgentToolResult::text(format!(
+                "Writing {shown} ({} bytes)…",
+                content.len()
+            )));
             tokio::fs::write(&path, &content)
                 .await
                 .with_context(|| format!("Could not write {shown}"))?;

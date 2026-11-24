@@ -141,6 +141,7 @@ impl AgentTool for EditTool {
             if ctx.cancel.is_cancelled() {
                 bail!("Operation aborted");
             }
+            ctx.update(AgentToolResult::text(format!("Reading {shown}…")));
             let metadata = tokio::fs::metadata(&path)
                 .await
                 .with_context(|| format!("Could not edit file: {shown}"))?;
@@ -154,6 +155,11 @@ impl AgentTool for EditTool {
             if ctx.cancel.is_cancelled() {
                 bail!("Operation aborted");
             }
+            ctx.update(AgentToolResult::text(format!(
+                "Writing {shown} ({} bytes, {} replacements)…",
+                after.len(),
+                edits.len()
+            )));
             tokio::fs::write(&path, &after)
                 .await
                 .with_context(|| format!("Could not write {shown}"))?;

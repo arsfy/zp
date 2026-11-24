@@ -24,7 +24,7 @@ use two_face::theme::EmbeddedThemeName;
 pub type Highlights = Arc<Vec<(Range<usize>, HighlightStyle)>>;
 
 /// Blocks longer than this are shown plain (highlighting cost grows with the text).
-const MAX_HIGHLIGHTED_BYTES: usize = 256 * 1024;
+pub(crate) const MAX_HIGHLIGHTED_BYTES: usize = 256 * 1024;
 /// Cached results and resumable states kept at most.
 const MAX_CACHED: usize = 256;
 const MAX_CHECKPOINTS: usize = 16;

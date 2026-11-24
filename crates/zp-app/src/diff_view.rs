@@ -1,20 +1,22 @@
 //! Diffs of files: the full-size diff view (unified or side by side) and the line
 //! renderers shared with the inline diffs of tool cards.
 
+use std::ops::Range;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
 
 use gpui::{
     AnyElement, App, ClipboardItem, ColorExt as _, Context, DispatchPhase, ElementId, EventEmitter,
-    FocusHandle, Focusable, FontWeight, IntoElement, ListHorizontalSizingBehavior, MouseButton,
-    Pixels, Render, Rgba, SharedString, UniformListScrollHandle, Window, div, prelude::*, px,
-    uniform_list,
+    FocusHandle, Focusable, FontWeight, HighlightStyle, IntoElement, ListHorizontalSizingBehavior,
+    MouseButton, Pixels, Render, Rgba, SharedString, StyledText, UniformListScrollHandle, Window,
+    div, prelude::*, px, uniform_list,
 };
 use zp_core::changes::RevertStatus;
 use zp_core::diff::{DEFAULT_CONTEXT, DiffLine, FileDiff, LineKind, SideLine, SplitRow};
 
 use crate::actions::{CloseDiff, NextDiffFile, PreviousDiffFile, ToggleDiffLayout};
+use crate::markdown::highlight::{Highlights, MAX_HIGHLIGHTED_BYTES, highlight};
 use crate::selectable_text::{SelectableText, TextId, TextSelection};
 use crate::theme::ActiveTheme;
 
@@ -164,6 +166,66 @@ fn expand_tabs(text: &str) -> String {
     text.replace('\t', "    ")
 }
 
+/// One version of a diffed file, indexed in the same line order as the diff.
+struct DiffSource {
+    text: Arc<str>,
+    starts: Rc<[usize]>,
+}
+
+impl DiffSource {
+    fn new(text: &Arc<str>) -> Option<Self> {
+        if text.len() > MAX_HIGHLIGHTED_BYTES {
+            return None;
+        }
+        let text = if text.contains('\r') {
+            text.replace("\r\n", "\n").replace('\r', "\n").into()
+        } else {
+            text.clone()
+        };
+        let starts = std::iter::once(0)
+            .chain(text.match_indices('\n').map(|(offset, _)| offset + 1))
+            .collect();
+        Some(Self { text, starts })
+    }
+
+    fn highlight(&self, path: &str, dark: bool) -> Option<DiffHighlights> {
+        Some(DiffHighlights {
+            spans: highlight(Some(path), &self.text, dark)?,
+            starts: self.starts.clone(),
+        })
+    }
+}
+
+struct DiffHighlights {
+    spans: Highlights,
+    starts: Rc<[usize]>,
+}
+
+impl DiffHighlights {
+    fn line(&self, number: usize, text: &str) -> Vec<(Range<usize>, HighlightStyle)> {
+        let Some(&start) = number
+            .checked_sub(1)
+            .and_then(|index| self.starts.get(index))
+        else {
+            return Vec::new();
+        };
+        let end = start + text.len();
+        let first = self.spans.partition_point(|(range, _)| range.end <= start);
+        let tabs: Vec<_> = text.match_indices('\t').map(|(offset, _)| offset).collect();
+        // A tab occupies one byte in the source and four spaces in the diff.
+        let display_offset = |offset| offset + 3 * tabs.partition_point(|&tab| tab < offset);
+        self.spans[first..]
+            .iter()
+            .take_while(|(range, _)| range.start < end)
+            .filter_map(|(range, style)| {
+                let from = range.start.saturating_sub(start);
+                let to = range.end.min(end) - start;
+                (from < to).then(|| (display_offset(from)..display_offset(to), *style))
+            })
+            .collect()
+    }
+}
+
 /// Columns `text` takes in a monospace font: wide (CJK, fullwidth, emoji) characters
 /// take two.
 fn display_columns(text: &str) -> usize {
@@ -202,25 +264,32 @@ fn gutter(number: Option<usize>, width: Pixels, colors: &DiffColors) -> impl Int
 
 /// A line's text: selectable and as wide as it is (the diff view scrolls sideways), or
 /// cut off at the row's end (small previews).
-fn code(text: &str, selection: Option<(&TextSelection, TextId)>) -> AnyElement {
+fn code(
+    text: &str,
+    selection: Option<(&TextSelection, TextId)>,
+    highlights: Vec<(Range<usize>, HighlightStyle)>,
+) -> AnyElement {
     let text: SharedString = expand_tabs(text).into();
     match selection {
         Some((selection, id)) => div()
             .flex_shrink_0()
             .pr(px(TEXT_END_PADDING))
-            .child(SelectableText::new(
-                ElementId::Name(format!("diff-text-{}-{}", id.0, id.1).into()),
-                id,
-                text,
-                selection.clone(),
-                "\n",
-            ))
+            .child(
+                SelectableText::new(
+                    ElementId::Name(format!("diff-text-{}-{}", id.0, id.1).into()),
+                    id,
+                    text,
+                    selection.clone(),
+                    "\n",
+                )
+                .highlights(highlights),
+            )
             .into_any_element(),
         None => div()
             .flex_1()
             .min_w_0()
             .overflow_hidden()
-            .child(text)
+            .child(StyledText::new(text).with_highlights(highlights))
             .into_any_element(),
     }
 }
@@ -244,6 +313,16 @@ pub fn render_unified_row(
     gutters: Gutters,
     selection: Option<(&TextSelection, usize)>,
 ) -> AnyElement {
+    render_unified(row, colors, gutters, selection, [&None, &None])
+}
+
+fn render_unified(
+    row: &UnifiedRow,
+    colors: &DiffColors,
+    gutters: Gutters,
+    selection: Option<(&TextSelection, usize)>,
+    [old, new]: [&Option<DiffHighlights>; 2],
+) -> AnyElement {
     let base = row_base(selection.is_some(), colors);
     match row {
         UnifiedRow::Header(header) => base
@@ -253,6 +332,12 @@ pub fn render_unified_row(
             .child(header.clone())
             .into_any_element(),
         UnifiedRow::Line(line) => {
+            let syntax = match line.new {
+                Some(number) => new.as_ref().map(|syntax| (syntax, number)),
+                None => old.as_ref().zip(line.old),
+            };
+            let highlights =
+                syntax.map_or_else(Vec::new, |(syntax, number)| syntax.line(number, &line.text));
             let (sign, color) = match line.kind {
                 LineKind::Added => ("+", colors.added),
                 LineKind::Removed => ("-", colors.removed),
@@ -276,6 +361,7 @@ pub fn render_unified_row(
                 .child(code(
                     &line.text,
                     selection.map(|(selection, index)| (selection, (0, index, 0))),
+                    highlights,
                 ))
                 .into_any_element()
         }
@@ -287,10 +373,10 @@ fn render_side(
     side: Option<&SideLine>,
     column: usize,
     index: usize,
-    gutter_width: Pixels,
-    width: Pixels,
+    (gutter_width, width): (Pixels, Pixels),
     colors: &DiffColors,
     selection: &TextSelection,
+    syntax: Option<&DiffHighlights>,
 ) -> impl IntoElement {
     div()
         .flex_1()
@@ -305,7 +391,11 @@ fn render_side(
         .when(side.is_none(), |this| this.bg(colors.muted.opacity(0.05)))
         .when_some(side, |this, side| {
             this.child(gutter(Some(side.number), gutter_width, colors))
-                .child(code(&side.text, Some((selection, (column, index, 0)))))
+                .child(code(
+                    &side.text,
+                    Some((selection, (column, index, 0))),
+                    syntax.map_or_else(Vec::new, |syntax| syntax.line(side.number, &side.text)),
+                ))
         })
 }
 
@@ -347,13 +437,14 @@ impl SplitWidths {
 }
 
 /// A side-by-side diff row; its text can be selected, one side at a time.
-pub fn render_split_row(
+fn render_split_row(
     row: &SplitRow,
     index: usize,
     diff: &FileDiff,
     colors: &DiffColors,
     widths: SplitWidths,
     selection: &TextSelection,
+    [old, new]: [&Option<DiffHighlights>; 2],
 ) -> AnyElement {
     let base = row_base(true, colors).text_color(colors.text);
     match row {
@@ -368,10 +459,10 @@ pub fn render_split_row(
                 left.as_ref(),
                 0,
                 index,
-                widths.gutters.0,
-                widths.sides.0,
+                (widths.gutters.0, widths.sides.0),
                 colors,
                 selection,
+                old.as_ref(),
             ))
             .child(
                 div()
@@ -384,10 +475,10 @@ pub fn render_split_row(
                 right.as_ref(),
                 1,
                 index,
-                widths.gutters.1,
-                widths.sides.1,
+                (widths.gutters.1, widths.sides.1),
                 colors,
                 selection,
+                new.as_ref(),
             ))
             .into_any_element(),
     }
@@ -416,6 +507,7 @@ pub struct DiffView {
     diff: Rc<FileDiff>,
     unified: Rc<Vec<UnifiedRow>>,
     split: Rc<Vec<SplitRow>>,
+    sources: [Option<DiffSource>; 2],
     scroll: UniformListScrollHandle,
     /// Selected text across the lines, for copying.
     selection: TextSelection,
@@ -439,6 +531,7 @@ impl DiffView {
             diff: Rc::default(),
             unified: Rc::default(),
             split: Rc::default(),
+            sources: [None, None],
             scroll: UniformListScrollHandle::new(),
             selection: TextSelection::new(focus_handle.clone()),
             focus_handle,
@@ -456,6 +549,13 @@ impl DiffView {
             .unwrap_or_default();
         self.unified = Rc::new(unified_rows(&diff));
         self.split = Rc::new(diff.split_rows());
+        self.sources = match self.items.get(self.index) {
+            Some(item) if !diff.too_large && !diff.is_empty() => [
+                item.before.as_ref().and_then(DiffSource::new),
+                item.after.as_ref().and_then(DiffSource::new),
+            ],
+            _ => [None, None],
+        };
         self.diff = Rc::new(diff);
         self.scroll = UniformListScrollHandle::new();
         self.reset_selection();
@@ -814,14 +914,21 @@ impl Render for DiffView {
             let gutters = Gutters::of(&diff, digit);
             let widths = SplitWidths::of(&split, gutters, digit);
             let selection = self.selection.clone();
+            let path = self.items[self.index].path.to_string_lossy();
+            let [old, new] = self.sources.each_ref().map(|source| {
+                source
+                    .as_ref()
+                    .and_then(|source| source.highlight(&path, cx.theme().is_dark))
+            });
             uniform_list("diff-rows", count, move |range, _, _| {
                 range
                     .map(|ix| match layout {
-                        DiffLayout::Unified => render_unified_row(
+                        DiffLayout::Unified => render_unified(
                             &unified[ix],
                             &diff_colors,
                             gutters,
                             Some((&selection, ix)),
+                            [&old, &new],
                         ),
                         DiffLayout::Split => render_split_row(
                             &split[ix],
@@ -830,6 +937,7 @@ impl Render for DiffView {
                             &diff_colors,
                             widths,
                             &selection,
+                            [&old, &new],
                         ),
                     })
                     .collect::<Vec<_>>()
@@ -898,6 +1006,28 @@ impl Render for DiffView {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn syntax_ranges_follow_diff_lines_with_crlf_tabs_and_unicode() {
+        let line = "\tlet café = \"你好\";";
+        let text = Arc::<str>::from(format!("fn demo() {{\r\n{line}\r\n}}\r\n"));
+        let source = DiffSource::new(&text).unwrap();
+        let shown = expand_tabs(line);
+        for dark in [false, true] {
+            let highlights = source.highlight("src/demo.rs", dark).unwrap();
+            let parts = highlights.line(2, line);
+            assert!(
+                parts
+                    .iter()
+                    .any(|(range, _)| &shown[range.clone()] == "let")
+            );
+            assert!(
+                parts
+                    .iter()
+                    .any(|(range, _)| shown[range.clone()].contains("你好"))
+            );
+        }
+    }
 
     #[test]
     fn unified_rows_have_headers() {
