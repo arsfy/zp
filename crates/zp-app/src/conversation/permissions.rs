@@ -95,8 +95,8 @@ impl ConversationView {
 
     /// Applies new rules (the mode or settings changed); session grants are kept.
     pub fn set_permission_policy(&mut self, policy: PermissionPolicy, cx: &mut Context<Self>) {
-        if let Some(gate) = self.coding.as_ref().and_then(|c| c.permissions()) {
-            gate.set_policy(policy);
+        if let Some(coding) = &self.coding {
+            coding.set_permission_policy(policy);
         }
         cx.notify();
     }

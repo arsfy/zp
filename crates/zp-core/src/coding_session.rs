@@ -19,7 +19,7 @@ use zp_session::{COMPACTION_SUMMARY_TYPE, EntryData, Session, SessionEntry};
 use crate::changes::{ChangeLog, RestoreSource, restore_message_with_sources};
 use crate::checkpoint::{BlobStore, RecordedChange, store_tool_change};
 use crate::compaction::{self, CompactionSettings};
-use crate::permissions::PermissionGate;
+use crate::permissions::{PermissionGate, PermissionPolicy};
 use crate::resources::Resources;
 use crate::subagents::{self, SubagentSettings, SubagentTool};
 use crate::system_prompt::{SystemPromptOptions, build_system_prompt, load_context_files};
@@ -543,6 +543,10 @@ impl CodingSession {
             custom_prompt: custom_system_prompt.as_deref(),
             append: append_system_prompt.as_deref(),
             skills: Some(&skills),
+            scratch_directory: permissions
+                .as_deref()
+                .and_then(PermissionGate::scratch_directory)
+                .as_deref(),
         });
 
         let session_id = session.id().to_owned();
@@ -700,6 +704,14 @@ impl CodingSession {
         self.permissions.as_ref()
     }
 
+    /// Updates permissions and the scratch directory advertised to the model.
+    pub fn set_permission_policy(&self, policy: PermissionPolicy) {
+        if let Some(permissions) = &self.permissions {
+            permissions.set_policy(policy);
+            self.rebuild_system_prompt();
+        }
+    }
+
     /// Rebuilds the system prompt with or without the project's instruction files (after
     /// the user decided whether to trust the project). Applies from the next request.
     pub fn set_trusted(&self, trusted: bool) {
@@ -814,6 +826,11 @@ impl CodingSession {
             custom_prompt: inputs.custom_system_prompt.as_deref(),
             append: inputs.append_system_prompt.as_deref(),
             skills: Some(&skills),
+            scratch_directory: self
+                .permissions
+                .as_deref()
+                .and_then(PermissionGate::scratch_directory)
+                .as_deref(),
         });
         drop(inputs);
         self.agent.set_system_prompt(Some(prompt.clone()));

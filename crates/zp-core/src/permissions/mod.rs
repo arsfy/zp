@@ -25,7 +25,7 @@ use zp_ai::{Message, Model, Models, UserContent};
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum PermissionMode {
-    /// Read-only commands run automatically; other commands and file changes need approval.
+    /// Read-only commands and session scratch cleanup run automatically.
     #[default]
     Ask,
     /// File changes, including workspace-local removals, and routine commands run automatically.
@@ -51,7 +51,7 @@ impl PermissionMode {
     pub fn description(self) -> &'static str {
         match self {
             Self::Ask => {
-                "Approve commands and file changes; read-only commands and echo output run automatically"
+                "Approve commands and file changes. Read-only commands, echo output and verified session scratch cleanup run automatically"
             }
             Self::AutoEdit => {
                 "Auto-approve file changes, echo writes in the project, Python scripts and routine local Git operations"
@@ -250,8 +250,8 @@ pub struct PermissionPolicy {
     pub review_thinking: zp_ai::ThinkingLevel,
     pub review_backend: ReviewBackend,
     pub review_jev: jev::JevSettings,
-    /// Temporary directories (canonical) the tools may use like the project: file tools
-    /// work there without asking, and removals there count as edits.
+    /// Temporary directories (canonical) the tools may use as scratch space. Edit modes
+    /// allow verified removals there.
     pub temp_directories: Vec<PathBuf>,
 }
 
@@ -369,8 +369,19 @@ impl PermissionPolicy {
                 .any(|dir| path.starts_with(dir))
     }
 
-    /// Decides whether a call may run, needs review or needs the user.
+    /// Decides whether a call may run, needs review or needs the user. The gate adds
+    /// its session scratch directory when checking live tool calls.
     pub fn evaluate(&self, tool: &str, args: &Value, grants: &Grants) -> Evaluation {
+        self.evaluate_with_scratch(tool, args, grants, None)
+    }
+
+    fn evaluate_with_scratch(
+        &self,
+        tool: &str,
+        args: &Value,
+        grants: &Grants,
+        session_scratch: Option<&Path>,
+    ) -> Evaluation {
         let kind = ToolKind::of(tool);
         let mut reasons = Vec::new();
         let mut offer = Vec::new();
@@ -422,14 +433,14 @@ impl PermissionPolicy {
                     if edits {
                         allowed.extend(["python", "python3"].map(str::to_owned));
                     }
-                    let removable: Vec<&Path> = if edits {
-                        std::iter::once(self.root.as_path())
-                            .chain(self.temp_directories.iter().map(PathBuf::as_path))
-                            .collect()
-                    } else {
-                        Vec::new()
-                    };
-                    match shell::assess(command, &allowed, &removable) {
+                    match shell::assess(
+                        command,
+                        &allowed,
+                        &self.root,
+                        &self.temp_directories,
+                        session_scratch,
+                        edits,
+                    ) {
                         shell::CommandAssessment::Allowed => {}
                         shell::CommandAssessment::Dangerous(why) => {
                             reasons.push(AskReason::Dangerous(why));
@@ -483,6 +494,7 @@ impl PermissionPolicy {
 /// Applies a [`PermissionPolicy`] to tool calls, asking an [`Approver`] when needed.
 pub struct PermissionGate {
     policy: RwLock<PermissionPolicy>,
+    scratch: Mutex<Option<tempfile::TempDir>>,
     grants: Mutex<Grants>,
     approver: Arc<dyn Approver>,
     models: Models,
@@ -503,6 +515,7 @@ impl PermissionGate {
     pub fn new(policy: PermissionPolicy, approver: Arc<dyn Approver>, models: Models) -> Self {
         Self {
             policy: RwLock::new(policy),
+            scratch: Mutex::default(),
             grants: Mutex::default(),
             approver,
             models,
@@ -536,6 +549,49 @@ impl PermissionGate {
             .clone()
     }
 
+    pub(crate) fn scratch_directory(&self) -> Option<PathBuf> {
+        self.scratch_for_policy(&self.policy())
+    }
+
+    fn scratch_for_policy(&self, policy: &PermissionPolicy) -> Option<PathBuf> {
+        if policy.temp_directories.is_empty() {
+            return None;
+        }
+        let mut scratch = self.scratch.lock().unwrap_or_else(PoisonError::into_inner);
+        if scratch.is_none() {
+            let mut builder = tempfile::Builder::new();
+            builder.prefix("zp-session-");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                builder.permissions(std::fs::Permissions::from_mode(0o700));
+            }
+            *scratch = policy.temp_directories.iter().find_map(|parent| {
+                if parent.canonicalize().ok().as_deref() != Some(parent) {
+                    return None;
+                }
+                builder.tempdir_in(parent).ok()
+            });
+        }
+        let path = scratch.as_ref()?.path();
+        path.parent()
+            .is_some_and(|parent| policy.temp_directories.iter().any(|root| root == parent))
+            .then(|| path.to_path_buf())
+    }
+
+    fn evaluate_call(
+        &self,
+        policy: &PermissionPolicy,
+        tool: &str,
+        args: &Value,
+        grants: &Grants,
+    ) -> Evaluation {
+        let scratch = (tool == "bash" && policy.mode != PermissionMode::FullAuto)
+            .then(|| self.scratch_for_policy(policy))
+            .flatten();
+        policy.evaluate_with_scratch(tool, args, grants, scratch.as_deref())
+    }
+
     /// Decides about one call: allowed, reviewed, or answered by the user.
     pub async fn check(
         &self,
@@ -547,7 +603,7 @@ impl PermissionGate {
     ) -> ToolCallDecision {
         let policy = self.policy();
         let current_grants = self.grants();
-        let evaluation = policy.evaluate(&call.name, args, &current_grants);
+        let evaluation = self.evaluate_call(&policy, &call.name, args, &current_grants);
         let (reasons, grants, description) = match evaluation {
             Evaluation::Allow => return ToolCallDecision::Allow,
             Evaluation::Ask { reasons, grants } => (reasons, grants, None),
@@ -623,7 +679,7 @@ impl PermissionGate {
         // A session grant given while this call waited for its turn may cover it now.
         let policy = self.policy();
         if matches!(
-            policy.evaluate(&call.name, args, &self.grants()),
+            self.evaluate_call(&policy, &call.name, args, &self.grants()),
             Evaluation::Allow
         ) {
             return ToolCallDecision::Allow;
@@ -725,11 +781,16 @@ mod tests {
         let base = dir.path().canonicalize().unwrap();
         let root = base.join("project");
         let temp = base.join("scratch");
+        let nested_temp = temp.join("service/private-temp");
+        let session_scratch = temp.join("session");
         std::fs::create_dir(&root).unwrap();
         std::fs::create_dir_all(temp.join("build")).unwrap();
+        std::fs::create_dir_all(&nested_temp).unwrap();
+        std::fs::create_dir_all(&session_scratch).unwrap();
+        std::fs::write(temp.join("notes with spaces.txt"), "scratch").unwrap();
         let none = Grants::default();
         let mut policy = policy(PermissionMode::AutoEdit, &root);
-        policy.temp_directories = vec![temp.clone()];
+        policy.temp_directories = vec![temp.clone(), nested_temp];
         let write = |path: &Path| json!({"path": path, "content": "x"});
         assert_eq!(
             policy.evaluate("write", &write(&temp.join("notes.txt")), &none),
@@ -744,28 +805,146 @@ mod tests {
             policy.evaluate("write", &write(&outside), &none),
             Evaluation::Ask { .. }
         ));
-        // Use project-relative Bash paths so the Windows check can resolve them too.
-        assert_eq!(
-            policy.evaluate(
-                "bash",
-                &json!({"command": "rm -rf ../scratch/build"}),
-                &none,
-            ),
-            Evaluation::Allow,
-            "removing inside a temporary directory counts as an edit"
-        );
-        assert!(
-            matches!(
-                policy.evaluate("bash", &json!({"command": "rm -rf ../scratch"}), &none),
-                Evaluation::Ask { .. }
-            ),
-            "never the directory itself"
-        );
+        for mode in [
+            PermissionMode::Ask,
+            PermissionMode::AutoEdit,
+            PermissionMode::AutoReview,
+        ] {
+            policy.mode = mode;
+            let evaluate = |command: &str| {
+                policy.evaluate_with_scratch(
+                    "bash",
+                    &json!({"command": command}),
+                    &none,
+                    Some(&session_scratch),
+                )
+            };
+            if !cfg!(windows) || zp_tools::Shell::detect().name() == "bash" {
+                // Use project-relative Bash paths on Windows.
+                assert_eq!(
+                    evaluate("rm -f ../scratch/session/artifact"),
+                    Evaluation::Allow
+                );
+                for command in [
+                    "rm -rf ../scratch/build",
+                    "rm -f -- '../scratch/notes with spaces.txt'",
+                ] {
+                    if mode == PermissionMode::Ask {
+                        let (reasons, grants) = ask(evaluate(command));
+                        assert!(
+                            matches!(&reasons[..], [AskReason::Dangerous(_)]),
+                            "{command}"
+                        );
+                        assert!(grants.is_empty());
+                    } else {
+                        assert_eq!(evaluate(command), Evaluation::Allow, "{mode:?}: {command}");
+                    }
+                }
+                #[cfg(unix)]
+                if mode != PermissionMode::Ask {
+                    assert_eq!(
+                        evaluate(&format!("rm -rf -- {:?}", temp.join("build"))),
+                        Evaluation::Allow,
+                    );
+                }
+            }
+            for command in [
+                "rm -rf ../scratch",
+                "rm -rf ../scratch/service",
+                "rm -rf ../scratch/service/private-temp",
+                "rm -rf ../scratch/session",
+                "rm -f ../scratch/notes.txt ../x.txt",
+                "rm -f ../scratch/*.txt",
+            ] {
+                let (reasons, offers) = ask(evaluate(command));
+                assert!(
+                    matches!(&reasons[..], [AskReason::Dangerous(_)]),
+                    "{mode:?}: {command}"
+                );
+                assert!(offers.is_empty(), "{command}");
+            }
+            if mode == PermissionMode::Ask {
+                assert!(matches!(
+                    evaluate("rm -f local.txt"),
+                    Evaluation::Ask { .. }
+                ));
+                assert!(matches!(
+                    evaluate("echo x > ../scratch/notes.txt"),
+                    Evaluation::Ask { .. }
+                ));
+            }
+        }
         policy.temp_directories.clear();
         assert!(matches!(
             policy.evaluate("write", &write(&temp.join("notes.txt")), &none),
             Evaluation::Ask { .. }
         ));
+        assert!(matches!(
+            policy.evaluate(
+                "bash",
+                &json!({"command": "rm -rf ../scratch/build"}),
+                &none
+            ),
+            Evaluation::Ask { .. }
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn removal_checks_the_location_of_the_symlink_entry() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let base = canonical(dir.path());
+        let root = base.join("project");
+        let scratch = base.join("temp/session");
+        std::fs::create_dir(&root).unwrap();
+        let outside = base.join("elsewhere");
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::create_dir_all(&scratch).unwrap();
+        std::fs::write(scratch.join("artifact"), "temporary").unwrap();
+        symlink(scratch.join("artifact"), root.join("project-link")).unwrap();
+        symlink(scratch.join("artifact"), base.join("outside-link")).unwrap();
+        symlink(outside, scratch.join("outside-dir-link")).unwrap();
+
+        let mut policy = policy(PermissionMode::Ask, &root);
+        policy.temp_directories = vec![base.join("temp")];
+        let grants = Grants::default();
+        for mode in [PermissionMode::Ask, PermissionMode::AutoEdit] {
+            policy.mode = mode;
+            let evaluate = |command: &str| {
+                policy.evaluate_with_scratch(
+                    "bash",
+                    &json!({"command": command}),
+                    &grants,
+                    Some(&scratch),
+                )
+            };
+            for command in [
+                "rm -f ../outside-link",
+                "rm -rf ../temp/session/outside-dir-link/",
+                "rm -f ../temp/session/outside-dir-link/file",
+            ] {
+                let (reasons, grants) = ask(evaluate(command));
+                assert!(
+                    matches!(&reasons[..], [AskReason::Dangerous(_)]),
+                    "{command}"
+                );
+                assert!(grants.is_empty());
+            }
+            assert_eq!(
+                evaluate("rm -f ../temp/session/outside-dir-link"),
+                Evaluation::Allow
+            );
+            if mode == PermissionMode::Ask {
+                assert!(matches!(
+                    evaluate("rm -f project-link"),
+                    Evaluation::Ask { .. }
+                ));
+            } else {
+                assert_eq!(evaluate("rm -f project-link"), Evaluation::Allow);
+            }
+        }
     }
 
     fn ask(evaluation: Evaluation) -> (Vec<AskReason>, Vec<SessionGrant>) {

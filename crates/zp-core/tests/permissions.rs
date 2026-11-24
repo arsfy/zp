@@ -291,6 +291,82 @@ async fn edit_modes_skip_review_for_workspace_file_changes() {
     }
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn ask_mode_uses_a_private_scratch_directory_for_the_session() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let fixture = tempfile::tempdir().unwrap();
+    let base = fixture.path().canonicalize().unwrap();
+    let root = base.join("project");
+    let shared = base.join("shared");
+    std::fs::create_dir(&root).unwrap();
+    std::fs::create_dir(&shared).unwrap();
+
+    let faux = FauxProvider::default();
+    let mut models = Models::new();
+    models.set_provider(Arc::new(faux.clone()));
+    let approver = Arc::new(Scripted::default());
+    let policy = PermissionPolicy {
+        root: root.clone(),
+        temp_directories: vec![shared.clone()],
+        ..PermissionPolicy::default()
+    };
+    let mut options = CodingSessionOptions::new(models.clone(), &root, Session::in_memory(&root));
+    options.model = Some(faux.model());
+    options.permissions = Some(Arc::new(PermissionGate::new(
+        policy.clone(),
+        approver.clone(),
+        models,
+    )));
+    let coding = CodingSession::new(options).unwrap();
+
+    let scratch = std::fs::read_dir(&shared)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    assert!(
+        coding
+            .system_prompt()
+            .contains(&scratch.display().to_string())
+    );
+    assert_eq!(scratch.metadata().unwrap().permissions().mode() & 0o077, 0);
+    let disabled = PermissionPolicy {
+        temp_directories: Vec::new(),
+        ..policy.clone()
+    };
+    coding.set_permission_policy(disabled);
+    assert!(!coding.system_prompt().contains("<session_scratch>"));
+    coding.set_permission_policy(policy);
+    assert!(
+        coding
+            .system_prompt()
+            .contains(&scratch.display().to_string())
+    );
+
+    let artifact = scratch.join("temporary artifact");
+    std::fs::write(&artifact, "temporary").unwrap();
+    faux.push(call(
+        "bash",
+        json!({"command": format!("rm -f -- {artifact:?}")}),
+    ));
+    faux.push(FauxResponse::text("done"));
+    let output = results(
+        &coding
+            .prompt("clean up the session artifact")
+            .await
+            .unwrap(),
+    );
+    assert_eq!(output.len(), 1);
+    assert!(!output[0].0, "{}", output[0].1);
+    assert!(!artifact.exists());
+    assert!(approver.requests.lock().unwrap().is_empty());
+    drop(coding);
+    assert!(!scratch.exists());
+}
+
 #[tokio::test]
 async fn auto_review_and_destructive_commands() {
     let project = tempfile::tempdir().unwrap();

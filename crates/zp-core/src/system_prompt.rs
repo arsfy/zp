@@ -88,6 +88,8 @@ pub struct SystemPromptOptions<'a> {
     pub append: Option<&'a str>,
     /// The skills section (see [`crate::resources::Resources::skills_prompt`]).
     pub skills: Option<&'a str>,
+    /// A private directory for the session's temporary files.
+    pub scratch_directory: Option<&'a Path>,
 }
 
 impl Default for SystemPromptOptions<'_> {
@@ -99,6 +101,7 @@ impl Default for SystemPromptOptions<'_> {
             custom_prompt: None,
             append: None,
             skills: None,
+            scratch_directory: None,
         }
     }
 }
@@ -141,6 +144,18 @@ pub fn build_system_prompt(options: &SystemPromptOptions<'_>) -> String {
     }
     if let Some(skills) = options.skills.filter(|text| !text.trim().is_empty()) {
         sections.push(("skills", skills.trim().to_owned()));
+    }
+    if let Some(path) = options
+        .scratch_directory
+        .filter(|_| options.tools.iter().any(|tool| tool.name() == "bash"))
+    {
+        sections.push((
+            "session_scratch",
+            format!(
+                "Use {} for temporary files specific to this session. Use literal paths for shell cleanup.",
+                path.display()
+            ),
+        ));
     }
     sections.push(("cwd", options.cwd.to_string_lossy().replace('\\', "/")));
 

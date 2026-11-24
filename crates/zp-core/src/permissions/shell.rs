@@ -864,7 +864,7 @@ fn git_config_writes_elsewhere(args: &[&str]) -> bool {
 /// file) whose redirections all read or write literal paths inside `roots` (the project
 /// first, then temporary directories). Relative paths resolve against `cwd`; without it
 /// (the command changed directory) only absolute ones qualify.
-fn writes_within(segment: &Segment, cwd: Option<&Path>, roots: &[PathBuf]) -> bool {
+fn writes_within(segment: &Segment, cwd: Option<&Path>, roots: &[&Path]) -> bool {
     let words = command_words(segment);
     match program(words) {
         Some("echo") => {}
@@ -915,10 +915,7 @@ fn writes_within(segment: &Segment, cwd: Option<&Path>, roots: &[PathBuf]) -> bo
         }) else {
             return false;
         };
-        if !roots
-            .iter()
-            .any(|root| removal_target_in_workspace(&path, root))
-        {
+        if !target_inside_roots(&path, roots) {
             return false;
         }
     }
@@ -1180,12 +1177,17 @@ pub(super) enum CommandAssessment {
     Unverified,
 }
 
-/// Applies the shell rules. `edit_roots` is where the edit modes may change files (the
-/// project first, where commands start, then temporary directories; empty in other
-/// modes): verified removals and `echo` redirections there count as edits, and routine
-/// Git commands run too.
-pub(super) fn assess(command: &str, allowed: &[String], edit_roots: &[&Path]) -> CommandAssessment {
-    let removable = edit_roots;
+/// Applies the shell rules. Ask mode only auto-approves removals in the session scratch
+/// directory. Edit modes allow removals and redirections in the project and temporary
+/// directories, as well as routine Git commands.
+pub(super) fn assess(
+    command: &str,
+    allowed: &[String],
+    project: &Path,
+    temp_directories: &[PathBuf],
+    session_scratch: Option<&Path>,
+    auto_edit: bool,
+) -> CommandAssessment {
     let parsed = split(command);
     if parsed.unverified {
         return parsed
@@ -1194,45 +1196,64 @@ pub(super) fn assess(command: &str, allowed: &[String], edit_roots: &[&Path]) ->
             .find_map(segment_danger)
             .map_or(CommandAssessment::Unverified, CommandAssessment::Dangerous);
     }
-    let edit_roots: Vec<PathBuf> = edit_roots
-        .iter()
-        .filter_map(|root| root.canonicalize().ok())
-        .collect();
-    // Relative redirections resolve against the project until a command changes directory.
-    let mut echo_cwd = edit_roots.first().cloned();
-    let checks_removals = !parsed.compound
+    let checks_removals = (auto_edit || session_scratch.is_some())
+        && !parsed.compound
         && parsed
             .segments
             .iter()
             .any(|segment| direct_rm_args(segment).is_some())
         && (!cfg!(windows) || zp_tools::Shell::detect().name() == "bash");
-    let roots: Vec<PathBuf> = if checks_removals {
-        removable
+    let project = (auto_edit || checks_removals)
+        .then(|| project.canonicalize().ok())
+        .flatten();
+    let edit_roots: Vec<_> = if auto_edit {
+        project
             .iter()
-            .filter_map(|root| root.canonicalize().ok())
+            .map(PathBuf::as_path)
+            .chain(temp_directories.iter().map(PathBuf::as_path))
             .collect()
     } else {
         Vec::new()
     };
-    // Commands start in the project; without it, directories cannot be tracked.
-    let mut cwd = removable
-        .first()
-        .filter(|_| checks_removals)
-        .and_then(|root| root.canonicalize().ok());
+    let removal_roots = if auto_edit {
+        &edit_roots
+    } else {
+        session_scratch.as_slice()
+    };
+    let protected_roots: Vec<_> = if checks_removals {
+        project
+            .iter()
+            .map(PathBuf::as_path)
+            .chain(temp_directories.iter().map(PathBuf::as_path))
+            .chain(session_scratch)
+            .collect()
+    } else {
+        Vec::new()
+    };
+    // Both checks resolve relative paths from the project, independently of allowed roots.
+    let mut echo_cwd = project.as_deref().filter(|_| auto_edit);
+    let mut cwd = project.clone().filter(|_| checks_removals);
     let mut preceding_program = false;
     let mut needs_approval = parsed.segments.is_empty();
     let mut prefixes = Vec::new();
     for segment in &parsed.segments {
         if let Some(cwd) = &cwd
-            && workspace_rm(segment, cwd, &roots, preceding_program)
+            && workspace_rm(
+                segment,
+                cwd,
+                removal_roots,
+                &protected_roots,
+                preceding_program,
+            )
         {
             continue;
         }
         if let Some(reason) = segment_danger(segment) {
             return CommandAssessment::Dangerous(reason);
         }
-        let edit_allowed = !edit_roots.is_empty()
-            && (routine_git(segment) || writes_within(segment, echo_cwd.as_deref(), &edit_roots));
+        let edit_allowed = auto_edit
+            && !edit_roots.is_empty()
+            && (routine_git(segment) || writes_within(segment, echo_cwd, &edit_roots));
         if matches!(
             program(command_words(segment)),
             Some("cd" | "pushd" | "popd")
@@ -1299,7 +1320,13 @@ fn direct_rm_args(segment: &Segment) -> Option<&[String]> {
     matches!(executable.as_str(), "rm" | "/bin/rm" | "/usr/bin/rm").then_some(args)
 }
 
-fn workspace_rm(segment: &Segment, cwd: &Path, roots: &[PathBuf], preceding_program: bool) -> bool {
+fn workspace_rm(
+    segment: &Segment,
+    cwd: &Path,
+    roots: &[&Path],
+    protected_roots: &[&Path],
+    preceding_program: bool,
+) -> bool {
     let Some(args) = direct_rm_args(segment).filter(|_| !segment.expanded && !segment.redirected)
     else {
         return false;
@@ -1318,11 +1345,13 @@ fn workspace_rm(segment: &Segment, cwd: &Path, roots: &[PathBuf], preceding_prog
             if preceding_program && arg.trim_start_matches("./").contains('/') {
                 return false;
             }
-            if !literal_path(cwd, arg).is_some_and(|path| {
-                roots
-                    .iter()
-                    .any(|root| removal_target_in_workspace(&path, root))
-            }) {
+            let Some(target) = removal_target(cwd, arg) else {
+                return false;
+            };
+            // Recursive removal also affects any protected roots below the target.
+            if !roots.iter().any(|root| target.starts_with(root))
+                || protected_roots.iter().any(|root| root.starts_with(&target))
+            {
                 return false;
             }
             saw_target = true;
@@ -1363,11 +1392,39 @@ fn literal_path(cwd: &Path, path: &str) -> Option<PathBuf> {
     Some(cwd.join(path))
 }
 
-fn removal_target_in_workspace(mut path: &Path, root: &Path) -> bool {
-    let mut missing = false;
+fn removal_target(cwd: &Path, arg: &str) -> Option<PathBuf> {
+    if matches!(
+        arg.trim_end_matches('/').rsplit('/').next(),
+        Some("." | "..")
+    ) {
+        return None;
+    }
+    let path = literal_path(cwd, arg)?;
+    let parent = resolve_target(path.parent()?)?;
+    let target = parent.join(path.file_name()?);
+    match target.symlink_metadata() {
+        // rm unlinks a final symlink. A trailing slash has platform-dependent behavior.
+        Ok(metadata) if metadata.is_symlink() => (!arg.ends_with('/')).then_some(target),
+        Ok(_) => target.canonicalize().ok(),
+        Err(error) if error.kind() == ErrorKind::NotFound => Some(target),
+        Err(_) => None,
+    }
+}
+
+fn target_inside_roots(path: &Path, roots: &[&Path]) -> bool {
+    resolve_target(path).is_some_and(|target| {
+        roots.iter().any(|root| target.starts_with(root)) && !roots.contains(&target.as_path())
+    })
+}
+
+fn resolve_target(mut path: &Path) -> Option<PathBuf> {
+    let mut missing = Vec::new();
     loop {
         match path.canonicalize() {
-            Ok(resolved) => return resolved.starts_with(root) && (missing || resolved != root),
+            Ok(mut resolved) => {
+                resolved.extend(missing.into_iter().rev());
+                return Some(resolved);
+            }
             Err(error)
                 if error.kind() == ErrorKind::NotFound
                     && path.file_name().is_some()
@@ -1375,10 +1432,10 @@ fn removal_target_in_workspace(mut path: &Path, root: &Path) -> bool {
                         .symlink_metadata()
                         .is_err_and(|error| error.kind() == ErrorKind::NotFound) =>
             {
-                missing = true;
-                path = path.parent().expect("a file name has a parent");
+                missing.push(path.file_name()?);
+                path = path.parent()?;
             }
-            Err(_) => return false,
+            Err(_) => return None,
         }
     }
 }
@@ -1865,7 +1922,7 @@ mod tests {
             assert!(!all_allowed(command, &[]), "{command}");
             assert!(
                 matches!(
-                    super::assess(command, &[], &[]),
+                    super::assess(command, &[], Path::new("."), &[], None, false),
                     CommandAssessment::Unverified
                 ),
                 "{command}"
@@ -1883,7 +1940,7 @@ mod tests {
     fn heredoc_writes_into_the_project_are_edits() {
         let root = tempfile::tempdir().unwrap();
         let root = root.path().canonicalize().unwrap();
-        let assess = |command| super::assess(command, &[], &[&root]);
+        let assess = |command| super::assess(command, &[], &root, &[], None, true);
         assert!(matches!(
             assess("cat > notes.md << EOF\nhello\nEOF"),
             CommandAssessment::Allowed
