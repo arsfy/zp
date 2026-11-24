@@ -786,6 +786,14 @@ impl ProjectWindow {
             if let Some(rate) = status.cache_read_rate {
                 right.push(format!("cache {:.1}%", rate * 100.0));
             }
+            if let Some(ttft) = status.ttft {
+                let latency = if ttft.as_secs() == 0 {
+                    format!("{}ms", ttft.as_millis())
+                } else {
+                    format!("{:.2}s", ttft.as_secs_f64())
+                };
+                right.push(format!("TTFT {latency}"));
+            }
             if let Some(speed) = status.tokens_per_second {
                 right.push(format!("{estimate}{speed:.0} tok/s"));
             }
@@ -796,7 +804,7 @@ impl ProjectWindow {
                     _ => format_tokens(tokens),
                 };
                 right.push(format!(
-                    "context {}/{} ({:.1}%)",
+                    "{}/{} ({:.1}%)",
                     context_tokens(usage.last_context_tokens),
                     context_tokens(model.context_window),
                     usage.last_context_tokens as f64 * 100.0 / model.context_window as f64

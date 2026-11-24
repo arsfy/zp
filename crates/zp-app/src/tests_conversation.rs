@@ -1118,7 +1118,7 @@ fn new_conversations_remember_the_last_model(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
-fn measures_the_output_speed(cx: &mut TestAppContext) {
+fn measures_time_to_first_token_and_output_speed(cx: &mut TestAppContext) {
     let faux = FauxProvider::default().with_chunk_delay(Duration::from_millis(200));
     faux.push(FauxResponse::text(
         "a fairly long answer streamed in several chunks ".repeat(6),
@@ -1127,7 +1127,9 @@ fn measures_the_output_speed(cx: &mut TestAppContext) {
     let (_dir, project) = project_dir();
     let window = open(cx, &project);
     let conversation = active(window, cx);
-    assert!(conversation.read_with(cx, |v, _| v.status().tokens_per_second.is_none()));
+    let initial = conversation.read_with(cx, |view, _| view.status());
+    assert!(initial.tokens_per_second.is_none());
+    assert!(initial.ttft.is_none());
 
     send(window, "hello", cx);
     wait_until(cx, |cx| {
@@ -1138,9 +1140,11 @@ fn measures_the_output_speed(cx: &mut TestAppContext) {
     });
     let live = conversation.read_with(cx, |view, _| view.status());
     assert!(live.output_estimated);
+    assert!(live.ttft.is_some_and(|ttft| !ttft.is_zero()));
     assert!(live.tokens_per_second.is_some_and(|speed| speed > 0.));
     idle(&conversation, 2, cx);
     let final_status = conversation.read_with(cx, |view, _| view.status());
+    assert_eq!(final_status.ttft, live.ttft);
     assert!(!final_status.output_estimated);
     assert_eq!(
         final_status.usage.output, 5,

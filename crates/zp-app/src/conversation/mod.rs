@@ -150,13 +150,18 @@ pub struct ConversationStatus {
     pub running: bool,
     /// Whether the in-flight output usage is estimated until provider usage arrives.
     pub output_estimated: bool,
+    /// Elapsed time from the current or last model request to its first output delta.
+    pub ttft: Option<Duration>,
     /// Output speed of the current or last streamed response.
     pub tokens_per_second: Option<f64>,
 }
 
-/// When the streaming response started and produced its first output.
+/// Timing and output counts for one streamed response.
 #[derive(Clone, Copy, Debug, Default)]
 struct ResponseTimer {
+    /// Before opening the provider stream.
+    request_started: Option<Instant>,
+    /// When the provider sent the response skeleton.
     started: Option<Instant>,
     first_output: Option<Instant>,
     output_bytes: u64,
@@ -256,6 +261,8 @@ pub struct ConversationView {
     copied_row: Option<usize>,
     /// Times the streaming response.
     response_timer: ResponseTimer,
+    /// Time to the first output delta for the current or last model request.
+    ttft: Option<Duration>,
     /// Output tokens per second of the last streamed response.
     tokens_per_second: Option<f64>,
     progress: Entity<progress::RunProgress>,
@@ -383,6 +390,7 @@ impl ConversationView {
             composer_input_width: Rc::default(),
             copied_row: None,
             response_timer: ResponseTimer::default(),
+            ttft: None,
             tokens_per_second: None,
             progress: cx.new(|_| progress::RunProgress::default()),
             status_task: None,
@@ -696,14 +704,21 @@ impl ConversationView {
         }
     }
 
-    /// Tracks the streaming response; returns whether the output speed was updated.
+    /// Tracks the streaming response and reports changes for the status bar.
     fn time_response(&mut self, at: Instant, event: &AgentEvent) -> bool {
         use zp_ai::{AssistantMessageEvent, Message, StopReason};
         match event {
+            AgentEvent::ModelRequestStart => {
+                self.response_timer.request_started = Some(at);
+                self.ttft = None;
+                self.tokens_per_second = None;
+                true
+            }
             AgentEvent::MessageStart {
                 message: zp_agent::AgentMessage::Llm(Message::Assistant(_)),
             } => {
                 self.response_timer = ResponseTimer {
+                    request_started: self.response_timer.request_started,
                     started: Some(at),
                     ..ResponseTimer::default()
                 };
@@ -722,8 +737,15 @@ impl ConversationView {
                 | AssistantMessageEvent::ToolCallDelta { delta, .. } = event
                     && !delta.is_empty()
                 {
-                    self.response_timer.first_output.get_or_insert(at);
                     self.response_timer.output_bytes += delta.len() as u64;
+                    if self.response_timer.first_output.is_none() {
+                        self.response_timer.first_output = Some(at);
+                        self.ttft = self
+                            .response_timer
+                            .request_started
+                            .map(|start| at.duration_since(start));
+                        return self.ttft.is_some();
+                    }
                 }
                 false
             }
@@ -1348,6 +1370,7 @@ impl ConversationView {
             cache_read_rate,
             running: self.running,
             output_estimated,
+            ttft: self.ttft,
             tokens_per_second,
         }
     }
@@ -1604,6 +1627,7 @@ impl ConversationView {
         }
         self.running = true;
         self.start_temp_tracking();
+        self.ttft = None;
         self.tokens_per_second = None;
         self.response_timer = ResponseTimer::default();
         self.start_status_updates(cx);
@@ -2346,7 +2370,11 @@ mod tests {
             view.apply_events(
                 vec![
                     ReceivedEvent::new(
-                        at,
+                        at - Duration::from_millis(500),
+                        AgentEvent::ModelRequestStart,
+                    ),
+                    ReceivedEvent::new(
+                        at - Duration::from_millis(50),
                         AgentEvent::MessageStart {
                             message: message.clone().into(),
                         },
@@ -2370,11 +2398,24 @@ mod tests {
                         AgentEvent::MessageUpdate {
                             event: AssistantMessageEvent::TextDelta {
                                 index: 0,
-                                delta: "x".repeat(400),
+                                delta: String::new(),
                             },
                         },
                     ),
                 ],
+                cx,
+            );
+            assert_eq!(view.status().ttft, None);
+            view.apply_events(
+                vec![ReceivedEvent::new(
+                    at,
+                    AgentEvent::MessageUpdate {
+                        event: AssistantMessageEvent::TextDelta {
+                            index: 0,
+                            delta: "x".repeat(400),
+                        },
+                    },
+                )],
                 cx,
             );
         });
@@ -2384,6 +2425,7 @@ mod tests {
             (10, 90, 101)
         );
         assert!(live.output_estimated);
+        assert_eq!(live.ttft, Some(Duration::from_millis(500)));
         assert!(live.tokens_per_second.is_some_and(|speed| speed > 0.));
 
         message.usage = Usage {

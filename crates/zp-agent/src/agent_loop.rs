@@ -315,6 +315,7 @@ async fn stream_response(
         ..config.request_options.clone()
     };
 
+    emit(AgentEvent::ModelRequestStart);
     let mut stream = (config.stream)(&config.run.model, &request, options);
     let mut started = false;
     while let Some(event) = stream.next().await {

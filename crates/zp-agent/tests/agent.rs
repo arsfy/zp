@@ -269,6 +269,7 @@ async fn text_prompt_emits_the_full_lifecycle() {
             "turn_start",
             "message_start:user",
             "message_end:user",
+            "model_request_start",
             "message_start:assistant",
             "message_end:assistant",
             "turn_end",
@@ -327,6 +328,7 @@ async fn multi_turn_tool_calls() {
     let log = log.lock().unwrap();
     let count = |name: &str| log.iter().filter(|e| *e == name).count();
     assert_eq!(count("turn_start"), 3);
+    assert_eq!(count("model_request_start"), 3);
     assert_eq!(count("turn_end"), 3);
     assert_eq!(count("tool_execution_start:echo"), 3);
     assert_eq!(count("tool_execution_update:echo"), 3);

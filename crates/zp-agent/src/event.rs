@@ -15,6 +15,7 @@ use crate::tool::AgentToolResult;
 /// AgentStart
 ///   TurnStart
 ///     MessageStart/End            prompt and queued messages
+///     ModelRequestStart          when the model request begins
 ///     MessageStart (Update)* End  the assistant response
 ///     ToolExecutionStart (Update)* End, …
 ///     MessageStart/End            tool results, in call order
@@ -50,6 +51,8 @@ pub enum AgentEvent {
         /// Failure reported by the summarizer or session store.
         error: String,
     },
+    /// The agent is starting a request for one streamed model response.
+    ModelRequestStart,
     /// A turn finished.
     TurnEnd {
         /// The turn's assistant message.
@@ -118,6 +121,7 @@ impl AgentEvent {
             Self::ContextCompacting { .. } => "context_compacting",
             Self::ContextCompacted { .. } => "context_compacted",
             Self::ContextCompactionFailed { .. } => "context_compaction_failed",
+            Self::ModelRequestStart => "model_request_start",
             Self::MessageStart { .. } => "message_start",
             Self::MessageUpdate { .. } => "message_update",
             Self::MessageEnd { .. } => "message_end",
